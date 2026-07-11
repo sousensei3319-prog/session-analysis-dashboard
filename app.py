@@ -1873,7 +1873,18 @@ def _get_exchange(exchange_id: str):
     if exchange_id not in _EXCHANGE_CACHE:
         import ccxt  # 遅延import
         klass = getattr(ccxt, exchange_id)
-        _EXCHANGE_CACHE[exchange_id] = klass({"enableRateLimit": True})
+        ex = klass({"enableRateLimit": True})
+        if exchange_id == "binance":
+            # 米国ホスティング(Streamlit Cloud等)ではapi.binance.comがHTTP 451で地域ブロック
+            # される(2026-07-12クラウド実機で確認)。Binance公式の公開データミラー
+            # data-api.binance.vision(市場データ専用・地域制限なし)へ公開エンドポイントを
+            # 差し替える。klines/exchangeInfoとも同一データで全環境無害。
+            try:
+                if isinstance(ex.urls.get("api"), dict) and "public" in ex.urls["api"]:
+                    ex.urls["api"]["public"] = "https://data-api.binance.vision/api/v3"
+            except Exception:  # noqa: BLE001 — ccxtのURL構造が変わっても本体動作は損なわない
+                pass
+        _EXCHANGE_CACHE[exchange_id] = ex
     return _EXCHANGE_CACHE[exchange_id]
 
 
@@ -1883,6 +1894,25 @@ def _jst_date_to_utc_ms(d: date) -> int:
 
 
 def _fetch_ccxt_ohlcv_impl(
+    exchange_id: str, symbol: str, since_ms: int, until_ms: int, timeframe: str = "1h",
+) -> pd.DataFrame:
+    try:
+        return _fetch_ccxt_ohlcv_loop(exchange_id, symbol, since_ms, until_ms, timeframe)
+    except Exception as e:  # noqa: BLE001
+        # bybitも米国ホスティングから地域ブロックされ得る。HYPE等はHyperliquid本体の
+        # 公開API(地域制限なし)へフォールバック(USDT表記→USDC建てperpへ読み替え)。
+        # 取得元の正直な表示のためdf.attrs["actual_source"]に実際の取得元を記録する。
+        msg = str(e).lower()
+        geo = any(m in msg for m in ("451", "403", "restricted", "cloudfront", "eligibility"))
+        if exchange_id == "bybit" and geo:
+            hl_symbol = symbol.split("/")[0] + "/USDC:USDC"
+            df = _fetch_ccxt_ohlcv_loop("hyperliquid", hl_symbol, since_ms, until_ms, timeframe)
+            df.attrs["actual_source"] = "ccxt(hyperliquid)"
+            return df
+        raise
+
+
+def _fetch_ccxt_ohlcv_loop(
     exchange_id: str, symbol: str, since_ms: int, until_ms: int, timeframe: str = "1h",
 ) -> pd.DataFrame:
     ex = _get_exchange(exchange_id)
@@ -1963,7 +1993,8 @@ def fetch_ccxt_ohlcv(
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     df = _fetch_ccxt_ohlcv_impl(exchange_id, symbol, since_ms, until_ms, timeframe)
     # README §14/追補v3§4: 取得元表示は `ccxt(binance)` のように取引所IDをラップする仕様。
-    return df, _build_fetch_meta(f"ccxt({exchange_id})", symbol, df)
+    # 地域ブロックでフォールバックした場合はattrsの実取得元を表示(取得元の正直表示)。
+    return df, _build_fetch_meta(df.attrs.get("actual_source", f"ccxt({exchange_id})"), symbol, df)
 
 
 @st.cache_data(ttl=HOURLY_CACHE_TTL_SEC, show_spinner=False)
@@ -1980,7 +2011,7 @@ def fetch_ccxt_ohlcv_1m(
     exchange_id: str, symbol: str, since_ms: int, until_ms: int,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     df = _fetch_ccxt_ohlcv_impl(exchange_id, symbol, since_ms, until_ms, timeframe="1m")
-    return df, _build_fetch_meta(f"ccxt({exchange_id})", symbol, df)
+    return df, _build_fetch_meta(df.attrs.get("actual_source", f"ccxt({exchange_id})"), symbol, df)
 
 
 @st.cache_data(ttl=FINE_CACHE_TTL_SEC, show_spinner=False)
@@ -1988,7 +2019,7 @@ def fetch_ccxt_ohlcv_fine(
     exchange_id: str, symbol: str, since_ms: int, until_ms: int, timeframe: str,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     df = _fetch_ccxt_ohlcv_impl(exchange_id, symbol, since_ms, until_ms, timeframe)
-    return df, _build_fetch_meta(f"ccxt({exchange_id})", symbol, df)
+    return df, _build_fetch_meta(df.attrs.get("actual_source", f"ccxt({exchange_id})"), symbol, df)
 
 
 @st.cache_data(ttl=FINE_CACHE_TTL_SEC, show_spinner=False)
