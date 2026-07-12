@@ -855,15 +855,15 @@ def _to_float_or_nan(v: Any) -> float:
 
 
 def compare_trade_stats(stats_a: dict[str, Any], stats_b: dict[str, Any]) -> dict[str, Any]:
-    """compute_trade_stats() の戻り値2つ(既定=a:弟子, b:師匠)を比較する純関数。追補仕様書§1.4/§1.3。
+    """compute_trade_stats() の戻り値2つ(a=読み込み済みデータセット①, b=同②)を比較する純関数。
 
-    差分は全て「b - a」(師匠−弟子)の向きに統一する。捏造アドバイス文は一切生成しない
-    (数値の突合のみ。掟2)。
+    差分は全て「a - b」(データセット①−②)の向きに統一する(v6.11でb-aから反転・ユーザー指定)。
+    捏造アドバイス文は一切生成しない(数値の突合のみ。掟2)。
 
     戻り値:
         {
           "overall_a": stats_a["overall"], "overall_b": stats_b["overall"],
-          "overall_diff": {指標名: b-aの数値差(_COMPARE_OVERALL_NUMERIC_KEYSのみ対象)},
+          "overall_diff": {指標名: a-bの数値差(_COMPARE_OVERALL_NUMERIC_KEYSのみ対象)},
           "period_a": (first_time_a, last_time_a), "period_b": (first_time_b, last_time_b),
           "by_band": DataFrame(index=帯ラベル(aの登場順→bのみに有る帯を末尾追加),
                      columns=_COMPARE_BY_BAND_COLUMNS。片側にしか無い帯は無い側を0/NaNで補完し
@@ -881,7 +881,7 @@ def _compare_trade_stats_impl(stats_a: dict[str, Any], stats_b: dict[str, Any]) 
     for k in _COMPARE_OVERALL_NUMERIC_KEYS:
         fa = _to_float_or_nan(overall_a.get(k))
         fb = _to_float_or_nan(overall_b.get(k))
-        overall_diff[k] = fb - fa
+        overall_diff[k] = fa - fb  # v6.11: ①−②(a−b)へ反転
 
     by_band_a = (stats_a or {}).get("by_band")
     by_band_b = (stats_b or {}).get("by_band")
@@ -915,8 +915,8 @@ def _compare_trade_stats_impl(stats_a: dict[str, Any], stats_b: dict[str, Any]) 
             "n_trades_b": n_b, "n_wins_b": int(rb["n_wins"]) if has_b else 0,
             "n_losses_b": int(rb["n_losses"]) if has_b else 0,
             "win_rate_pct_b": wr_b, "total_pnl_usd_b": pnl_b,
-            "win_rate_diff": (wr_b - wr_a) if not (math.isnan(wr_a) or math.isnan(wr_b)) else float("nan"),
-            "total_pnl_diff": (pnl_b - pnl_a) if not (math.isnan(pnl_a) or math.isnan(pnl_b)) else float("nan"),
+            "win_rate_diff": (wr_a - wr_b) if not (math.isnan(wr_a) or math.isnan(wr_b)) else float("nan"),
+            "total_pnl_diff": (pnl_a - pnl_b) if not (math.isnan(pnl_a) or math.isnan(pnl_b)) else float("nan"),
             "low_n_a": n_a < 3, "low_n_b": n_b < 3,
         })
 
@@ -2977,9 +2977,8 @@ def style_cross_table(df: pd.DataFrame, diverging_vmax: Optional[float] = None) 
 
 
 def _compare_diff_color(v: Any, vmax: float) -> str:
-    """追補v4§1.3.3: 勝率差(師匠-弟子)の発散色付け。正(師匠優位=改善余地)=赤系、
-    0以下(弟子が同等以上)=緑系。style_cross_table の diverging_color と濃淡ロジックは同系だが、
-    符号の意味(色の向き)が逆転する専用版。
+    """勝率差(データセット①−②)の発散色付け(v6.11で向き反転)。
+    正(①が優位)=緑系、負(①が劣位=改善余地)=赤系。
     """
     if pd.isna(v):
         return ""
@@ -2987,8 +2986,8 @@ def _compare_diff_color(v: Any, vmax: float) -> str:
     intensity = min(1.0, abs(v) / eff_vmax)
     alpha = 0.18 + 0.5 * intensity
     if v > 0:
-        return f"background-color: rgba(224,64,64,{alpha:.2f}); color: #fff"
-    return f"background-color: rgba(56,168,96,{alpha:.2f}); color: #fff"
+        return f"background-color: rgba(56,168,96,{alpha:.2f}); color: #fff"
+    return f"background-color: rgba(224,64,64,{alpha:.2f}); color: #fff"
 
 
 def style_compare_band_table(df: pd.DataFrame, label_a: str, label_b: str) -> Any:
@@ -3025,7 +3024,7 @@ def style_compare_band_table(df: pd.DataFrame, label_a: str, label_b: str) -> An
         "total_pnl_usd_a": f"{label_a} 損益(USD)",
         "n_trades_b": f"{label_b} 回数", "win_rate_pct_b": f"{label_b} 勝率(%)",
         "total_pnl_usd_b": f"{label_b} 損益(USD)",
-        "win_rate_diff": f"勝率差({label_b}-{label_a})",
+        "win_rate_diff": f"勝率差({label_a}-{label_b})",  # v6.11: ①−②の向き
     }
     fmt = {
         "n_trades_a": lambda v: "—" if pd.isna(v) else f"{int(v)}",
@@ -4769,7 +4768,8 @@ def _render_trader_comparison_view(records: list[dict[str, Any]]) -> None:
     st.markdown("**④ 改善ヒント(データ駆動・数字のみ。一般論のアドバイス文は生成しない)**")
     hint_df = cmp["by_band"].copy()
     hint_df = hint_df[hint_df["win_rate_diff"].notna()]
-    top_gap = hint_df.sort_values("win_rate_diff", ascending=False).head(3)
+    # v6.11: 勝率差=①−②に反転したため「②に最も差を付けられている帯」=最も負の帯=昇順TOP3
+    top_gap = hint_df.sort_values("win_rate_diff", ascending=True).head(3)
     if top_gap.empty:
         st.caption("両者に共通する帯データが不足しているため、勝率差TOP3を算出できません。")
     else:
@@ -4779,7 +4779,9 @@ def _render_trader_comparison_view(records: list[dict[str, Any]]) -> None:
             f"{label_b} {row['win_rate_pct_b']:.1f}%・n={int(row['n_trades_b'])})"
             for band, row in top_gap.iterrows()
         ]
-        st.markdown(f"{label_b}との勝率差が大きい帯 TOP3:\n" + "\n".join(lines))
+        st.markdown(
+            f"{label_b}に最も差を付けられている帯 TOP3(勝率差={label_a}−{label_b}):\n" + "\n".join(lines)
+        )
 
     # win_rate_diffのNaN(相手側n=0)に依存させない: a側のみの指標なのでcmp["by_band"]を直接フィルタする
     band_all = cmp["by_band"]
@@ -6024,10 +6026,10 @@ def run_selftest() -> bool:
     cmp12 = compare_trade_stats(stats_a12, stats_b12)
     diff12 = cmp12["overall_diff"]
     exp_diff12 = {
-        "total_pnl_usd": 200.0, "n_trades": 2.0, "win_rate_pct": 30.0, "profit_factor": 2.5,
-        "avg_win": 10.0, "avg_loss": 5.0, "rr": 1.67, "max_dd_usd": 60.0, "max_consec_losses": -2.0,
+        "total_pnl_usd": -200.0, "n_trades": -2.0, "win_rate_pct": -30.0, "profit_factor": -2.5,
+        "avg_win": -10.0, "avg_loss": -5.0, "rr": -1.67, "max_dd_usd": -60.0, "max_consec_losses": 2.0,
     }
-    check("12-5a overall_diffが全指標で b-a の符号・値と一致",
+    check("12-5a overall_diffが全指標で a-b(①−②・v6.11反転)の符号・値と一致",
           all(abs(diff12[k] - exp_diff12[k]) < 1e-6 for k in exp_diff12), f"diff12={diff12}")
     bb12 = cmp12["by_band"]
     check("12-5b by_band帯の合併順序が a登場順→bのみの帯を末尾 (BandX,BandY,BandZ)",
@@ -6036,8 +6038,8 @@ def run_selftest() -> bool:
     check("12-5c BandX(両側にあり)の実数値・勝率差・低n判定が正しい",
           row_x12["n_trades_a"] == 5 and row_x12["n_trades_b"] == 6
           and abs(row_x12["win_rate_pct_a"] - 60.0) < 1e-9 and abs(row_x12["win_rate_pct_b"] - 83.333333333) < 1e-6
-          and abs(row_x12["win_rate_diff"] - 23.333333333) < 1e-4
-          and abs(row_x12["total_pnl_diff"] - 100.0) < 1e-9
+          and abs(row_x12["win_rate_diff"] - (-23.333333333)) < 1e-4
+          and abs(row_x12["total_pnl_diff"] - (-100.0)) < 1e-9
           and row_x12["low_n_a"] == False and row_x12["low_n_b"] == False, f"row_x12={dict(row_x12)}")
     row_y12 = bb12.loc["BandY"]
     check("12-5d BandY(aのみ)はb側が0/NaN補完・low_n両True(片側欠落かつn<3)",
