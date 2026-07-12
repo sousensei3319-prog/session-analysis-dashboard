@@ -1750,6 +1750,11 @@ def generate_sample_trades() -> pd.DataFrame:
     Entry/Exit価格が完全一致した本物の30分保有ケースを採用している。
     ペルソナ: 勝率46〜48%・RR約0.78(平均勝ち<平均負け)。負けを欧州序盤(16-18時)・
     NY序盤(21-24時)に意図的に集中させ、「負けやすい時間帯」の可視化デモに使う。
+
+    追補v7: このうち2件(2026-05-10 ETH・2026-05-27 ETH)は師匠側と「同局面ペア」
+    (同一銘柄・エントリー時刻差30分以内)を成すよう決済時刻を短縮・実価格再アンカーした
+    (元の保有時間が長くズームウィンドウを不要に広げていたため)。ペア一覧は
+    generate_sample_trades_mentor の追補v7注記と selftest 18-8 を参照。
     """
     rows = [
         ("2026-04-15 16:05:00", "2026-04-16 12:55:00", "SOL", -508.75, -2.81, "loss", "SHORT", 17, 83.02, 85.35),
@@ -1770,13 +1775,13 @@ def generate_sample_trades() -> pd.DataFrame:
         ("2026-05-06 21:00:00", "2026-05-07 22:05:00", "BTC", -832.29, -1.71, "loss", "LONG", 18, 82522.88, 81108.12),
         ("2026-05-07 15:45:00", "2026-05-09 02:35:00", "ETH", -603.72, -1.01, "loss", "LONG", 22, 2336.24, 2312.74),
         ("2026-05-09 06:00:00", "2026-05-10 05:25:00", "SOL", 589.26, 1.19, "win", "LONG", 14, 92.12, 93.22),
-        ("2026-05-10 09:30:00", "2026-05-10 20:25:00", "ETH", -56.1, -0.25, "loss", "LONG", 24, 2327.41, 2321.52),
+        ("2026-05-10 09:30:00", "2026-05-10 10:40:00", "ETH", -83.03, -0.37, "loss", "LONG", 24, 2327.41, 2318.7),
         ("2026-05-11 17:20:00", "2026-05-13 04:45:00", "SOL", -382.97, -0.41, "loss", "LONG", 24, 95.09, 94.7),
         ("2026-05-13 01:25:00", "2026-05-13 07:50:00", "SOL", -232.68, -0.61, "loss", "SHORT", 15, 94.14, 94.71),
         ("2026-05-13 10:05:00", "2026-05-14 06:15:00", "BTC", 275.71, 1.6, "win", "SHORT", 16, 80739.9, 79449.19),
         ("2026-05-20 23:20:00", "2026-05-21 19:20:00", "BTC", 54.95, 0.27, "win", "LONG", 12, 77460.15, 77665.58),
         ("2026-05-21 21:30:00", "2026-05-23 03:10:00", "BTC", -56.57, -0.49, "loss", "LONG", 12, 77115.09, 76737.47),
-        ("2026-05-27 13:00:00", "2026-05-27 20:00:00", "ETH", 198.4, 0.46, "win", "LONG", 19, 2070.01, 2079.51),
+        ("2026-05-27 13:00:00", "2026-05-27 17:30:00", "ETH", 495.99, 1.15, "win", "LONG", 19, 2070.01, 2093.89),
         ("2026-05-28 10:00:00", "2026-05-29 02:55:00", "HYPE", -917.17, -2.66, "loss", "SHORT", 20, 57.939, 59.478),
         ("2026-05-30 00:45:00", "2026-05-30 12:30:00", "ETH", 54.77, 0.56, "win", "SHORT", 5, 2031.33, 2019.92),
         ("2026-05-30 10:35:00", "2026-05-31 11:55:00", "SOL", 104.91, 0.35, "win", "LONG", 14, 82.76, 83.05),
@@ -1818,29 +1823,36 @@ def generate_sample_trades_mentor() -> pd.DataFrame:
     /損益分布が明確に良い実データを使う。師弟比較ビューの実演データ用。
     (旧v5はGOLDを含み1時間足closeで代用しておりEntry/Exit価格が実際の約定時刻から最大59分
     ズレる欠陥があったため、追補v6で弟子サンプルと同じ分単位実価格アンカー方式に統一した。)
+
+    追補v7: ズームビューの「同局面ペア」実演のため、10件(idx 0,7,8,9,12,17,19,20,36,43)を
+    弟子側トレードとの対(同一銘柄・エントリー時刻差30分以内・保有30分〜6時間)になるよう
+    差し替えた(いずれも実1分足openに完全一致・PnLは実価格から再計算)。うち8件は弟子側の
+    既存トレードへ、残り2件(idx36→disc idx18, idx43→disc idx24)は弟子側の決済時刻短縮と
+    セットで新設。10組全てが勝敗または決済時刻30分以上のいずれかで分岐する
+    (ディスカッション材料。selftest 18-8/18-8bで検証)。
     """
     rows = [
-        ("2026-04-19 12:55:00", "2026-04-20 23:20:00", "SOL", -135.81, -0.46, "loss", "LONG", 25, 85.7, 85.31),
+        ("2026-04-20 16:25:00", "2026-04-20 17:45:00", "HYPE", -104.94, -1.59, "loss", "LONG", 4, 41.418, 40.759),
         ("2026-04-24 05:40:00", "2026-04-25 10:20:00", "ETH", -32.19, -0.27, "loss", "LONG", 13, 2325.52, 2319.27),
         ("2026-04-24 20:35:00", "2026-04-25 07:30:00", "SOL", -114.92, -0.15, "loss", "SHORT", 23, 86.22, 86.35),
         ("2026-04-26 08:15:00", "2026-04-27 03:30:00", "HYPE", 31.91, 0.45, "win", "LONG", 6, 41.421, 41.606),
         ("2026-04-26 18:50:00", "2026-04-27 23:35:00", "ETH", 127.12, 0.74, "win", "SHORT", 6, 2332.9, 2315.61),
         ("2026-04-27 04:15:00", "2026-04-27 09:40:00", "ETH", -8.74, -0.15, "loss", "SHORT", 2, 2365.65, 2369.22),
         ("2026-04-27 07:10:00", "2026-04-27 20:55:00", "BTC", 266.45, 0.91, "win", "SHORT", 24, 78536.23, 77818.01),
-        ("2026-04-28 01:20:00", "2026-04-28 19:55:00", "ETH", 83.35, 0.34, "win", "LONG", 9, 2279.04, 2286.8),
-        ("2026-04-28 02:55:00", "2026-04-28 04:35:00", "SOL", -84.03, -0.52, "loss", "LONG", 5, 84.53, 84.09),
-        ("2026-04-29 01:25:00", "2026-04-30 00:45:00", "HYPE", 200.5, 0.66, "win", "SHORT", 17, 39.731, 39.469),
+        ("2026-04-20 20:00:00", "2026-04-21 00:30:00", "BTC", 69.84, 0.97, "win", "LONG", 3, 75027.26, 75754.39),
+        ("2026-06-21 16:20:00", "2026-06-21 17:50:00", "BTC", -172.8, -0.48, "loss", "LONG", 12, 64252.0, 63945.64),
+        ("2026-04-25 13:30:00", "2026-04-25 16:25:00", "HYPE", 74.4, 0.15, "win", "LONG", 16, 41.117, 41.179),
         ("2026-04-29 22:50:00", "2026-05-01 06:30:00", "BTC", 291.65, 0.35, "win", "SHORT", 21, 76605.45, 76337.5),
         ("2026-05-01 04:20:00", "2026-05-01 16:10:00", "BTC", 491.3, 0.85, "win", "LONG", 25, 76435.4, 77088.86),
-        ("2026-05-02 03:50:00", "2026-05-02 10:10:00", "ETH", 89.89, 0.35, "win", "SHORT", 21, 2307.08, 2299.08),
+        ("2026-04-26 00:30:00", "2026-04-26 01:40:00", "HYPE", 495.6, 1.77, "win", "SHORT", 10, 41.622, 40.884),
         ("2026-05-02 09:15:00", "2026-05-03 15:20:00", "ETH", 52.7, 0.31, "win", "LONG", 8, 2294.09, 2301.25),
         ("2026-05-05 00:55:00", "2026-05-05 19:55:00", "SOL", -175.33, -0.33, "loss", "SHORT", 21, 84.49, 84.77),
         ("2026-05-05 09:45:00", "2026-05-05 11:15:00", "SOL", -92.31, -0.4, "loss", "SHORT", 22, 84.25, 84.59),
         ("2026-05-05 09:55:00", "2026-05-06 01:45:00", "SOL", 20.4, 0.94, "win", "LONG", 2, 84.34, 85.13),
-        ("2026-05-06 11:05:00", "2026-05-07 01:15:00", "ETH", 98.04, 0.28, "win", "SHORT", 24, 2370.11, 2363.46),
+        ("2026-06-07 21:35:00", "2026-06-08 02:15:00", "BTC", 166.4, 0.8, "win", "LONG", 8, 61790.21, 62287.45),
         ("2026-05-07 13:30:00", "2026-05-08 20:30:00", "BTC", -183.22, -0.78, "loss", "LONG", 10, 80933.34, 80300.0),
-        ("2026-05-10 21:25:00", "2026-05-12 08:55:00", "ETH", 340.91, 0.68, "win", "LONG", 14, 2324.99, 2340.74),
-        ("2026-05-11 01:05:00", "2026-05-11 05:25:00", "BTC", 296.33, 0.37, "win", "SHORT", 24, 81423.36, 81119.46),
+        ("2026-06-16 19:30:00", "2026-06-16 21:25:00", "SOL", 42.56, 0.16, "win", "SHORT", 14, 75.04, 74.92),
+        ("2026-07-06 04:05:00", "2026-07-06 07:25:00", "SOL", 241.74, 1.58, "win", "LONG", 9, 81.0, 82.28),
         ("2026-05-11 05:30:00", "2026-05-11 16:40:00", "BTC", -101.62, -0.51, "loss", "LONG", 9, 81151.87, 80736.63),
         ("2026-05-12 09:40:00", "2026-05-12 12:35:00", "BTC", -218.73, -0.46, "loss", "LONG", 17, 81564.58, 81190.36),
         ("2026-05-13 09:20:00", "2026-05-14 14:55:00", "BTC", 451.05, 0.94, "win", "SHORT", 16, 80607.99, 79853.16),
@@ -1856,14 +1868,14 @@ def generate_sample_trades_mentor() -> pd.DataFrame:
         ("2026-05-31 17:40:00", "2026-06-01 04:05:00", "BTC", 75.92, 0.38, "win", "SHORT", 12, 73886.02, 73602.47),
         ("2026-06-01 05:00:00", "2026-06-01 17:15:00", "SOL", 86.39, 1.02, "win", "SHORT", 5, 81.59, 80.76),
         ("2026-06-03 01:40:00", "2026-06-03 17:40:00", "BTC", 464.55, 0.93, "win", "SHORT", 14, 67610.01, 66979.18),
-        ("2026-06-07 13:15:00", "2026-06-07 15:20:00", "ETH", 101.93, 1.02, "win", "LONG", 3, 1589.33, 1605.5),
+        ("2026-05-10 09:15:00", "2026-05-10 10:40:00", "ETH", 125.28, 0.36, "win", "SHORT", 12, 2327.07, 2318.7),
         ("2026-06-09 20:25:00", "2026-06-11 00:05:00", "BTC", -177.91, -0.68, "loss", "LONG", 9, 62606.23, 62180.0),
         ("2026-06-10 05:45:00", "2026-06-10 07:25:00", "SOL", -72.86, -0.59, "loss", "LONG", 13, 65.61, 65.22),
         ("2026-06-11 18:40:00", "2026-06-11 21:35:00", "BTC", -67.78, -0.27, "loss", "LONG", 16, 62923.01, 62753.3),
         ("2026-06-11 19:50:00", "2026-06-12 21:50:00", "ETH", 47.98, 0.55, "win", "LONG", 3, 1658.22, 1667.33),
         ("2026-06-16 16:05:00", "2026-06-17 05:50:00", "BTC", 360.73, 0.87, "win", "SHORT", 17, 66408.0, 65830.01),
         ("2026-06-16 19:15:00", "2026-06-17 03:05:00", "BTC", -487.15, -0.66, "loss", "LONG", 22, 66540.02, 66102.01),
-        ("2026-06-17 00:30:00", "2026-06-18 02:05:00", "ETH", -242.99, -0.44, "loss", "LONG", 25, 1779.88, 1772.12),
+        ("2026-05-27 13:10:00", "2026-05-27 13:45:00", "ETH", -132.6, -0.34, "loss", "LONG", 15, 2070.4, 2063.44),
         ("2026-06-20 10:55:00", "2026-06-21 04:00:00", "BTC", -182.57, -0.35, "loss", "SHORT", 14, 63583.99, 63805.9),
         ("2026-06-26 10:20:00", "2026-06-26 20:10:00", "ETH", 516.71, 0.95, "win", "SHORT", 15, 1565.42, 1550.5),
         ("2026-06-27 12:55:00", "2026-06-28 16:10:00", "BTC", 40.9, 0.26, "win", "SHORT", 6, 60258.56, 60101.27),
@@ -4292,24 +4304,45 @@ def render_trade_history_tab() -> None:
                 st.warning(prefix + msg)
 
     labels = [r["label"] for r in records]
+    # v6.6: 複数データセット時は「合算」を先頭に追加(ユーザー要望: 弟子+師匠まとめた成績)。
+    _ALL_DATASETS = "🤝 全データセット合算"
     if len(labels) >= 2:
-        active_label = st.selectbox("トレード統計の対象", labels, key="trade_history_active_label")
+        active_label = st.selectbox(
+            "トレード統計の対象", [_ALL_DATASETS] + labels, key="trade_history_active_label",
+        )
     else:
         active_label = labels[0]
-    active_rec = next(r for r in records if r["label"] == active_label)
+    combined_stats = active_label == _ALL_DATASETS
 
-    trades_df = active_rec["df"]
-    source_name = active_rec["source_name"]
-    if trades_df is None or trades_df.empty:
-        st.info(f"「{active_label}」に有効なトレードデータがありません。")
-        if len(records) >= 2:
-            st.divider()
-            _render_trader_comparison_view(records)
-        return
-
-    loaded_at = active_rec.get("loaded_at")
-    loaded_str = loaded_at.strftime("%Y-%m-%d %H:%M") if loaded_at is not None else "不明"
-    st.caption(f"📊 データ元: {source_name} | ⏱ 読込: {loaded_str} JST時点")
+    if combined_stats:
+        parts: list[pd.DataFrame] = []
+        srcs: list[str] = []
+        for r in records:
+            if r["df"] is None or r["df"].empty:
+                continue
+            p = r["df"].copy()
+            p.insert(0, "データセット", r["label"])
+            parts.append(p)
+            srcs.append(f"{r['label']}({len(p)}件)")
+        if not parts:
+            st.info("有効なトレードデータがありません。")
+            return
+        trades_df = pd.concat(parts, ignore_index=True)
+        source_name = " + ".join(srcs)
+        st.caption(f"📊 データ元(合算): {source_name} | 指標は全データセットを1つの成績として時系列合算で計算")
+    else:
+        active_rec = next(r for r in records if r["label"] == active_label)
+        trades_df = active_rec["df"]
+        source_name = active_rec["source_name"]
+        if trades_df is None or trades_df.empty:
+            st.info(f"「{active_label}」に有効なトレードデータがありません。")
+            if len(records) >= 2:
+                st.divider()
+                _render_trader_comparison_view(records)
+            return
+        loaded_at = active_rec.get("loaded_at")
+        loaded_str = loaded_at.strftime("%Y-%m-%d %H:%M") if loaded_at is not None else "不明"
+        st.caption(f"📊 データ元: {source_name} | ⏱ 読込: {loaded_str} JST時点")
     try:
         df = assign_trade_sessions(trades_df)
         stats = compute_trade_stats(df)
@@ -4340,7 +4373,7 @@ def render_trade_history_tab() -> None:
 
     st.metric("最大連敗数", f"{overall['max_consec_losses']}回")
 
-    st.markdown("**トレード一覧**")
+    st.markdown("**トレード一覧**" + ("(全データセット・時系列)" if combined_stats else ""))
     disp = df.copy().sort_values("Entry_Time")
     disp = disp.rename(columns={"band": "詳細帯", "parent": "大枠"})
     st.dataframe(disp, width="stretch")
@@ -4348,22 +4381,54 @@ def render_trade_history_tab() -> None:
     st.markdown("**累積損益曲線**")
     sorted_df = df.sort_values("Entry_Time")
     cum_fig = go.Figure()
-    cum_fig.add_trace(
-        go.Scatter(
-            x=sorted_df["Entry_Time"], y=sorted_df["PnL_USD"].cumsum(), mode="lines+markers", name="累積損益(USD)",
+    if combined_stats and "データセット" in sorted_df.columns:
+        # v6.6: 合算(太線)+データセット別(細線)を重ね描き
+        cum_fig.add_trace(
+            go.Scatter(
+                x=sorted_df["Entry_Time"], y=sorted_df["PnL_USD"].cumsum(),
+                mode="lines+markers", name="🤝 合算", line=dict(width=3),
+            )
         )
-    )
+        for i, (ds_lbl, sub) in enumerate(sorted_df.groupby("データセット", sort=False)):
+            sub = sub.sort_values("Entry_Time")
+            cum_fig.add_trace(
+                go.Scatter(
+                    x=sub["Entry_Time"], y=sub["PnL_USD"].cumsum(), mode="lines",
+                    name=ds_lbl, line=dict(width=1.5, dash="dot",
+                                           color=get_trade_marker_color(ds_lbl, i)),
+                )
+            )
+    else:
+        cum_fig.add_trace(
+            go.Scatter(
+                x=sorted_df["Entry_Time"], y=sorted_df["PnL_USD"].cumsum(),
+                mode="lines+markers", name="累積損益(USD)",
+            )
+        )
     cum_fig.update_layout(
         template="plotly_dark", height=380, margin=dict(l=40, r=20, t=40, b=20), yaxis_title="累積損益(USD)",
     )
     st.plotly_chart(cum_fig, width="stretch")
 
     st.markdown("**詳細帯別 損益**")
-    by_band = stats["by_band"].reindex(BAND_ORDER).reset_index()
-    band_fig = px.bar(
-        by_band, x="band", y="total_pnl_usd", template="plotly_dark",
-        labels={"band": "詳細帯", "total_pnl_usd": "損益(USD)"}, category_orders={"band": BAND_ORDER},
-    )
+    if combined_stats and "データセット" in df.columns:
+        # v6.6: データセット別に色分けしたグループ棒(帯ごとの貢献が見比べられる)
+        gb = (
+            df.groupby(["band", "データセット"])["PnL_USD"].sum().reset_index()
+            .rename(columns={"PnL_USD": "total_pnl_usd"})
+        )
+        band_fig = px.bar(
+            gb, x="band", y="total_pnl_usd", color="データセット", barmode="group",
+            template="plotly_dark",
+            labels={"band": "詳細帯", "total_pnl_usd": "損益(USD)"},
+            category_orders={"band": BAND_ORDER},
+        )
+    else:
+        by_band = stats["by_band"].reindex(BAND_ORDER).reset_index()
+        band_fig = px.bar(
+            by_band, x="band", y="total_pnl_usd", template="plotly_dark",
+            labels={"band": "詳細帯", "total_pnl_usd": "損益(USD)"}, category_orders={"band": BAND_ORDER},
+        )
     band_fig.update_layout(height=380, margin=dict(l=40, r=20, t=40, b=20))
     st.plotly_chart(band_fig, width="stretch")
 
@@ -6156,6 +6221,43 @@ def run_selftest() -> bool:
         _gen_text18 = _gen18().to_csv(index=False).replace("\r\n", "\n")
         check(f"18-7 {_label18b} CSVファイルとto_csv文字列が完全一致",
               _file_text18 == _gen_text18, f"len file={len(_file_text18)} gen={len(_gen_text18)}")
+
+    # 18-8: 追補v7 同局面ペア(同銘柄・エントリー時刻差30分以内)。両生成関数の出力から
+    # 貪欲最近傍マッチング(エントリー差が小さい順に1対1対応)で純ロジック計算する
+    # (ハードコードのインデックス一覧に依存しない=行を並べ替えても崩れない検査)。
+    def _find_same_scene_pairs18(disc_df: pd.DataFrame, mentor_df: pd.DataFrame,
+                                  max_entry_diff_min: float = 30.0) -> list[dict]:
+        d_entry = pd.to_datetime(disc_df["Entry_Time(JST)"])
+        m_entry = pd.to_datetime(mentor_df["Entry_Time(JST)"])
+        d_exit = pd.to_datetime(disc_df["Exit_Time(JST)"])
+        m_exit = pd.to_datetime(mentor_df["Exit_Time(JST)"])
+        used_mentor: set[int] = set()
+        found: list[dict] = []
+        for di in range(len(disc_df)):
+            cands = []
+            for mi in range(len(mentor_df)):
+                if mi in used_mentor or disc_df["Symbol"].iat[di] != mentor_df["Symbol"].iat[mi]:
+                    continue
+                ediff = abs((d_entry.iat[di] - m_entry.iat[mi]).total_seconds()) / 60.0
+                if ediff <= max_entry_diff_min:
+                    cands.append((ediff, mi))
+            if not cands:
+                continue
+            cands.sort(key=lambda c: c[0])
+            ediff_best, best_mi = cands[0]
+            used_mentor.add(best_mi)
+            xdiff = abs((d_exit.iat[di] - m_exit.iat[best_mi]).total_seconds()) / 60.0
+            divergent = (disc_df["Win_Loss"].iat[di] != mentor_df["Win_Loss"].iat[best_mi]) or (xdiff >= 30.0)
+            found.append({"disc_idx": di, "mentor_idx": best_mi, "entry_diff_min": ediff_best,
+                          "exit_diff_min": xdiff, "divergent": divergent})
+        return found
+
+    pairs18 = _find_same_scene_pairs18(disc18, mentor18)
+    check("18-8 同局面ペア(同銘柄・エントリー差30分以内)が10組以上", len(pairs18) >= 10,
+          f"n={len(pairs18)}")
+    ndiv18 = sum(1 for p in pairs18 if p["divergent"])
+    check("18-8b 同局面ペアのうち結果/決済時刻が分かれるものが6組以上", ndiv18 >= 6,
+          f"divergent={ndiv18}/{len(pairs18)}")
 
     print("\n" + "=" * 78)
     if all_ok:
