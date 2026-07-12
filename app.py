@@ -153,6 +153,11 @@ FINE_CACHE_TTL_SEC = 1800    # 5分足/15分足の短期キャッシュ(v6.1: 60
 MINUTE_CACHE_TTL_MIN = MINUTE_CACHE_TTL_SEC // 60
 FINE_CACHE_TTL_MIN = FINE_CACHE_TTL_SEC // 60
 
+# v6.3: チャート描画の自動間引き上限(1行あたりの最大バー数)。分足×長期間などで
+# 数千〜数万本をSVG描画するとホバーが「かくかく」する(クライアント側の負荷)ため、
+# 超過時は表示専用に粗い足へ自動リサンプルする。集計・クリック詳細・ズームは影響なし。
+CHART_MAX_BARS_PER_ROW = 3000
+
 # ---- 銘柄マスタ(研究班R1実証結果に基づく。推測でティッカーを変えない) -----------------
 SYMBOL_MASTER: dict[str, dict[str, Any]] = {
     "BTC": {"source": "ccxt", "exchange": "binance", "ticker": "BTC/USDT"},
@@ -2502,6 +2507,28 @@ def _hover_customdata(df: pd.DataFrame) -> np.ndarray:
     return np.array(rows, dtype=object)
 
 
+def _median_bar_minutes(df: pd.DataFrame) -> float:
+    """v6.3: dfの足間隔(分)の中央値。閉場ギャップ等の外れ値に頑健なようmedianを使う。"""
+    if len(df) < 2:
+        return 0.0
+    diffs = pd.Series(df.index).diff().dropna()
+    if diffs.empty:
+        return 0.0
+    return float(diffs.median().total_seconds() / 60.0)
+
+
+def _auto_decimation_rule(max_len: int, base_minutes: float,
+                          max_bars: int = CHART_MAX_BARS_PER_ROW) -> Optional[str]:
+    """v6.3: 表示バー数がmax_barsを超える場合に表示専用の粗い足ルール(例 "2min")を返す。
+    上限内・間隔不明ならNone(間引きしない)。集計/クリック詳細/ズームには使わない。
+    """
+    if max_len <= max_bars or base_minutes <= 0:
+        return None
+    import math
+    factor = math.ceil(max_len / max_bars)
+    return f"{int(round(base_minutes * factor))}min"
+
+
 def build_candlestick_chart(
     data: dict[str, pd.DataFrame],
     timeframe_rule: Optional[str],
@@ -2538,6 +2565,19 @@ def build_candlestick_chart(
             skipped.append(label)
             continue
         resampled[label] = d
+
+    # v6.3: 描画負荷対策の自動間引き(表示専用)。最長銘柄のバー数が上限を超える場合、
+    # 全銘柄を同じ粗い足へ再リサンプルする(行間の時間軸整合を保つため全銘柄同一ルール)。
+    if resampled:
+        max_len = max(len(d) for d in resampled.values())
+        base_min = _median_bar_minutes(max(resampled.values(), key=len))
+        deci_rule = _auto_decimation_rule(max_len, base_min)
+        if deci_rule:
+            decimated: dict[str, pd.DataFrame] = {}
+            for lbl, d in resampled.items():
+                d2 = resample_ohlcv(d, deci_rule)
+                decimated[lbl] = d2 if (d2 is not None and not d2.empty) else d
+            resampled = decimated
 
     labels = list(resampled.keys())
     if not labels:
@@ -3468,6 +3508,23 @@ def render_chart_tab(
             continue
         detail_data[label] = d
         base_map[label] = float(d["close"].iloc[0])
+    # v6.3: チャート本体と同じ自動間引きを詳細データにも適用する
+    # (クリック詳細パネル=画面に表示されているバーと同じ粒度に揃える)。
+    if detail_data:
+        _max_len = max(len(d) for d in detail_data.values())
+        _base_min = _median_bar_minutes(max(detail_data.values(), key=len))
+        _deci = _auto_decimation_rule(_max_len, _base_min)
+        if _deci:
+            _dd: dict[str, pd.DataFrame] = {}
+            for _lbl, _d in detail_data.items():
+                _d2 = resample_ohlcv(_d, _deci)
+                _dd[_lbl] = _d2 if (_d2 is not None and not _d2.empty) else _d
+            detail_data = _dd
+            base_map = {lbl: float(d["close"].iloc[0]) for lbl, d in detail_data.items()}
+            st.caption(
+                f"⚡ 描画負荷対策: バー数が上限({CHART_MAX_BARS_PER_ROW:,}本/行)を超えるため、"
+                f"表示を約{_deci}の足へ自動間引きしています(統計集計・🔍ズームビューは元の足のまま)。"
+            )
     trade_rows_for_click = _mapped_trade_rows_for_click(detail_data, overlays) if overlays else {}
     if skipped:
         st.warning(f"次の銘柄は指定期間・足種でのリサンプル後にデータが空のため、チャートから除外しました: {', '.join(skipped)}")
@@ -5852,6 +5909,17 @@ def run_selftest() -> bool:
           and "値幅" in candles16b[0].hovertemplate)
     check("16-2g hoverモード: 価格行customdataがあり・hovertemplateに『変動幅』",
           candles16b[1].customdata is not None and "変動幅" in candles16b[1].hovertemplate)
+
+    # 16-5: v6.3 チャート自動間引き(描画負荷対策)の純ロジック
+    check("16-5a 上限内は間引きなし", _auto_decimation_rule(3000, 1.0) is None)
+    check("16-5b 1分足6000本→2minへ間引き", _auto_decimation_rule(6000, 1.0) == "2min")
+    check("16-5c 1時間足8760本→180minへ間引き", _auto_decimation_rule(8760, 60.0) == "180min")
+    check("16-5d 足間隔不明(0分)は間引きしない", _auto_decimation_rule(10000, 0.0) is None)
+    idx165 = pd.date_range("2026-01-01", periods=10, freq="1min", tz="Asia/Tokyo")
+    df165 = pd.DataFrame(
+        {"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0}, index=idx165,
+    )
+    check("16-5e 足間隔の中央値=1分", abs(_median_bar_minutes(df165) - 1.0) < 1e-9)
 
     # 16-3: build_click_detail(欄外パネルの純ロジック) — 該当バー・範囲外・欠損
     idx16 = pd.date_range("2026-02-01 00:00", periods=5, freq="1h", tz="Asia/Tokyo")
