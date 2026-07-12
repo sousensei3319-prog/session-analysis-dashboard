@@ -2352,12 +2352,14 @@ def _ohlc_hovertemplate(is_pct: bool = False) -> str:
     同時に供給されている前提(_hover_customdata参照)。通貨記号は付けない(日経225等の円建て
     銘柄があるため数値のみ+日本語ラベルで表現する)。
     """
-    head = "%{x|%Y-%m-%d %H:%M}<br>"
+    # v6.2: 銘柄名は横に付くフラグ(<extra>)でなく枠内1行目に太字で統合する
+    # (横フラグは本体と別枠で描画され「枠が崩れた」ように見えるため廃止)。
+    head = "<b>%{fullData.name}</b>  %{x|%Y-%m-%d %H:%M}<br>"
     # customdataは_hover_customdataで整形済み文字列(書式指定子を付けない。
     # plotly.jsが:+,.2fの符号フラグを解釈できないための方式変更・実機確認済み)
     tail = (
         "<br>変動幅 %{customdata[1]} (%{customdata[2]})"
-        "<br>値幅(安値→高値) %{customdata[3]}<extra>%{fullData.name}</extra>"
+        "<br>値幅(安値→高値) %{customdata[3]}<extra></extra>"
     )
     if is_pct:
         return head + "累積騰落率 %{close:.2f}%<br>終値 %{customdata[0]}" + tail
@@ -2365,8 +2367,8 @@ def _ohlc_hovertemplate(is_pct: bool = False) -> str:
 
 
 def _volume_hovertemplate() -> str:
-    """追補v5§3: 出来高barトレース用の日本語hovertemplate。"""
-    return "%{x|%Y-%m-%d %H:%M}<br>出来高 %{y:,.0f}<extra>%{fullData.name}</extra>"
+    """追補v5§3: 出来高barトレース用の日本語hovertemplate(v6.2: 銘柄名を枠内へ)。"""
+    return "<b>%{fullData.name}</b>  %{x|%Y-%m-%d %H:%M}<br>出来高 %{y:,.0f}<extra></extra>"
 
 
 def build_click_detail(
@@ -2484,6 +2486,11 @@ def _hover_customdata(df: pd.DataFrame) -> np.ndarray:
         if np.isfinite(c) and np.isfinite(o) and o != 0:
             diff_s = f"{c - o:+,.2f}"
             pct_s = f"{(c / o - 1.0) * 100.0:+.2f}%"
+            # 「-0.00」「+0.00%」等のマイナスゼロ表示を排除(v6.2・見た目の違和感解消)
+            if diff_s in ("+0.00", "-0.00"):
+                diff_s = "0.00"
+            if pct_s in ("+0.00%", "-0.00%"):
+                pct_s = "0.00%"
         else:
             diff_s, pct_s = "—", "—"
         rows.append([
@@ -2665,7 +2672,11 @@ def build_candlestick_chart(
         height=320 * rows_total,  # 追補v5§1: 1行あたり約320px
     )
     if not is_click_mode:
-        layout_kwargs["hoverlabel"] = dict(font_size=11, bgcolor="rgba(30,30,30,0.75)")
+        # v6.2: ユーザー要望「枠を大きく・文字を読みやすく」— 14px+ほぼ不透明+白文字+左揃え
+        layout_kwargs["hoverlabel"] = dict(
+            font_size=14, font_color="#FFFFFF", bgcolor="rgba(13,17,23,0.96)",
+            bordercolor="rgba(160,160,160,0.7)", align="left",
+        )
     fig.update_layout(**layout_kwargs)
     return fig, skipped, marker_count
 
@@ -3666,7 +3677,10 @@ def render_trade_zoom_section(
     fig.update_layout(
         template="plotly_dark", xaxis_rangeslider_visible=False, hovermode="x unified",
         height=450, margin=dict(l=10, r=10, t=30, b=10),
-        hoverlabel=dict(font_size=11, bgcolor="rgba(30,30,30,0.75)"),  # 追補v5§3: コンパクト+半透明
+        hoverlabel=dict(
+            font_size=14, font_color="#FFFFFF", bgcolor="rgba(13,17,23,0.96)",
+            bordercolor="rgba(160,160,160,0.7)", align="left",
+        ),  # v6.2: チャートタブと同一の読みやすいホバー様式
     )
     st.plotly_chart(fig, width="stretch")
     st.caption(format_data_source_caption(symbol, meta, ttl_min))
