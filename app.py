@@ -3849,6 +3849,46 @@ def render_trade_zoom_section(
     )
 
 
+def build_multi_symbol_weekday_band_heatmap(
+    matrices: dict[str, tuple[pd.DataFrame, pd.DataFrame]],
+) -> go.Figure:
+    """v6.7: 銘柄×詳細帯(行)×曜日(列)の一括ヒートマップ(ユーザー要望「何曜日の何時に
+    どの銘柄が上がりやすい/落ちやすいかをいっぺんに見たい」)。
+    行は銘柄ごとにBAND_ORDER順で積み上げ(ラベル「銘柄｜帯」)、色は全銘柄共通の
+    ゼロ中心発散スケール(緑=上がりやすい/赤=落ちやすい)。hoverにn(サンプル日数)。
+    matrices: 銘柄ラベル -> (return_matrix, n_matrix)  ※compute_session_weekday_matrixの戻り値。
+    """
+    y_labels: list[str] = []
+    z_rows: list[list[float]] = []
+    n_rows: list[list[float]] = []
+    for sym, (ret_m, n_m) in matrices.items():
+        rm = ret_m.reindex(index=BAND_ORDER, columns=WEEKDAY_LABELS)
+        nm = n_m.reindex(index=BAND_ORDER, columns=WEEKDAY_LABELS)
+        for band in BAND_ORDER:
+            y_labels.append(f"{sym}｜{band}")
+            z_rows.append([float(v) if pd.notna(v) else np.nan for v in rm.loc[band]])
+            n_rows.append([float(v) if pd.notna(v) else 0.0 for v in nm.loc[band]])
+    vals = np.array(z_rows, dtype=float)
+    abs_vals = np.abs(vals[~np.isnan(vals)])
+    max_abs = float(abs_vals.max()) if abs_vals.size else 1.0
+    max_abs = max_abs if max_abs > 0 else 1.0
+    text = [["—" if pd.isna(v) else f"{v:+.2f}" for v in row] for row in vals]
+    fig = go.Figure(data=go.Heatmap(
+        z=vals, x=WEEKDAY_LABELS, y=y_labels, customdata=np.array(n_rows),
+        colorscale="RdYlGn", zmid=0, zmin=-max_abs, zmax=max_abs,
+        text=text, texttemplate="%{text}", textfont=dict(size=10),
+        hovertemplate="%{y}<br>曜日=%{x}<br>平均騰落率=%{z:.3f}%<br>n(日数)=%{customdata:.0f}<extra></extra>",
+        colorbar=dict(title="平均騰落率(%)"),
+    ))
+    fig.update_layout(
+        template="plotly_dark", margin=dict(l=40, r=20, t=40, b=20),
+        height=max(420, 26 * len(y_labels) + 140),
+        xaxis_title="曜日", yaxis_title="銘柄｜詳細帯",
+        yaxis=dict(autorange="reversed"),  # 先頭銘柄を最上段に
+    )
+    return fig
+
+
 def render_session_analysis_tab(
     data_a: dict[str, pd.DataFrame],
     stats_a: dict[str, pd.DataFrame],
@@ -3898,6 +3938,53 @@ def render_session_analysis_tab(
             _panel(data_b, stats_b, period_b, "Period B", meta_b)
     else:
         _panel(data_a, stats_a, period_a, "集計結果", meta_a)
+
+    # v6.7: 曜日×時間帯×銘柄の一括ヒートマップ(選択期間の1hデータから算出。
+    # 比較モード時はPeriod A基準)。
+    st.markdown("---")
+    st.subheader("📆 曜日×時間帯×銘柄 一括ヒートマップ")
+    st.caption(
+        f"{_period_caption(period_a)} | 各セル=その銘柄の(曜日×詳細帯)の平均騰落率%。"
+        "緑=上がりやすい/赤=落ちやすい(全銘柄共通のゼロ中心スケール)。hoverでn(サンプル日数)。"
+        "⚠️1セルあたりのnは十数日程度と小さいため傾向の当たり付け用(将来の値動きを保証しない)。"
+    )
+    mats: dict[str, tuple[pd.DataFrame, pd.DataFrame]] = {}
+    for lbl, df_ in data_a.items():
+        try:
+            mats[lbl] = compute_session_weekday_matrix(df_)
+        except Exception as e:  # noqa: BLE001
+            st.warning(f"{lbl}: 曜日×帯の集計に失敗しました({e})")
+    if mats:
+        st.plotly_chart(build_multi_symbol_weekday_band_heatmap(mats), width="stretch")
+
+    # v6.7: 月別×銘柄(長期日足・グループ棒グラフ。ユーザー指定によりヒートマップではなくグラフ)。
+    st.markdown("---")
+    st.subheader("📅 月別×銘柄(長期日足)")
+    yrs = st.radio("集計年数", [3, 5, 10], index=1, horizontal=True, key="session_month_years")
+    today_ = date.today()
+    with st.spinner("長期日足を取得中..."):
+        try:
+            data_m, meta_m, errors_m = fetch_daily_bundle(list(data_a.keys()), int(yrs), today_)
+        except Exception as e:  # noqa: BLE001
+            st.warning(f"長期日足の取得に失敗しました({e})")
+            data_m, meta_m, errors_m = {}, {}, []
+    for e in errors_m:
+        st.warning(e)
+    if data_m:
+        month_stats: dict[str, pd.DataFrame] = {}
+        for lbl, ddf in data_m.items():
+            try:
+                month_stats[lbl] = compute_month_stats(ddf, today_)
+            except Exception as e:  # noqa: BLE001
+                st.warning(f"{lbl}: 月別集計に失敗しました({e})")
+        if month_stats:
+            for lbl in month_stats:
+                st.caption(format_data_source_caption(lbl, (meta_m or {}).get(lbl), DAILY_CACHE_TTL_MIN))
+            st.caption(
+                f"集計期間: 過去{yrs}年の日足(進行中の当月は集計から自動除外) | "
+                "⚠️月別季節性はn=年数しかないため統計的に弱い参考情報です。"
+            )
+            st.plotly_chart(build_month_bar_chart(month_stats), width="stretch")
 
 
 def render_weekday_section(
@@ -6084,6 +6171,15 @@ def run_selftest() -> bool:
     row166n["pnl_percent"] = 0.0
     mg166n, _, _ = _trade_risk_labels(row166n, ohlcv166)
     check("16-6e PnL0%は証拠金算出不能=—", mg166n == "—", f"got={mg166n}")
+
+    # 16-7: v6.7 銘柄×帯×曜日 一括ヒートマップの構造
+    _rm167 = pd.DataFrame(0.1, index=BAND_ORDER, columns=WEEKDAY_LABELS)
+    _nm167 = pd.DataFrame(5, index=BAND_ORDER, columns=WEEKDAY_LABELS)
+    fig167 = build_multi_symbol_weekday_band_heatmap({"AAA": (_rm167, _nm167), "BBB": (_rm167 * -1, _nm167)})
+    hm167 = fig167.data[0]
+    check("16-7a 行数=銘柄2×9帯=18", len(hm167.y) == 18, f"got={len(hm167.y)}")
+    check("16-7b 行ラベル=『銘柄｜帯』形式", hm167.y[0] == f"AAA｜{BAND_ORDER[0]}" and hm167.y[9] == f"BBB｜{BAND_ORDER[0]}")
+    check("16-7c z形状=(18,7)・ゼロ中心", np.asarray(hm167.z).shape == (18, 7) and fig167.data[0].zmid == 0)
 
     # 16-5: v6.3 チャート自動間引き(描画負荷対策)の純ロジック
     check("16-5a 上限内は間引きなし", _auto_decimation_rule(3000, 1.0) is None)
