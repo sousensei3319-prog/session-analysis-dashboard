@@ -2357,23 +2357,28 @@ def _ohlc_hovertemplate(is_pct: bool = False) -> str:
     同時に供給されている前提(_hover_customdata参照)。通貨記号は付けない(日経225等の円建て
     銘柄があるため数値のみ+日本語ラベルで表現する)。
     """
-    # v6.2: 銘柄名は横に付くフラグ(<extra>)でなく枠内1行目に太字で統合する
-    # (横フラグは本体と別枠で描画され「枠が崩れた」ように見えるため廃止)。
-    head = "<b>%{fullData.name}</b>  %{x|%Y-%m-%d %H:%M}<br>"
-    # customdataは_hover_customdataで整形済み文字列(書式指定子を付けない。
-    # plotly.jsが:+,.2fの符号フラグを解釈できないための方式変更・実機確認済み)
-    tail = (
+    # v6.4: hovermode="x unified"(全銘柄を1つの箱に統合)前提のテンプレート。
+    # 日時は統合箱のタイトル(xaxis.hoverformat)が出すため各行には書かない。
+    # 複数銘柄が重なるボラチャート行は1銘柄1行のコンパクト表記にする(箱の巨大化防止)。
+    # customdataは_hover_customdataで整形済み文字列(plotly.jsが:+,.2fの符号フラグを
+    # 解釈できないための方式・実機確認済み)。
+    if is_pct:
+        return (
+            "<b>%{fullData.name}</b> 累積騰落率 %{close:.2f}%"
+            "｜終値 %{customdata[0]}｜変動幅 %{customdata[1]} (%{customdata[2]})"
+            "｜値幅 %{customdata[3]}<extra></extra>"
+        )
+    return (
+        "<b>%{fullData.name}</b><br>始値 %{open:,.2f}<br>高値 %{high:,.2f}"
+        "<br>安値 %{low:,.2f}<br>終値 %{close:,.2f}"
         "<br>変動幅 %{customdata[1]} (%{customdata[2]})"
         "<br>値幅(安値→高値) %{customdata[3]}<extra></extra>"
     )
-    if is_pct:
-        return head + "累積騰落率 %{close:.2f}%<br>終値 %{customdata[0]}" + tail
-    return head + "始値 %{open:,.2f}<br>高値 %{high:,.2f}<br>安値 %{low:,.2f}<br>終値 %{close:,.2f}" + tail
 
 
 def _volume_hovertemplate() -> str:
-    """追補v5§3: 出来高barトレース用の日本語hovertemplate(v6.2: 銘柄名を枠内へ)。"""
-    return "<b>%{fullData.name}</b>  %{x|%Y-%m-%d %H:%M}<br>出来高 %{y:,.0f}<extra></extra>"
+    """追補v5§3: 出来高barトレース用の日本語hovertemplate(v6.4: unified箱用に日時なし)。"""
+    return "<b>%{fullData.name}</b> 出来高 %{y:,.0f}<extra></extra>"
 
 
 def build_click_detail(
@@ -2703,10 +2708,11 @@ def build_candlestick_chart(
     fig.update_xaxes(
         showspikes=True, spikemode="across", spikesnap="cursor",
         spikethickness=1, spikedash="dot", spikecolor="rgba(180,180,180,0.6)",
+        hoverformat="%Y-%m-%d %H:%M",  # v6.4: unified箱のタイトル(日時)の書式
     )  # 追補v5§2: 全xaxisに縦ライン設定(行数に依らず一括=既知の罠⑤への対応)
     layout_kwargs: dict[str, Any] = dict(
         template="plotly_dark",
-        hovermode="x",  # 追補v5§2: どの行にカーソルを置いても全行に同時刻の縦ラインを表示
+        hovermode="x unified",  # v6.4: 全銘柄を1つの箱に統合(銘柄毎の箱が重なり文字が隠れる問題の根治)
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         margin=dict(l=40, r=20, t=40, b=20),
         height=320 * rows_total,  # 追補v5§1: 1行あたり約320px
@@ -3481,51 +3487,48 @@ def render_chart_tab(
             list(chart_data.keys()), trade_datasets, selected_marker_labels or [],
         )
 
-    # 追補v5§3: 詳細表示方法の切替(既定=欄外パネル)。
-    detail_choice = st.radio(
-        "詳細表示方法", ["欄外パネル(クリックで固定)", "チャート内ホバー"],
-        index=0, key="chart_detail_mode", horizontal=True,
-    )
-    detail_mode = "click" if detail_choice == "欄外パネル(クリックで固定)" else "hover"
+    # v6.4: 詳細表示はチャート内ホバー(x unified)に一本化。
+    # 欄外パネル(クリックで固定)はユーザー要望で廃止(build_candlestick_chartの
+    # clickモード自体はselftest互換のため関数として残置)。
+    detail_mode = "hover"
+
+    # v6.4: 背景帯は表示期間14日以内のみ描画(90日等では1日毎の色帯が数百枚のSVG矩形になり、
+    # 縞模様で判読不能な上にスクロールが重くなる主因だった)。
+    period_days = (period[1] - period[0]).days if (period and period[0] and period[1]) else 0
+    effective_bg = show_bg and period_days <= 14
+    if show_bg and not effective_bg:
+        st.caption(
+            "🎨 セッション背景帯は表示期間14日以内のときのみ描画します"
+            "(長期間では縞模様になり判読できず、描画負荷も大きいため)。"
+        )
 
     try:
         fig, skipped, marker_count = build_candlestick_chart(
-            chart_data, rule, show_bg, bg_opacity, overlays, detail_mode=detail_mode,
+            chart_data, rule, effective_bg, bg_opacity, overlays, detail_mode=detail_mode,
         )
     except Exception as e:  # noqa: BLE001
         st.error(f"チャート生成に失敗しました: {e}")
         return
 
-    # 追補v5§3: 欄外パネル用に、実際に描画された(リサンプル後の)銘柄別データとbaseを再構築する
-    # (build_candlestick_chart内部のresampled/normと同じロジック。クリック詳細の抽出専用)。
-    detail_data: dict[str, pd.DataFrame] = {}
-    base_map: dict[str, float] = {}
+    # v6.3: 自動間引きの案内(本体build_candlestick_chart内と同じ判定を再現して表示)。
+    _lens: list[int] = []
+    _longest: Optional[pd.DataFrame] = None
     for label, df in chart_data.items():
         if label in skipped:
             continue
         d = resample_ohlcv(df, rule) if rule else df
         if d is None or d.empty:
             continue
-        detail_data[label] = d
-        base_map[label] = float(d["close"].iloc[0])
-    # v6.3: チャート本体と同じ自動間引きを詳細データにも適用する
-    # (クリック詳細パネル=画面に表示されているバーと同じ粒度に揃える)。
-    if detail_data:
-        _max_len = max(len(d) for d in detail_data.values())
-        _base_min = _median_bar_minutes(max(detail_data.values(), key=len))
-        _deci = _auto_decimation_rule(_max_len, _base_min)
+        _lens.append(len(d))
+        if _longest is None or len(d) > len(_longest):
+            _longest = d
+    if _lens and _longest is not None:
+        _deci = _auto_decimation_rule(max(_lens), _median_bar_minutes(_longest))
         if _deci:
-            _dd: dict[str, pd.DataFrame] = {}
-            for _lbl, _d in detail_data.items():
-                _d2 = resample_ohlcv(_d, _deci)
-                _dd[_lbl] = _d2 if (_d2 is not None and not _d2.empty) else _d
-            detail_data = _dd
-            base_map = {lbl: float(d["close"].iloc[0]) for lbl, d in detail_data.items()}
             st.caption(
                 f"⚡ 描画負荷対策: バー数が上限({CHART_MAX_BARS_PER_ROW:,}本/行)を超えるため、"
                 f"表示を約{_deci}の足へ自動間引きしています(統計集計・🔍ズームビューは元の足のまま)。"
             )
-    trade_rows_for_click = _mapped_trade_rows_for_click(detail_data, overlays) if overlays else {}
     if skipped:
         st.warning(f"次の銘柄は指定期間・足種でのリサンプル後にデータが空のため、チャートから除外しました: {', '.join(skipped)}")
     # 追補v5§1: ボラチャート(1段目)+価格チャート(2段目以降)の2段構成見出し。
@@ -3541,13 +3544,7 @@ def render_chart_tab(
         "<style>.stPlotlyChart .hoverlayer g.hovertext{translate:14px -18px;}</style>",
         unsafe_allow_html=True,
     )
-    if detail_mode == "click":
-        click_event = st.plotly_chart(
-            fig, width="stretch", on_select="rerun", selection_mode="points", key="chart_click_select",
-        )
-    else:
-        st.plotly_chart(fig, width="stretch")
-        click_event = None
+    st.plotly_chart(fig, width="stretch")  # v6.4: hover一本化(on_select/クリック捕捉は廃止)
     if show_trade_markers and trade_datasets:
         # 追補v4§2.2: マーカーサイズのレバ段階スケール説明+銘柄照合ルールの明記(脚注/hoverいずれかで良い旨の要求を脚注で満たす)。
         st.caption(
@@ -3562,9 +3559,6 @@ def render_chart_tab(
             "ℹ️ 表示期間内に該当トレードなし(選択中の銘柄と一致するSymbolのトレードが期間外、"
             "または銘柄名が一致しませんでした)。"
         )
-    if detail_mode == "click":
-        render_click_detail_panel(click_event, detail_data, base_map, trade_rows_for_click)
-
     col1, col2 = st.columns([1, 2])
     with col1:
         if st.button("📷 PNGを生成", key="png_gen_btn"):
@@ -5885,7 +5879,7 @@ def run_selftest() -> bool:
     candles16a = [t for t in fig16a.data if t.type == "candlestick"]
     check("16-1c click: 全ローソクtraceがhoverinfo=skip(英語OHLC非表示)",
           all(t.hoverinfo == "skip" for t in candles16a))
-    check("16-1d hovermode='x'(v5§2)", fig16a.layout.hovermode == "x")
+    check("16-1d hovermode='x unified'(v6.4: 複数箱の重なり根治)", fig16a.layout.hovermode == "x unified")
     xaxis_names16 = ["xaxis", "xaxis2", "xaxis3"]
     check("16-1e 全xaxis(3行)にshowspikes=True・spikemode=across",
           all(getattr(fig16a.layout, nm).showspikes is True and getattr(fig16a.layout, nm).spikemode == "across"
