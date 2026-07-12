@@ -3849,6 +3849,20 @@ def render_trade_zoom_section(
     )
 
 
+def _wmean_and_sum(rets: np.ndarray, ns: np.ndarray) -> tuple[float, float, float]:
+    """v6.9: セル群の(日数加重平均, 累積合計=Σ平均×日数, Σn)を返す。
+    有効セル(非NaNかつn>0)が無ければ(NaN, NaN, 0)。サマリ行/列・サマリ表の共通集計。
+    """
+    rets = np.asarray(rets, dtype=float)
+    ns = np.asarray(ns, dtype=float)
+    m = (~np.isnan(rets)) & (ns > 0)
+    if not m.any():
+        return (np.nan, np.nan, 0.0)
+    tot_n = float(ns[m].sum())
+    s = float((rets[m] * ns[m]).sum())
+    return (s / tot_n, s, tot_n)
+
+
 def build_multi_symbol_weekday_band_heatmap(
     matrices: dict[str, tuple[pd.DataFrame, pd.DataFrame]],
 ) -> go.Figure:
@@ -3866,22 +3880,27 @@ def build_multi_symbol_weekday_band_heatmap(
         nm = n_m.reindex(index=BAND_ORDER, columns=WEEKDAY_LABELS)
         for band in BAND_ORDER:
             y_labels.append(f"<b>{sym}</b>｜{band}")  # v6.8: 銘柄名を太字で視認性UP
-            z_rows.append([float(v) if pd.notna(v) else np.nan for v in rm.loc[band]])
-            n_rows.append([float(v) if pd.notna(v) else 0.0 for v in nm.loc[band]])
+            row_ret = [float(v) if pd.notna(v) else np.nan for v in rm.loc[band]]
+            row_n = [float(v) if pd.notna(v) else 0.0 for v in nm.loc[band]]
+            # v6.9: 行頭に「全曜日(平均)」列=その行の日数加重平均(ユーザー要望のサマリ)
+            wmean, _wsum, wn = _wmean_and_sum(np.array(row_ret), np.array(row_n))
+            z_rows.append([wmean] + row_ret)
+            n_rows.append([wn] + row_n)
+    x_labels = ["◀全曜日(平均)"] + list(WEEKDAY_LABELS)
     vals = np.array(z_rows, dtype=float)
     abs_vals = np.abs(vals[~np.isnan(vals)])
     max_abs = float(abs_vals.max()) if abs_vals.size else 1.0
     max_abs = max_abs if max_abs > 0 else 1.0
     text = [["—" if pd.isna(v) else f"{v:+.2f}" for v in row] for row in vals]
     fig = go.Figure(data=go.Heatmap(
-        z=vals, x=WEEKDAY_LABELS, y=y_labels, customdata=np.array(n_rows),
+        z=vals, x=x_labels, y=y_labels, customdata=np.array(n_rows),
         colorscale="RdYlGn", zmid=0, zmin=-max_abs, zmax=max_abs,
         text=text, texttemplate="%{text}", textfont=dict(size=10),
         xgap=1.5, ygap=1.5,  # v6.8: セル間に細い隙間=グリッド感で行/列を追いやすく
-        hovertemplate="%{y}<br>曜日=%{x}<br>平均騰落率=%{z:.3f}%<br>n(日数)=%{customdata:.0f}<extra></extra>",
+        hovertemplate="%{y}<br>%{x}<br>平均騰落率=%{z:.3f}%<br>n(日数)=%{customdata:.0f}<extra></extra>",
         colorbar=dict(title="平均騰落率(%)"),
     ))
-    # v6.8: 視認性の区切り線(ユーザー要望): 銘柄ブロック間に白い横線+金/土の間に薄い縦点線(平日|週末)。
+    # v6.8/6.9: 視認性の区切り線: 銘柄ブロック間の白横線+サマリ列の右に実線+金/土の間に薄い縦点線。
     # カテゴリ軸は0始まりのインデックス座標で指定できる(k番目とk+1番目の間=k+0.5)。
     n_bands = len(BAND_ORDER)
     shapes: list[dict[str, Any]] = []
@@ -3892,9 +3911,13 @@ def build_multi_symbol_weekday_band_heatmap(
             line=dict(color="rgba(255,255,255,0.85)", width=2),
         ))
     shapes.append(dict(
-        type="line", yref="paper", y0=0, y1=1, xref="x", x0=4.5, x1=4.5,
+        type="line", yref="paper", y0=0, y1=1, xref="x", x0=0.5, x1=0.5,
+        line=dict(color="rgba(255,255,255,0.85)", width=2),
+    ))  # サマリ列|月 の区切り(実線)
+    shapes.append(dict(
+        type="line", yref="paper", y0=0, y1=1, xref="x", x0=5.5, x1=5.5,
         line=dict(color="rgba(255,255,255,0.45)", width=1, dash="dot"),
-    ))
+    ))  # 金|土 の区切り(サマリ列追加で+1シフト)
     fig.update_layout(
         template="plotly_dark", margin=dict(l=40, r=20, t=40, b=20),
         height=max(420, 26 * len(y_labels) + 140),
@@ -3903,6 +3926,103 @@ def build_multi_symbol_weekday_band_heatmap(
         shapes=shapes,
     )
     return fig
+
+
+def _summary_heatmap_figure(
+    z: list[list[float]], sums: list[list[float]], ns: list[list[float]],
+    x_labels: list[str], y_labels: list[str], title_colorbar: str = "平均騰落率(%)",
+) -> go.Figure:
+    """v6.9: サマリ用の小型ヒートマップ共通描画(ゼロ中心・hoverに累積合計とn)。"""
+    vals = np.array(z, dtype=float)
+    abs_vals = np.abs(vals[~np.isnan(vals)])
+    max_abs = float(abs_vals.max()) if abs_vals.size else 1.0
+    max_abs = max_abs if max_abs > 0 else 1.0
+    text = [["—" if pd.isna(v) else f"{v:+.2f}" for v in row] for row in vals]
+    custom = np.dstack([np.array(sums, dtype=float), np.array(ns, dtype=float)])
+    fig = go.Figure(data=go.Heatmap(
+        z=vals, x=x_labels, y=y_labels, customdata=custom,
+        colorscale="RdYlGn", zmid=0, zmin=-max_abs, zmax=max_abs,
+        text=text, texttemplate="%{text}", textfont=dict(size=11), xgap=1.5, ygap=1.5,
+        hovertemplate=("%{y}<br>%{x}<br>平均騰落率=%{z:.3f}%<br>"
+                       "累積合計=%{customdata[0]:+.1f}%(平均×日数)<br>"
+                       "n(日数)=%{customdata[1]:.0f}<extra></extra>"),
+        colorbar=dict(title=title_colorbar),
+    ))
+    fig.update_layout(
+        template="plotly_dark", margin=dict(l=40, r=20, t=30, b=20),
+        height=max(240, 34 * len(y_labels) + 120),
+        yaxis=dict(autorange="reversed"),
+    )
+    return fig
+
+
+def build_weekday_summary_heatmap(
+    matrices: dict[str, tuple[pd.DataFrame, pd.DataFrame]],
+) -> go.Figure:
+    """v6.9: 曜日まとめ(行=銘柄+全銘柄、列=7曜日)。各セル=その銘柄の全9帯を
+    日数加重平均した曜日別の平均騰落率(「結局月曜日はどうだったのか」の答え)。
+    """
+    y_labels = [f"<b>{s}</b>" for s in matrices] + ["<b>🤝全銘柄</b>"]
+    z: list[list[float]] = []
+    sums: list[list[float]] = []
+    ns: list[list[float]] = []
+    for sym, (rm, nm) in matrices.items():
+        rm = rm.reindex(index=BAND_ORDER, columns=WEEKDAY_LABELS)
+        nm = nm.reindex(index=BAND_ORDER, columns=WEEKDAY_LABELS)
+        row_z, row_s, row_n = [], [], []
+        for wd in WEEKDAY_LABELS:
+            wmean, wsum, wn = _wmean_and_sum(rm[wd].to_numpy(), nm[wd].to_numpy())
+            row_z.append(wmean)
+            row_s.append(wsum)
+            row_n.append(wn)
+        z.append(row_z)
+        sums.append(row_s)
+        ns.append(row_n)
+    all_z, all_s, all_n = [], [], []
+    for wd in WEEKDAY_LABELS:
+        rets = np.concatenate([m[0].reindex(index=BAND_ORDER)[wd].to_numpy() for m in matrices.values()])
+        nss = np.concatenate([m[1].reindex(index=BAND_ORDER)[wd].to_numpy() for m in matrices.values()])
+        wmean, wsum, wn = _wmean_and_sum(rets, nss)
+        all_z.append(wmean)
+        all_s.append(wsum)
+        all_n.append(wn)
+    z.append(all_z)
+    sums.append(all_s)
+    ns.append(all_n)
+    return _summary_heatmap_figure(z, sums, ns, list(WEEKDAY_LABELS), y_labels)
+
+
+def build_parent_summary_heatmap(
+    matrices: dict[str, tuple[pd.DataFrame, pd.DataFrame]],
+) -> go.Figure:
+    """v6.9: 大枠まとめ(行=銘柄、列=大枠4+全体)。各セル=その大枠に属する詳細帯×全曜日を
+    日数加重平均(「アジア時間はまとめてどうだったのか」の答え)。
+    """
+    y_labels = [f"<b>{s}</b>" for s in matrices]
+    x_labels = list(PARENT_ORDER) + ["🤝全体"]
+    z: list[list[float]] = []
+    sums: list[list[float]] = []
+    ns: list[list[float]] = []
+    for sym, (rm, nm) in matrices.items():
+        rm = rm.reindex(index=BAND_ORDER, columns=WEEKDAY_LABELS)
+        nm = nm.reindex(index=BAND_ORDER, columns=WEEKDAY_LABELS)
+        row_z, row_s, row_n = [], [], []
+        for parent in PARENT_ORDER:
+            bands = [b for b in BAND_ORDER if BAND_TO_PARENT.get(b) == parent]
+            rets = rm.loc[bands].to_numpy().ravel()
+            nss = nm.loc[bands].to_numpy().ravel()
+            wmean, wsum, wn = _wmean_and_sum(rets, nss)
+            row_z.append(wmean)
+            row_s.append(wsum)
+            row_n.append(wn)
+        wmean, wsum, wn = _wmean_and_sum(rm.to_numpy().ravel(), nm.to_numpy().ravel())
+        row_z.append(wmean)
+        row_s.append(wsum)
+        row_n.append(wn)
+        z.append(row_z)
+        sums.append(row_s)
+        ns.append(row_n)
+    return _summary_heatmap_figure(z, sums, ns, x_labels, y_labels)
 
 
 def render_session_analysis_tab(
@@ -3972,6 +4092,20 @@ def render_session_analysis_tab(
             st.warning(f"{lbl}: 曜日×帯の集計に失敗しました({e})")
     if mats:
         st.plotly_chart(build_multi_symbol_weekday_band_heatmap(mats), width="stretch")
+
+        # v6.9: サマリ2表(ユーザー要望「曜日のまとめ/帯のまとめ」)。値は日数加重平均。
+        st.markdown("**📊 サマリ(日数加重平均・hoverに累積合計とn)**")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.caption("曜日まとめ: 全時間帯を均して「結局この曜日はどうだったか」(最下行=全銘柄)")
+            st.plotly_chart(build_weekday_summary_heatmap(mats), width="stretch")
+        with c2:
+            st.caption("大枠まとめ: アジア/ロンドン/NY/薄商いを丸ごと均した結果(右端=全体)")
+            st.plotly_chart(build_parent_summary_heatmap(mats), width="stretch")
+        st.caption(
+            "ℹ️ サマリは「平均(日数加重)」= 1日あたりの期待値。hoverの「累積合計」=平均×日数で、"
+            "その区分に毎回乗っていた場合の期間中の合計寄与%の近似。合計は期間の長さに比例する点に注意。"
+        )
 
     # v6.7: 月別×銘柄(長期日足・グループ棒グラフ。ユーザー指定によりヒートマップではなくグラフ)。
     st.markdown("---")
@@ -6196,9 +6330,24 @@ def run_selftest() -> bool:
     check("16-7a 行数=銘柄2×9帯=18", len(hm167.y) == 18, f"got={len(hm167.y)}")
     check("16-7b 行ラベル=『<b>銘柄</b>｜帯』形式",
           hm167.y[0] == f"<b>AAA</b>｜{BAND_ORDER[0]}" and hm167.y[9] == f"<b>BBB</b>｜{BAND_ORDER[0]}")
-    check("16-7c z形状=(18,7)・ゼロ中心", np.asarray(hm167.z).shape == (18, 7) and fig167.data[0].zmid == 0)
-    check("16-7d 区切り線=銘柄間1本+週末1本", len(fig167.layout.shapes) == 2,
+    check("16-7c z形状=(18,8=サマリ列+7曜日)・ゼロ中心",
+          np.asarray(hm167.z).shape == (18, 8) and fig167.data[0].zmid == 0)
+    check("16-7d 区切り線=銘柄間1+サマリ列1+週末1", len(fig167.layout.shapes) == 3,
           f"got={len(fig167.layout.shapes)}")
+    check("16-7e 先頭列=全曜日(平均)・値は行平均", str(hm167.x[0]).startswith("◀全曜日")
+          and abs(float(np.asarray(hm167.z)[0][0]) - 0.1) < 1e-9)
+
+    # 16-8: v6.9 サマリ集計(_wmean_and_sum+サマリ2表)の純ロジック
+    _wm, _ws, _wn = _wmean_and_sum(np.array([1.0, 3.0]), np.array([3.0, 1.0]))
+    check("16-8a 加重平均=(1*3+3*1)/4=1.5・合計=6・n=4",
+          abs(_wm - 1.5) < 1e-9 and abs(_ws - 6.0) < 1e-9 and _wn == 4.0)
+    _wm2, _ws2, _wn2 = _wmean_and_sum(np.array([np.nan]), np.array([0.0]))
+    check("16-8b 有効セルなし=NaN/NaN/0", pd.isna(_wm2) and pd.isna(_ws2) and _wn2 == 0.0)
+    fig168 = build_weekday_summary_heatmap({"AAA": (_rm167, _nm167), "BBB": (_rm167 * -1, _nm167)})
+    check("16-8c 曜日まとめ=行3(銘柄2+全銘柄)×列7", np.asarray(fig168.data[0].z).shape == (3, 7))
+    check("16-8d 全銘柄行=(+0.1と-0.1の均し)=0", abs(float(np.asarray(fig168.data[0].z)[2][0])) < 1e-9)
+    fig168p = build_parent_summary_heatmap({"AAA": (_rm167, _nm167)})
+    check("16-8e 大枠まとめ=行1×列5(大枠4+全体)", np.asarray(fig168p.data[0].z).shape == (1, 5))
 
     # 16-5: v6.3 チャート自動間引き(描画負荷対策)の純ロジック
     check("16-5a 上限内は間引きなし", _auto_decimation_rule(3000, 1.0) is None)
