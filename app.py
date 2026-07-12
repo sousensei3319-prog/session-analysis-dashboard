@@ -3895,7 +3895,7 @@ def build_multi_symbol_weekday_band_heatmap(
     fig = go.Figure(data=go.Heatmap(
         z=vals, x=x_labels, y=y_labels, customdata=np.array(n_rows),
         colorscale="RdYlGn", zmid=0, zmin=-max_abs, zmax=max_abs,
-        text=text, texttemplate="%{text}", textfont=dict(size=10),
+        text=text, texttemplate="%{text}", textfont=dict(size=13),  # v6.10: 潰れ対策で拡大
         xgap=1.5, ygap=1.5,  # v6.8: セル間に細い隙間=グリッド感で行/列を追いやすく
         hovertemplate="%{y}<br>%{x}<br>平均騰落率=%{z:.3f}%<br>n(日数)=%{customdata:.0f}<extra></extra>",
         colorbar=dict(title="平均騰落率(%)"),
@@ -3920,9 +3920,10 @@ def build_multi_symbol_weekday_band_heatmap(
     ))  # 金|土 の区切り(サマリ列追加で+1シフト)
     fig.update_layout(
         template="plotly_dark", margin=dict(l=40, r=20, t=40, b=20),
-        height=max(420, 26 * len(y_labels) + 140),
+        height=max(460, 32 * len(y_labels) + 150),  # v6.10: 行高を拡大(セル内文字の潰れ対策)
         xaxis_title="曜日", yaxis_title="銘柄｜詳細帯",
-        yaxis=dict(autorange="reversed"),  # 先頭銘柄を最上段に
+        xaxis=dict(tickfont=dict(size=13)),
+        yaxis=dict(autorange="reversed", tickfont=dict(size=13)),  # 先頭銘柄を最上段に
         shapes=shapes,
     )
     return fig
@@ -3942,7 +3943,7 @@ def _summary_heatmap_figure(
     fig = go.Figure(data=go.Heatmap(
         z=vals, x=x_labels, y=y_labels, customdata=custom,
         colorscale="RdYlGn", zmid=0, zmin=-max_abs, zmax=max_abs,
-        text=text, texttemplate="%{text}", textfont=dict(size=11), xgap=1.5, ygap=1.5,
+        text=text, texttemplate="%{text}", textfont=dict(size=14), xgap=1.5, ygap=1.5,
         hovertemplate=("%{y}<br>%{x}<br>平均騰落率=%{z:.3f}%<br>"
                        "累積合計=%{customdata[0]:+.1f}%(平均×日数)<br>"
                        "n(日数)=%{customdata[1]:.0f}<extra></extra>"),
@@ -3950,8 +3951,9 @@ def _summary_heatmap_figure(
     ))
     fig.update_layout(
         template="plotly_dark", margin=dict(l=40, r=20, t=30, b=20),
-        height=max(240, 34 * len(y_labels) + 120),
-        yaxis=dict(autorange="reversed"),
+        height=max(260, 42 * len(y_labels) + 130),  # v6.10: 行高拡大
+        xaxis=dict(tickfont=dict(size=13)),
+        yaxis=dict(autorange="reversed", tickfont=dict(size=13)),
     )
     return fig
 
