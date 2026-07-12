@@ -1873,7 +1873,13 @@ def _get_exchange(exchange_id: str):
     if exchange_id not in _EXCHANGE_CACHE:
         import ccxt  # 遅延import
         klass = getattr(ccxt, exchange_id)
-        ex = klass({"enableRateLimit": True})
+        kwargs: dict[str, Any] = {"enableRateLimit": True}
+        if exchange_id == "binance":
+            # 現物のみロード: 既定ではload_marketsが先物(fapi.binance.com)も叩き、
+            # 米国ホスティングでは先物側だけ451で全体が失敗する(2026-07-12クラウド実機で確認)。
+            # 本アプリはbinance現物しか使わないため機能損失なし。
+            kwargs["options"] = {"defaultType": "spot", "fetchMarkets": ["spot"]}
+        ex = klass(kwargs)
         if exchange_id == "binance":
             # 米国ホスティング(Streamlit Cloud等)ではapi.binance.comがHTTP 451で地域ブロック
             # される(2026-07-12クラウド実機で確認)。Binance公式の公開データミラー
