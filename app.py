@@ -3865,7 +3865,7 @@ def build_multi_symbol_weekday_band_heatmap(
         rm = ret_m.reindex(index=BAND_ORDER, columns=WEEKDAY_LABELS)
         nm = n_m.reindex(index=BAND_ORDER, columns=WEEKDAY_LABELS)
         for band in BAND_ORDER:
-            y_labels.append(f"{sym}｜{band}")
+            y_labels.append(f"<b>{sym}</b>｜{band}")  # v6.8: 銘柄名を太字で視認性UP
             z_rows.append([float(v) if pd.notna(v) else np.nan for v in rm.loc[band]])
             n_rows.append([float(v) if pd.notna(v) else 0.0 for v in nm.loc[band]])
     vals = np.array(z_rows, dtype=float)
@@ -3877,14 +3877,30 @@ def build_multi_symbol_weekday_band_heatmap(
         z=vals, x=WEEKDAY_LABELS, y=y_labels, customdata=np.array(n_rows),
         colorscale="RdYlGn", zmid=0, zmin=-max_abs, zmax=max_abs,
         text=text, texttemplate="%{text}", textfont=dict(size=10),
+        xgap=1.5, ygap=1.5,  # v6.8: セル間に細い隙間=グリッド感で行/列を追いやすく
         hovertemplate="%{y}<br>曜日=%{x}<br>平均騰落率=%{z:.3f}%<br>n(日数)=%{customdata:.0f}<extra></extra>",
         colorbar=dict(title="平均騰落率(%)"),
+    ))
+    # v6.8: 視認性の区切り線(ユーザー要望): 銘柄ブロック間に白い横線+金/土の間に薄い縦点線(平日|週末)。
+    # カテゴリ軸は0始まりのインデックス座標で指定できる(k番目とk+1番目の間=k+0.5)。
+    n_bands = len(BAND_ORDER)
+    shapes: list[dict[str, Any]] = []
+    for k in range(1, len(matrices)):
+        ypos = k * n_bands - 0.5
+        shapes.append(dict(
+            type="line", xref="paper", x0=0, x1=1, yref="y", y0=ypos, y1=ypos,
+            line=dict(color="rgba(255,255,255,0.85)", width=2),
+        ))
+    shapes.append(dict(
+        type="line", yref="paper", y0=0, y1=1, xref="x", x0=4.5, x1=4.5,
+        line=dict(color="rgba(255,255,255,0.45)", width=1, dash="dot"),
     ))
     fig.update_layout(
         template="plotly_dark", margin=dict(l=40, r=20, t=40, b=20),
         height=max(420, 26 * len(y_labels) + 140),
         xaxis_title="曜日", yaxis_title="銘柄｜詳細帯",
         yaxis=dict(autorange="reversed"),  # 先頭銘柄を最上段に
+        shapes=shapes,
     )
     return fig
 
@@ -6178,8 +6194,11 @@ def run_selftest() -> bool:
     fig167 = build_multi_symbol_weekday_band_heatmap({"AAA": (_rm167, _nm167), "BBB": (_rm167 * -1, _nm167)})
     hm167 = fig167.data[0]
     check("16-7a 行数=銘柄2×9帯=18", len(hm167.y) == 18, f"got={len(hm167.y)}")
-    check("16-7b 行ラベル=『銘柄｜帯』形式", hm167.y[0] == f"AAA｜{BAND_ORDER[0]}" and hm167.y[9] == f"BBB｜{BAND_ORDER[0]}")
+    check("16-7b 行ラベル=『<b>銘柄</b>｜帯』形式",
+          hm167.y[0] == f"<b>AAA</b>｜{BAND_ORDER[0]}" and hm167.y[9] == f"<b>BBB</b>｜{BAND_ORDER[0]}")
     check("16-7c z形状=(18,7)・ゼロ中心", np.asarray(hm167.z).shape == (18, 7) and fig167.data[0].zmid == 0)
+    check("16-7d 区切り線=銘柄間1本+週末1本", len(fig167.layout.shapes) == 2,
+          f"got={len(fig167.layout.shapes)}")
 
     # 16-5: v6.3 チャート自動間引き(描画負荷対策)の純ロジック
     check("16-5a 上限内は間引きなし", _auto_decimation_rule(3000, 1.0) is None)
