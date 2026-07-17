@@ -32,6 +32,7 @@ import sys
 import io
 import json
 import os
+import gc
 import hmac
 import math
 import re
@@ -394,7 +395,7 @@ def _band_group_for_bg(hour: int) -> str:
     return BG_HOUR_GROUP[int(hour)]
 
 
-def compute_session_stats(ohlcv_df: pd.DataFrame) -> pd.DataFrame:
+def compute_session_stats(ohlcv_df: pd.DataFrame, weekday: Optional[str] = None) -> pd.DataFrame:
     """1銘柄のOHLCV(tz-aware Asia/Tokyo, 1h足, 列: open/high/low/close/volume)から
     詳細9帯別の 平均騰落率(%)/平均出来高/平均ボラティリティ(%) を計算する。
 
@@ -413,7 +414,13 @@ def compute_session_stats(ohlcv_df: pd.DataFrame) -> pd.DataFrame:
       平均に混入する。これは「21時始値->翌1時終値」という意図したセッション定義に反するため、
       21時の行を1つも含まないセッション(=前日21-23時データが存在しない孤立したhour=0のみの集団)は
       統計対象から除外する。
+
+    - weekday: 追補v7§2のクロス表タブ曜日フィルタ。指定時はセッション日(cal_date。「NY重複」帯の
+      日跨ぎ繰り込み後の値=セッション開始日の曜日)で絞り込んでから各帯を集計する
+      (WEEKDAY_LABELSのいずれか)。Noneなら従来どおり全曜日を対象にする(後方互換)。
     """
+    if weekday is not None and weekday not in WEEKDAY_LABELS:
+        raise ValueError(f"未知の曜日ラベルです: {weekday!r}")
     required_cols = {"open", "high", "low", "close", "volume"}
     missing = required_cols - set(ohlcv_df.columns)
     if missing:
@@ -431,6 +438,12 @@ def compute_session_stats(ohlcv_df: pd.DataFrame) -> pd.DataFrame:
     overnight_arr = overnight_mask.to_numpy()
     if overnight_arr.any():
         df.loc[overnight_mask, "cal_date"] = (df.index[overnight_arr] - pd.Timedelta(days=1)).date
+
+    # 追補v7§2: 曜日フィルタはセッション日(上記繰り込み後のcal_date)の曜日で絞る。これにより
+    # 「NY重複」帯のhour=0行も正しく「セッション開始日(21時側)の曜日」として扱われる。
+    if weekday is not None:
+        session_wd = pd.Index(df["cal_date"]).map(lambda d: WEEKDAY_LABELS[pd.Timestamp(d).weekday()])
+        df = df[session_wd.to_numpy() == weekday]
 
     rows = []
     for band in BAND_ORDER:
@@ -3356,6 +3369,53 @@ def format_data_source_caption(
 # =====================================================================================
 
 
+def render_cross_five_min_breakdown(
+    band: str, choice: str, weekday_arg: Optional[str], selected_labels: list[str],
+    period: tuple[date, date],
+) -> None:
+    """クロス表タブ「⏱ 5分毎の内訳」トグルON時の描画本体(追補v7§2)。data_1mを持つ
+    BTC/ETH/SOL以外(GOLD等)は対象外メッセージを出す。「全選択銘柄の平均」時はselected_labelsの
+    うちBTC/ETH/SOLだけを平均する(対象銘柄を注記)。
+    period: サイドバーの期間選択(date_start, date_end)。親表・詳細帯表と同じ期間に絞り込む
+    (2026-07-18バグ修正: 従来はdata_1m全履歴を無条件で使い親表と食い違っていた)。
+    """
+    date_start_, date_end_ = period
+    if choice == "全選択銘柄の平均":
+        crypto_labels = sorted(lbl for lbl in selected_labels if lbl in SCAN_SYMBOLS)
+        if not crypto_labels:
+            st.caption("1分足データ対象外(暗号3銘柄=BTC/ETH/SOLのみ集計可能。選択銘柄に含まれていません)。")
+            return
+        with st.spinner("5分毎の内訳を集計中..."):
+            cells, meta = _cross_five_min_cells_multi_cached(
+                tuple(crypto_labels), band, weekday_arg, date_start_, date_end_)
+        excluded = [lbl for lbl in selected_labels if lbl not in SCAN_SYMBOLS]
+        note = f"対象銘柄: {'/'.join(crypto_labels)}の平均" + (
+            f"({'/'.join(excluded)}は1分足データ対象外のため除外)" if excluded else "")
+    elif choice in SCAN_SYMBOLS:
+        with st.spinner("5分毎の内訳を集計中..."):
+            cells, meta = _cross_five_min_cells_cached(choice, band, weekday_arg, date_start_, date_end_)
+        note = f"対象銘柄: {choice}"
+    else:
+        st.caption(f"1分足データ対象外(暗号3銘柄=BTC/ETH/SOLのみ対応。{choice}は非対応)。")
+        return
+
+    if cells.empty:
+        st.info("該当データがありません。")
+        return
+    ps, pe = meta.get("period_start"), meta.get("period_end")
+    period_str = f"{str(ps)[:10]}〜{str(pe)[:10]}" if ps is not None and pe is not None else "不明"
+    wd_note = f"(**{weekday_arg}曜のみ**)" if weekday_arg else ""
+    st.caption(
+        f"集計期間: {period_str}{wd_note} | {note} | 粒度=5分・{band} | "
+        f"n={meta.get('n_occurrences_used', 0)}(枠合計)"
+    )
+    st.caption(
+        "判定=枠の騰落率がその枠の過去中央値変動を上回るか(データ由来の適応閾値・k=1.0)。"
+        "平均値幅%=平均(high-low)/open。"
+    )
+    st.dataframe(style_five_min_band_table(cells), width="stretch", hide_index=True)
+
+
 def render_cross_table_tab(
     stats_a: dict[str, pd.DataFrame],
     trade_datasets: Optional[dict[str, dict[str, Any]]],
@@ -3366,7 +3426,13 @@ def render_cross_table_tab(
     selected_labels: list[str],
     meta_a: Optional[dict[str, dict[str, Any]]] = None,
     meta_b: Optional[dict[str, dict[str, Any]]] = None,
+    data_a: Optional[dict[str, pd.DataFrame]] = None,
+    data_b: Optional[dict[str, pd.DataFrame]] = None,
 ) -> None:
+    """data_a/data_bは1h生OHLCV(main()のcompute_bundle出力)。追補v7§2の曜日フィルタ選択時に
+    compute_session_stats(weekday=...)で再集計するために使う(全曜日選択時はstats_a/bをそのまま使い
+    再計算しない=既定表示の性能は不変)。省略時(None)は曜日フィルタ選択自体を無効化しない設計だが
+    実データはmain()から必ず渡すため、Noneは実質selftest/後方互換用のフォールバックに限る。"""
     if not selected_labels:
         st.info("サイドバーで銘柄を1つ以上選択してください。")
         return
@@ -3387,6 +3453,17 @@ def render_cross_table_tab(
     options = ["全選択銘柄の平均"] + selected_labels
     choice = st.selectbox("銘柄セレクタ", options, key="cross_table_symbol_choice")
 
+    # 追補v7§2: 曜日フィルタ(大枠・詳細帯・5分内訳の全集計に適用)。既定「全曜日」は無フィルタで
+    # 従来どおりstats_a/bをそのまま使う(既定表示の再計算コストは増やさない)。
+    weekday_options = ["全曜日"] + WEEKDAY_LABELS
+    weekday_sel = st.selectbox("曜日で絞る", weekday_options, key="cross_table_weekday_filter")
+    weekday_arg = None if weekday_sel == "全曜日" else weekday_sel
+    if weekday_arg is not None:
+        st.caption(
+            "※曜日フィルタは市場統計(騰落率/出来高/ボラティリティ・5分内訳)にのみ適用します"
+            "(トレード統計は全期間が対象のままです)。"
+        )
+
     def _pick(stats_by_symbol: dict[str, pd.DataFrame]) -> Optional[pd.DataFrame]:
         if not stats_by_symbol:
             return None
@@ -3397,10 +3474,20 @@ def render_cross_table_tab(
     def _panel(
         stats_by_symbol: dict[str, pd.DataFrame], period: tuple[date, date], col_title: str,
         meta_by_symbol: Optional[dict[str, dict[str, Any]]] = None,
+        data_by_symbol: Optional[dict[str, pd.DataFrame]] = None,
     ) -> None:
-        market_stats = _pick(stats_by_symbol)
+        effective_stats = stats_by_symbol
+        if weekday_arg is not None and data_by_symbol:
+            effective_stats = {}
+            for lbl, df_ in data_by_symbol.items():
+                try:
+                    effective_stats[lbl] = compute_session_stats(df_, weekday=weekday_arg)
+                except Exception:  # noqa: BLE001 - フォールバックとして未フィルタ統計を使う
+                    effective_stats[lbl] = stats_by_symbol.get(lbl)
+        market_stats = _pick(effective_stats)
         cross = build_cross_table(market_stats, trade_stats)
-        st.markdown(f"**{col_title}**  {_period_caption(period)}")
+        wd_suffix = f"(**{weekday_sel}のみ**)" if weekday_arg is not None else ""
+        st.markdown(f"**{col_title}**  {_period_caption(period)}{wd_suffix}")
         # 追補v3§4: データ取得元キャプション(「全選択銘柄の平均」なら寄与銘柄すべてを列挙)
         source_labels = (
             list(stats_by_symbol.keys()) if choice == "全選択銘柄の平均"
@@ -3426,6 +3513,14 @@ def render_cross_table_tab(
                 st.dataframe(
                     style_cross_table(detail_by_parent[parent], diverging_vmax=vmax), width="stretch"
                 )
+                # 追補v7§2: 詳細帯ごとに「⏱ 5分毎の内訳」トグル(既定OFF・重い集計のため)。
+                for band in (b for b in BAND_ORDER if BAND_TO_PARENT[b] == parent):
+                    show5 = st.toggle(
+                        f"⏱ 5分毎の内訳: {band}", value=False,
+                        key=f"cross_5m_toggle_{col_title}_{band}",
+                    )
+                    if show5:
+                        render_cross_five_min_breakdown(band, choice, weekday_arg, selected_labels, period)
         csv_bytes = cross.to_csv(index=True).encode("utf-8-sig")
         st.download_button(
             "CSVダウンロード", data=csv_bytes, file_name=f"cross_table_{col_title}.csv",
@@ -3435,11 +3530,11 @@ def render_cross_table_tab(
     if compare_mode and stats_b is not None and period_b is not None:
         c1, c2 = st.columns(2)
         with c1:
-            _panel(stats_a, period_a, "Period A", meta_a)
+            _panel(stats_a, period_a, "Period A", meta_a, data_a)
         with c2:
-            _panel(stats_b, period_b, "Period B", meta_b)
+            _panel(stats_b, period_b, "Period B", meta_b, data_b)
     else:
-        _panel(stats_a, period_a, "集計結果", meta_a)
+        _panel(stats_a, period_a, "集計結果", meta_a, data_a)
 
 
 def _prepare_intraday_chart_data(
@@ -4819,7 +4914,7 @@ def _render_trader_comparison_view(records: list[dict[str, Any]]) -> None:
 
 DATA_1M_DIR = Path(__file__).parent / "data_1m"
 SCAN_1M_COLS = ["open", "high", "low", "close", "volume"]
-SCAN_SLOTS_PER_DAY: dict[int, int] = {30: 48, 5: 288}  # 粒度(分)->1日の枠数
+SCAN_SLOTS_PER_DAY: dict[int, int] = {30: 48, 5: 288, 60: 24}  # 粒度(分)->1日の枠数(60=追補v7月カレンダー1h粒度で追加)
 SCAN_MIN_BARS_FRACTION = 0.5  # 有効グループの最低バー充足率(欠測判定を粒度に比例させる。仕様§2)
 SCAN_MIN_BARS_FLOOR = 3  # 上記比率適用後でも最低3本は要求する(下限)
 SCAN_DEFAULT_TAIL_THRESHOLDS: tuple[float, ...] = (0.3, 0.5, 1.0)
@@ -4852,6 +4947,9 @@ def load_1m(label: str, years: Optional[list[int]] = None) -> pd.DataFrame:
     - 存在しない年はスキップ(エラーにしない)。
     - float32を維持する(Oracle側メモリ制約対策。書き込み元backfill_1m.pyと同じ精度)。
     - 呼び出し側は銘柄ごとに逐次呼ぶ想定(複数銘柄を同時にメモリ保持しないメモリ規律)。
+    - 2026-07-18: concat後は年次frame個々への参照が不要になるため即座に解放しgc.collect()で
+      ピークRSSを早期に返す(#3指摘: deep memory比で約3倍のRSS一時増加の緩和。恒久的リークでは
+      ないため出力自体への影響なし)。
     """
     d = DATA_1M_DIR / label
     if years is None:
@@ -4869,13 +4967,16 @@ def load_1m(label: str, years: Optional[list[int]] = None) -> pd.DataFrame:
         empty.index = pd.DatetimeIndex([], tz="Asia/Tokyo")
         return empty
     raw = pd.concat(frames, ignore_index=True)
+    frames.clear()
     raw = raw.drop_duplicates(subset="ts").sort_values("ts").reset_index(drop=True)
     idx = pd.to_datetime(raw["ts"], unit="s", utc=True).dt.tz_convert("Asia/Tokyo")
     df = raw.set_index(idx).drop(columns=["ts"])
     df.index.name = None
     for c in SCAN_1M_COLS:
         df[c] = df[c].astype("float32")
-    return df[SCAN_1M_COLS]
+    df = df[SCAN_1M_COLS]
+    gc.collect()
+    return df
 
 
 def scan_slot_label(slot_index: int, freq_minutes: int) -> str:
@@ -4897,15 +4998,17 @@ def build_scan_occurrences(df: pd.DataFrame, freq_minutes: int = 30) -> tuple[pd
     """1分足dfを指定粒度(30分/5分)の枠へグループ化し、日付×枠=1オカレンスのDataFrameを返す。
 
     列: date, weekday(月〜日), month(1-12), slot(0起点), g(騰落率%), mfe_up(%), mfe_down(%),
-        vola_pct(グループ内1分対数リターンのstd(母集団,ddof=0)*100), volume(合計), n_bars
+        vola_pct(グループ内1分対数リターンのstd(母集団,ddof=0)*100), volume(合計), n_bars,
+        range_pct(値幅%=(high_max-low_min)/open_first*100。追補v7§1/§2「どれくらい動くか」の正本)
     - g = (close_last-open_first)/open_first*100
     - mfe_up = (high_max-open_first)/open_first*100、mfe_down = (open_first-low_min)/open_first*100
     - グループ内バー数 < scan_min_bars_for_valid_group(freq_minutes)(粒度比例・既定30分枠=15本/
-      5分枠=3本)は欠測扱いで除外し、meta["n_missing"]/meta["n_total_groups"]に記録する(仕様§2)。
+      5分枠=3本/60分枠=30本)は欠測扱いで除外し、meta["n_missing"]/meta["n_total_groups"]に記録する(仕様§2)。
     """
     if freq_minutes not in SCAN_SLOTS_PER_DAY:
-        raise ValueError(f"未対応の粒度です: {freq_minutes}分(30または5のみ)")
-    empty_cols = ["date", "weekday", "month", "slot", "g", "mfe_up", "mfe_down", "vola_pct", "volume", "n_bars"]
+        raise ValueError(f"未対応の粒度です: {freq_minutes}分(30・5・60のみ)")
+    empty_cols = ["date", "weekday", "month", "slot", "g", "mfe_up", "mfe_down", "vola_pct",
+                  "volume", "n_bars", "range_pct"]
     if df.empty:
         return pd.DataFrame(columns=empty_cols), {"n_missing": 0, "n_total_groups": 0}
 
@@ -4937,11 +5040,12 @@ def build_scan_occurrences(df: pd.DataFrame, freq_minutes: int = 30) -> tuple[pd
     valid["g"] = (valid["close_last"] - valid["open_first"]) / valid["open_first"] * 100.0
     valid["mfe_up"] = (valid["high_max"] - valid["open_first"]) / valid["open_first"] * 100.0
     valid["mfe_down"] = (valid["open_first"] - valid["low_min"]) / valid["open_first"] * 100.0
+    valid["range_pct"] = (valid["high_max"] - valid["low_min"]) / valid["open_first"] * 100.0
     valid["weekday"] = [WEEKDAY_LABELS[pd.Timestamp(d).weekday()] for d in valid["date"]]
     valid["month"] = [pd.Timestamp(d).month for d in valid["date"]]
 
     out = valid[["date", "weekday", "month", "slot", "g", "mfe_up", "mfe_down", "vola_pct",
-                 "volume", "n_bars"]].reset_index(drop=True)
+                 "volume", "n_bars", "range_pct"]].reset_index(drop=True)
     meta = {"n_missing": int(n_missing), "n_total_groups": n_total_groups}
     return out, meta
 
@@ -4991,20 +5095,33 @@ def two_sided_z_test_pvalue(k: int, n: int, p0: float) -> float:
 
 
 def exact_binom_two_sided_pvalue(k: int, n: int, p0: float) -> float:
-    """二項比率の厳密両側検定p値(math.combによる正確計算・scipy不要)。
+    """二項比率の厳密両側検定p値(対数空間でのpmf計算・scipy不要)。
 
     scipy.stats.binomtest(alternative="two-sided")と同じ定義: d=pmf(k)として、
     pmf(i) <= d*(1+相対許容誤差) を満たす全てのiのpmf(i)の総和を返す
     (浮動小数点誤差で「本来同じはずの確率」が僅かに前後してしまう事故を防ぐための
     scipyと同じ安全策として相対許容誤差1e-7を使う)。
     n<=0またはp0が0/1に張り付く場合は検定不能としてnanを返す。
+
+    実装注記(2026-07-18修正): 旧実装はmath.comb(n,i)(Python大整数)をfloatへそのまま掛けており、
+    n≈1200超(5分内訳を曜日合算した場合の実運用値=数千に達する)でOverflowError
+    ("int too large to convert to float")を起こしていた。log(pmf(i))を
+    math.lgamma(二項係数の対数)+i*log(p0)+(n-i)*log(1-p0)で計算すれば、確率は常に0〜1
+    (log_pmf<=0)なのでexp()適用時にオーバーフローが起こらない。小nでの数値はmath.combの
+    素朴計算と一致することを既知解で検証済み(selftest 19-4系列・20-6系列)。
     """
     if n <= 0 or p0 <= 0.0 or p0 >= 1.0:
         return float("nan")
-    pmf = [math.comb(n, i) * (p0 ** i) * ((1.0 - p0) ** (n - i)) for i in range(n + 1)]
-    d = pmf[k]
-    rtol = 1e-7
-    return float(sum(p for p in pmf if p <= d * (1.0 + rtol)))
+    log_p0 = math.log(p0)
+    log_1mp0 = math.log(1.0 - p0)
+    log_n_fact = math.lgamma(n + 1)
+    log_pmf = [
+        log_n_fact - math.lgamma(i + 1) - math.lgamma(n - i + 1) + i * log_p0 + (n - i) * log_1mp0
+        for i in range(n + 1)
+    ]
+    log_d = log_pmf[k]
+    log_thresh = log_d + math.log1p(1e-7)
+    return float(sum(math.exp(lp) for lp in log_pmf if lp <= log_thresh))
 
 
 def bh_fdr(pvalues: Any) -> np.ndarray:
@@ -5191,6 +5308,7 @@ def compute_scan_cells(
     fixed_threshold_pct: float = 0.15,
     tail_thresholds: tuple[float, ...] = SCAN_DEFAULT_TAIL_THRESHOLDS,
     fee_pct: float = SCAN_DEFAULT_FEE_PCT,
+    precomputed_occ: Optional[tuple[pd.DataFrame, dict[str, Any]]] = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """確率スキャナーの統計エンジン本体(仕様§3)。1分足df_1mから階層グループ化→
     セル(曜日×時間枠)統計を計算し、(cells_df, meta)を返す。
@@ -5201,8 +5319,15 @@ def compute_scan_cells(
       (occをまたいで混ぜない。呼び出し側は銘柄ごとに逐次呼ぶこと=メモリ規律とも整合)。
     - metaは掟6(集計期間・n・更新日時明記)に対応: updated_at(JST)/period_start/period_end/
       データ元(label)/粒度/月フィルタ/判定モード/欠測グループ数などを持つ。
+    - precomputed_occ: build_scan_occurrences(df_1m, freq_minutes)の結果(occ, occ_meta)を
+      呼び出し側が既に持っている場合に渡すと再計算をスキップする(2026-07-18修正:
+      compute_month_calendar_cellsが同じ引数でbuild_scan_occurrencesを二重実行していた
+      重複コスト対策。既存呼び出し側は指定不要=Noneのままで従来どおり動作)。
     """
-    occ, occ_meta = build_scan_occurrences(df_1m, freq_minutes)
+    if precomputed_occ is not None:
+        occ, occ_meta = precomputed_occ
+    else:
+        occ, occ_meta = build_scan_occurrences(df_1m, freq_minutes)
     period_start = df_1m.index.min() if not df_1m.empty else None
     period_end = df_1m.index.max() if not df_1m.empty else None
     occ_used = occ[occ["month"] == month].reset_index(drop=True) if month is not None else occ
@@ -5215,6 +5340,55 @@ def compute_scan_cells(
         "n_missing_groups": occ_meta["n_missing"], "n_total_groups": occ_meta["n_total_groups"],
         "n_occurrences_used": int(len(occ_used)), "updated_at": datetime.now(JST),
     }
+    return cells, meta
+
+
+def compute_month_calendar_cells(
+    df_1m: pd.DataFrame,
+    month: Optional[int] = None,
+    freq_minutes: int = 30,
+    threshold_mode: str = "adaptive",
+    k: float = 1.0,
+    fixed_threshold_pct: float = 0.15,
+    precomputed_occ: Optional[tuple[pd.DataFrame, dict[str, Any]]] = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """月カレンダービュー用の集計(追補v7§1)。既存compute_scan_cells(E1エンジン本体)を
+    月フィルタ・粒度そのまま流用し、avg_range_pct(平均値幅%=平均(high-low)/open)だけ追加する
+    薄いラッパー(重複実装を避けるためcompute_scan_cellsの判定ロジック・BH-FDR等をそのまま再利用)。
+
+    - freq_minutes: 30(既定・30分粒度)または60(1時間粒度・追補v7でカレンダー用に追加)。
+    - month: None=全月合算(既定)、1〜12=その月のみ(仕様§1: nが小さくなる旨はUI側の注記で担保)。
+    - dominant_direction列がそのセルの「最頻判定」に当たる(σ適応閾値で上昇/下降/レンジへ分類した
+      各オカレンスのうち最頻のもの。p_up/p_down/p_rangeの最大値と等価)。
+    - precomputed_occ: build_scan_occurrences(df_1m, freq_minutes)の結果(occ, occ_meta)を
+      呼び出し側が既に持っている場合に渡すと再計算をスキップする(2026-07-18バグ修正#2:
+      月セレクタを変える度にシンボル全期間のbuild_scan_occurrencesを再実行し8〜16秒の
+      再読込が発生していた対策。既存呼び出し側は指定不要=Noneのままで従来どおり動作)。
+    戻り値: (cells, meta)。cellsは曜日×slot=1行(compute_scan_cellsと同じ全列)+avg_range_pct列。
+    """
+    if freq_minutes not in (30, 60):
+        raise ValueError(f"月カレンダー集計は30分または60分粒度のみ対応です: {freq_minutes}")
+    # 2026-07-18修正: build_scan_occurrencesをここで1回だけ実行し、compute_scan_cellsへ
+    # precomputed_occとして渡す(旧実装はcompute_scan_cells内部+この関数の2箇所で同じ
+    # 引数のbuild_scan_occurrencesを実行しておりコストがほぼ2倍だった)。
+    if precomputed_occ is not None:
+        occ, occ_meta = precomputed_occ
+    else:
+        occ, occ_meta = build_scan_occurrences(df_1m, freq_minutes)
+    cells, meta = compute_scan_cells(
+        df_1m, freq_minutes=freq_minutes, month=month,
+        threshold_mode=threshold_mode, k=k, fixed_threshold_pct=fixed_threshold_pct,
+        precomputed_occ=(occ, occ_meta))
+    occ_used = occ[occ["month"] == month] if month is not None else occ
+    cells = cells.copy()
+    if cells.empty or occ_used.empty:
+        cells["avg_range_pct"] = pd.Series(dtype=float) if cells.empty else np.nan
+    else:
+        range_by_cell = occ_used.groupby(["weekday", "slot"])["range_pct"].mean()
+        cells["avg_range_pct"] = [
+            range_by_cell.get((w, s), np.nan) for w, s in zip(cells["weekday"], cells["slot"])
+        ]
+    meta["calendar_freq_minutes"] = freq_minutes
     return cells, meta
 
 
@@ -5364,6 +5538,14 @@ def annotate_calendar_flags(
 SCAN_RESULTS_PATH = Path(__file__).parent / "scan_results.json"
 SCAN_COMMENTARY_PATH = Path(__file__).parent / "scan_commentary.json"
 SCAN_DIRECTION_TO_PCOL: dict[str, str] = {"上昇": "p_up", "下降": "p_down", "レンジ": "p_range"}
+SCAN_DIRECTION_ICON: dict[str, str] = {"上昇": "↑", "下降": "↓", "レンジ": "→"}  # 追補v7§1/§2表示用
+
+
+def scan_direction_icon(dominant_direction: str) -> str:
+    """dominant_direction(上昇/下降/レンジ)を判定アイコン(↑/↓/→)へ変換する(追補v7§1/§2)。"""
+    if dominant_direction not in SCAN_DIRECTION_ICON:
+        raise ValueError(f"未知のdominant_directionです: {dominant_direction!r}")
+    return SCAN_DIRECTION_ICON[dominant_direction]
 
 
 def load_scan_results(path: Path = SCAN_RESULTS_PATH) -> Optional[dict[str, Any]]:
@@ -5418,10 +5600,11 @@ def scan_dominant_probability(row: Any) -> tuple[float, float, float]:
 
 
 def filter_scan_cells(
-    cells: pd.DataFrame, min_n: int = 30, fdr_only: bool = True, q_threshold: float = 0.10,
+    cells: pd.DataFrame, min_n: int = 5, fdr_only: bool = False, q_threshold: float = 0.10,
     weekday: Optional[str] = None, session_band: Optional[str] = None,
 ) -> pd.DataFrame:
-    """ランキングビューのフィルタ+ソート(仕様§5)。
+    """ランキングビューのフィルタ+ソート(仕様§5。既定値は追補v7§4で緩和=min_n 30→5・
+    fdr_only True→False。探索優先でFDRや最低nで表示をブロックしない方針)。
 
     n>=min_n・(fdr_only時のみ)fdr_q<q_threshold・曜日/セッション帯の絞り込みを適用し、
     fdr_q昇順(NaNは最後)→n降順でソートして返す(scan_job._filter_sort_candidatesと同じ流儀)。
@@ -5449,41 +5632,35 @@ def scan_month_filter_warning(month: Optional[int], n_occurrences_used: int,
     return f"月フィルタ適用中(n={n_occurrences_used}件)。全月合算より統計的信頼性が下がります。"
 
 
-SCAN_HEATMAP_MODE_LABELS: dict[str, str] = {
-    "updown_diff": "P(上昇)-P(下降)", "tail_up": "テール確率↑(MFE_up)", "tail_down": "テール確率↓(MFE_down)",
-}
+SCAN_CALENDAR_HOVER_COLS: list[str] = [
+    "dominant_direction", "p_up", "p_down", "p_range", "avg_volume", "avg_vola_pct", "threshold_pct",
+]
 
 
-def build_scan_heatmap_matrix(
-    symbol_cells: dict[str, pd.DataFrame], weekday: str, value_mode: str, tail_threshold: float = 0.5,
-) -> pd.DataFrame:
-    """1日マップビュー(仕様§5)用の行=30分枠(48・時刻範囲ラベル)・列=銘柄の値マトリクス。
-
-    value_mode: "updown_diff"=P(上昇)-P(下降)、"tail_up"=P(MFE_up>=tail_threshold)、
-    "tail_down"=P(MFE_down>=tail_threshold)。該当セルが無ければNaN(その銘柄・枠のデータ欠如)。
+def build_scan_calendar_matrix(cells: pd.DataFrame, freq_minutes: int) -> dict[str, pd.DataFrame]:
+    """🗓️カレンダービュー(追補v7§1)用の行列組立: 行=時刻範囲ラベル(freq_minutes枠)・
+    列=曜日(月〜日固定順)。compute_month_calendar_cells出力(曜日×slot=1行)をピボットし、
+    表示に要る列ごとに同形状DataFrameをdictで返す(値なしの組み合わせはNaN=データ欠如)。
     """
-    if value_mode not in SCAN_HEATMAP_MODE_LABELS:
-        raise ValueError(f"未知のvalue_modeです: {value_mode!r}")
-    slots = list(range(48))
-    idx_labels = [scan_slot_label(s, 30) for s in slots]
-    labels = list(symbol_cells.keys())
-    mat = pd.DataFrame(index=idx_labels, columns=labels, dtype=float)
-    tail_col = f"p_mfe_up_{tail_threshold}" if value_mode == "tail_up" else f"p_mfe_down_{tail_threshold}"
-    for label in labels:
-        cells = symbol_cells.get(label)
-        if cells is None or cells.empty or "weekday" not in cells.columns:
-            continue
-        sub = cells[cells["weekday"] == weekday].set_index("slot")
-        for s in slots:
-            if s not in sub.index:
+    if freq_minutes not in SCAN_SLOTS_PER_DAY:
+        raise ValueError(f"未対応の粒度です: {freq_minutes}")
+    n_slots = SCAN_SLOTS_PER_DAY[freq_minutes]
+    idx_labels = [scan_slot_label(s, freq_minutes) for s in range(n_slots)]
+    cols = WEEKDAY_LABELS
+    out_cols = ["avg_g", "avg_range_pct", "n"] + SCAN_CALENDAR_HOVER_COLS
+    mats = {c: pd.DataFrame(index=idx_labels, columns=cols, dtype=object) for c in out_cols}
+    if cells.empty:
+        return mats
+    sub = cells.set_index(["weekday", "slot"])
+    for wd in cols:
+        for s in range(n_slots):
+            key = (wd, s)
+            if key not in sub.index:
                 continue
-            row = sub.loc[s]
-            if value_mode == "updown_diff":
-                val = row["p_up"] - row["p_down"]
-            else:
-                val = row.get(tail_col, np.nan)
-            mat.at[idx_labels[s], label] = val
-    return mat
+            row = sub.loc[key]
+            for c in out_cols:
+                mats[c].loc[idx_labels[s], wd] = row[c]
+    return mats
 
 
 def five_min_slots_for_thirty_min_slot(slot30: int) -> range:
@@ -5501,6 +5678,18 @@ def filter_cell_occurrences(occ: pd.DataFrame, weekday: str, slot: int) -> pd.Da
     return sub.sort_values("date", ascending=False).reset_index(drop=True)
 
 
+def filter_occurrences_by_date_range(
+    occ: pd.DataFrame, start_date_: date, end_date_: date,
+) -> pd.DataFrame:
+    """build_scan_occurrencesの出力(date列=JST暦日のdatetime.date)を[start_date_, end_date_]の
+    閉区間に絞る(2026-07-18バグ修正: クロス表「5分毎の内訳」がサイドバーの期間選択を無視して
+    data_1m全履歴を集計していた対策。date列はdf.index.date由来でtz変換済みJST暦日のため、
+    サイドバーのdate_input(date型)とそのまま比較できる)。"""
+    if occ.empty:
+        return occ
+    return occ[(occ["date"] >= start_date_) & (occ["date"] <= end_date_)]
+
+
 def compute_five_min_breakdown(
     occ5: pd.DataFrame, weekday: str, slot30: int, threshold_mode: str = "adaptive", k: float = 1.0,
     fixed_threshold_pct: float = 0.15,
@@ -5515,6 +5704,201 @@ def compute_five_min_breakdown(
     else:
         sub = occ5[(occ5["weekday"] == weekday) & (occ5["slot"].isin(five_slots))]
     return _compute_scan_cells_from_occurrences(sub, 5, threshold_mode, k, fixed_threshold_pct, (), 0.0)
+
+
+def compute_five_min_band_stats(
+    df_1m: pd.DataFrame,
+    band: str,
+    weekday: Optional[str] = None,
+    threshold_mode: str = "adaptive",
+    k: float = 1.0,
+    fixed_threshold_pct: float = 0.15,
+    precomputed_occ5: Optional[tuple[pd.DataFrame, dict[str, Any]]] = None,
+    date_range: Optional[tuple[date, date]] = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """詳細帯内の「5分毎の内訳」集計(追補v7§2)。1分足df_1mを5分粒度へグループ化し、指定した
+    詳細帯(band。BAND_HOURSのキー)に属する5分枠だけを対象に、既存E1エンジン
+    (_compute_scan_cells_from_occurrences)の判定ロジック(σ適応閾値・dominant_direction等)を
+    そのまま流用して集計する(重複実装しない)。
+
+    - weekday: None(既定)=帯内の全曜日を1系列に合算。WEEKDAY_LABELSのいずれかを指定すると
+      その曜日だけに絞る(仕様§2曜日フィルタ)。groupby(weekday, slot)を1本化するため、
+      内部では絞り込み後のweekday列を定数ラベルへ上書きしてからE1エンジンへ渡す。
+    - precomputed_occ5: build_scan_occurrences(df_1m, 5)の結果(occ5, occ_meta)を呼び出し側が
+      既に持っている場合に渡すと再計算をスキップする(2026-07-18修正: 帯/曜日フィルタを
+      変える度にシンボル全期間のbuild_scan_occurrences(df,5)を再実行していた重複コスト対策。
+      既存呼び出し側は指定不要=Noneのままで従来どおり動作)。
+    - date_range: (start_date_, end_date_)を渡すとJST暦日の閉区間でoccurrenceを絞り込む
+      (2026-07-18バグ修正#1: クロス表「5分毎の内訳」がサイドバーの期間選択を無視して
+      data_1m全履歴を集計していた対策)。指定時はmeta の period_start/period_end もこの
+      期間そのものに置き換える(親表キャプションの期間表示と一致させるため)。
+    - 戻り値: (cells, meta)。cellsは時刻(slot)昇順・1行=帯内の5分枠1本。既存E1の全列
+      (avg_g/p_up/p_down/p_range/dominant_direction/avg_volume/avg_vola_pct/n等)に加え
+      avg_range_pct(平均値幅%)を持つ。metaは掟6(集計期間・n・更新日時)対応。
+    """
+    if band not in BAND_HOURS:
+        raise ValueError(f"未知の帯ラベルです: {band!r}")
+    if weekday is not None and weekday not in WEEKDAY_LABELS:
+        raise ValueError(f"未知の曜日ラベルです: {weekday!r}")
+    if precomputed_occ5 is not None:
+        occ5, occ_meta = precomputed_occ5
+    else:
+        occ5, occ_meta = build_scan_occurrences(df_1m, 5)
+    if date_range is not None:
+        occ5 = filter_occurrences_by_date_range(occ5, date_range[0], date_range[1])
+        period_start: Any = date_range[0]
+        period_end: Any = date_range[1]
+    else:
+        period_start = df_1m.index.min() if not df_1m.empty else None
+        period_end = df_1m.index.max() if not df_1m.empty else None
+    band_slots = {s for s in range(SCAN_SLOTS_PER_DAY[5]) if scan_slot_band(s, 5) == band}
+    weekday_label = weekday if weekday is not None else "全曜日"
+    if occ5.empty:
+        sub = occ5
+    else:
+        sub = occ5[occ5["slot"].isin(band_slots)]
+        if weekday is not None:
+            sub = sub[sub["weekday"] == weekday]
+        sub = sub.assign(weekday=weekday_label)
+    cells = _compute_scan_cells_from_occurrences(sub, 5, threshold_mode, k, fixed_threshold_pct, (), 0.0)
+    if cells.empty:
+        cells["avg_range_pct"] = pd.Series(dtype=float)
+    else:
+        range_by_slot = sub.groupby("slot")["range_pct"].mean()
+        cells["avg_range_pct"] = cells["slot"].map(range_by_slot)
+    cells = cells.sort_values("slot").reset_index(drop=True)
+    meta: dict[str, Any] = {
+        "band": band, "weekday_filter": weekday_label, "freq_minutes": 5,
+        "period_start": period_start, "period_end": period_end,
+        "n_missing_groups": occ_meta["n_missing"], "n_total_groups": occ_meta["n_total_groups"],
+        "n_occurrences_used": int(len(sub)), "updated_at": datetime.now(JST),
+    }
+    return cells, meta
+
+
+def compute_five_min_band_stats_multi(
+    dfs_1m: dict[str, pd.DataFrame],
+    band: str,
+    weekday: Optional[str] = None,
+    threshold_mode: str = "adaptive",
+    k: float = 1.0,
+    fixed_threshold_pct: float = 0.15,
+    precomputed_occ5_map: Optional[dict[str, tuple[pd.DataFrame, dict[str, Any]]]] = None,
+    date_range: Optional[tuple[date, date]] = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """複数銘柄(BTC/ETH/SOL)のcompute_five_min_band_stats結果をslot単位で平均する
+    (クロス表タブ「全選択銘柄の平均」モード用。追補v7§2)。数値列はslot毎の単純平均
+    (aggregate_market_stats_multiと同じ「銘柄横断は単純平均」方針)、nは平均を四捨五入した整数。
+    dominant_directionは平均avg_gと平均threshold_pctの符号比較で再判定する
+    (各銘柄の判定を多数決するのではなく、平均後の値に同じσ適応ロジックを適用し直す)。
+
+    - precomputed_occ5_map: {label: (occ5, occ_meta)}を渡すと銘柄ごとのbuild_scan_occurrences
+      再計算をスキップする(2026-07-18修正。既存呼び出し側は指定不要=Noneのまま)。
+    - date_range: compute_five_min_band_stats同様、(start_date_, end_date_)へ絞り込む
+      (2026-07-18バグ修正#1)。全銘柄へ同一期間を適用する。
+    """
+    labels = [lbl for lbl in dfs_1m if lbl in SCAN_SYMBOLS]
+    per_symbol: dict[str, pd.DataFrame] = {}
+    metas: list[dict[str, Any]] = []
+    for lbl in labels:
+        occ5_arg = (precomputed_occ5_map or {}).get(lbl)
+        cells, meta = compute_five_min_band_stats(
+            dfs_1m[lbl], band, weekday, threshold_mode, k, fixed_threshold_pct,
+            precomputed_occ5=occ5_arg, date_range=date_range)
+        per_symbol[lbl] = cells
+        metas.append(meta)
+    weekday_label = weekday if weekday is not None else "全曜日"
+    if not per_symbol or all(c.empty for c in per_symbol.values()):
+        empty_meta = {
+            "band": band, "weekday_filter": weekday_label, "freq_minutes": 5,
+            "period_start": None, "period_end": None, "n_missing_groups": 0,
+            "n_total_groups": 0, "n_occurrences_used": 0, "updated_at": datetime.now(JST),
+            "symbols": labels,
+        }
+        return pd.DataFrame(), empty_meta
+
+    combined = pd.concat(per_symbol, names=["symbol", "_i"]).reset_index(level="symbol", drop=True)
+    mean_cols = ["avg_g", "median_g", "avg_volume", "avg_vola_pct", "avg_range_pct", "threshold_pct",
+                 "p_up", "p_down", "p_range", "n"]
+    grouped = combined.groupby("slot", sort=True)
+    result = grouped[mean_cols].mean().reset_index()
+    result["n"] = result["n"].round().astype(int)
+    result["time_range"] = result["slot"].map(lambda s: scan_slot_label(int(s), 5))
+    result["session_band"] = band
+    result["weekday"] = weekday_label
+    result["dominant_direction"] = [
+        "上昇" if g > t else ("下降" if g < -t else "レンジ")
+        for g, t in zip(result["avg_g"], result["threshold_pct"])
+    ]
+    result = result.sort_values("slot").reset_index(drop=True)
+    period_starts = [m["period_start"] for m in metas if m.get("period_start") is not None]
+    period_ends = [m["period_end"] for m in metas if m.get("period_end") is not None]
+    meta = {
+        "band": band, "weekday_filter": weekday_label, "freq_minutes": 5,
+        "period_start": min(period_starts) if period_starts else None,
+        "period_end": max(period_ends) if period_ends else None,
+        "n_missing_groups": sum(m["n_missing_groups"] for m in metas),
+        "n_total_groups": sum(m["n_total_groups"] for m in metas),
+        "n_occurrences_used": sum(m["n_occurrences_used"] for m in metas),
+        "updated_at": datetime.now(JST), "symbols": labels,
+    }
+    return result, meta
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _scan_5m_occurrences_cached(label: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """5分粒度オカレンス(build_scan_occurrences(df,5))のシンボル単位キャッシュ
+    (2026-07-18修正: 帯/曜日フィルタの組み合わせを変える度にシンボル全期間のグループ化を
+    再実行していた重複コスト対策。_scan_load_1m_cachedと同じ作法でシンボル単位に1回だけ計算)。"""
+    df = _scan_load_1m_cached(label)
+    return build_scan_occurrences(df, 5)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _scan_occurrences_cached(label: str, freq_minutes: int) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """30/60分粒度オカレンス(build_scan_occurrences(df,freq_minutes))のシンボル×粒度単位
+    キャッシュ(2026-07-18バグ修正#2: 🗓️カレンダービューで月セレクタを変える度にシンボル
+    全期間のグループ化を再実行し8〜16秒の再読込が発生していた対策。_scan_5m_occurrences_cached
+    と同じ作法。月はここでは絞り込まない=月を変えてもキャッシュヒットする)。"""
+    df = _scan_load_1m_cached(label)
+    return build_scan_occurrences(df, freq_minutes)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cross_five_min_cells_cached(
+    label: str, band: str, weekday: Optional[str], date_start_: date, date_end_: date,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """クロス表タブ「⏱ 5分毎の内訳」用キャッシュラッパ(追補v7§2)。data_1mから直接集計する
+    (_scan_calendar_cells_cachedと同じ作法・ttl=3600)。df読込・5分オカレンス生成はいずれも
+    シンボル単位キャッシュ(_scan_load_1m_cached/_scan_5m_occurrences_cached)を経由し、
+    (label,band,weekday)の組み合わせを変える度の再計算を避ける(2026-07-18修正)。
+    date_start_/date_end_: サイドバーの期間選択(2026-07-18バグ修正#1: 親表と食い違っていた
+    対策。キャッシュキーに含め期間ごとに正しく別結果を返す)。"""
+    df = _scan_load_1m_cached(label)
+    if df.empty:
+        return pd.DataFrame(), {
+            "band": band, "weekday_filter": weekday or "全曜日", "freq_minutes": 5,
+            "period_start": date_start_, "period_end": date_end_, "n_missing_groups": 0,
+            "n_total_groups": 0, "n_occurrences_used": 0, "updated_at": datetime.now(JST),
+        }
+    occ5, occ_meta = _scan_5m_occurrences_cached(label)
+    return compute_five_min_band_stats(
+        df, band, weekday=weekday, precomputed_occ5=(occ5, occ_meta),
+        date_range=(date_start_, date_end_))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cross_five_min_cells_multi_cached(
+    labels: tuple[str, ...], band: str, weekday: Optional[str], date_start_: date, date_end_: date,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """クロス表タブ「全選択銘柄の平均」時の「⏱ 5分毎の内訳」用キャッシュラッパ(追補v7§2)。
+    df読込・5分オカレンス生成はシンボル単位キャッシュ経由(2026-07-18修正)。
+    date_start_/date_end_はサイドバーの期間選択(2026-07-18バグ修正#1)。"""
+    dfs = {lbl: _scan_load_1m_cached(lbl) for lbl in labels}
+    occ5_map = {lbl: _scan_5m_occurrences_cached(lbl) for lbl in labels}
+    return compute_five_min_band_stats_multi(
+        dfs, band, weekday=weekday, precomputed_occ5_map=occ5_map,
+        date_range=(date_start_, date_end_))
 
 
 def slice_1m_window_for_occurrence(
@@ -5624,40 +6008,97 @@ def style_scan_ranking_table(cells: pd.DataFrame, tail_threshold: float, q_thres
     return styler
 
 
-def build_scan_heatmap_figure(mat: pd.DataFrame, value_mode: str) -> go.Figure:
-    """1日マップビュー(仕様§5)のgo.Heatmap組立(表示専用・selftest対象外。既存
-    build_session_weekday_heatmapと同じ作法)。行=48枠の時刻範囲ラベル・列=銘柄。
-    updown_diffはゼロ中心発散配色、テール確率は0-100%の単色スケール。
+def style_five_min_band_table(cells: pd.DataFrame) -> Any:
+    """クロス表タブ「⏱ 5分毎の内訳」表示用Styler(追補v7§2)。st.dataframe×pandas3.0の
+    Styler.format無視対策として表示文字列を事前整形したコピーを使う(style_cross_tableと同じ作法)。
+    列: 時刻|判定|平均騰落率(%)|上昇%|下落%|レンジ%|平均値幅(%)|平均出来高|ボラ(%)|n。
     """
-    vals = mat.to_numpy(dtype=float)
-    is_diff = value_mode == "updown_diff"
-    if is_diff:
-        abs_vals = np.abs(vals[~np.isnan(vals)])
-        vmax = float(abs_vals.max()) if abs_vals.size else 1.0
-        vmax = vmax if vmax > 0 else 1.0
-        zmid, zmin, zmax = 0.0, -vmax, vmax
-        text = [["—" if pd.isna(v) else f"{v * 100:+.1f}%" for v in row] for row in vals]
-    else:
-        zmid, zmin, zmax = None, 0.0, 1.0
-        text = [["—" if pd.isna(v) else f"{v * 100:.1f}%" for v in row] for row in vals]
-    heatmap_kwargs: dict[str, Any] = dict(
-        z=vals, x=list(mat.columns), y=list(mat.index), colorscale="RdYlGn",
-        zmin=zmin, zmax=zmax, text=text, texttemplate="%{text}",
-        hovertemplate="時間枠=%{y}<br>銘柄=%{x}<br>値=%{z:.3f}<extra></extra>",
-        colorbar=dict(title=SCAN_HEATMAP_MODE_LABELS[value_mode]),
-    )
-    if zmid is not None:
-        heatmap_kwargs["zmid"] = zmid
-    fig = go.Figure(data=go.Heatmap(**heatmap_kwargs))
+    display_cols = ["時刻", "判定", "平均騰落率(%)", "上昇%", "下落%", "レンジ%",
+                     "平均値幅(%)", "平均出来高", "ボラ(%)", "n"]
+    if cells.empty:
+        return pd.DataFrame(columns=display_cols).style
+    icons = [scan_direction_icon(d) for d in cells["dominant_direction"]]
+    display = pd.DataFrame({
+        "時刻": cells["time_range"].values,
+        "判定": [f"{icon} {d}" for icon, d in zip(icons, cells["dominant_direction"])],
+        "平均騰落率(%)": cells["avg_g"].map(lambda v: "—" if pd.isna(v) else f"{v:+.3f}%").values,
+        "上昇%": cells["p_up"].map(lambda v: "—" if pd.isna(v) else f"{v:.1%}").values,
+        "下落%": cells["p_down"].map(lambda v: "—" if pd.isna(v) else f"{v:.1%}").values,
+        "レンジ%": cells["p_range"].map(lambda v: "—" if pd.isna(v) else f"{v:.1%}").values,
+        "平均値幅(%)": cells["avg_range_pct"].map(lambda v: "—" if pd.isna(v) else f"{v:.3f}%").values,
+        "平均出来高": cells["avg_volume"].map(lambda v: "—" if pd.isna(v) else f"{v:,.1f}").values,
+        "ボラ(%)": cells["avg_vola_pct"].map(lambda v: "—" if pd.isna(v) else f"{v:.3f}%").values,
+        "n": cells["n"].map(lambda v: "—" if pd.isna(v) else f"{int(v)}").values,
+    })
+    vmax = float(cells["avg_g"].abs().max(skipna=True)) if not cells.empty else 0.0
+    vmax = vmax if pd.notna(vmax) else 0.0
+    g_vals = cells["avg_g"].to_numpy(dtype=float)
+    styler = display.style
+    styler = styler.apply(lambda col: [diverging_color(v, vmax) for v in g_vals], subset=["平均騰落率(%)"])
+    return styler
+
+
+def build_scan_calendar_figure(mats: dict[str, pd.DataFrame], freq_minutes: int) -> go.Figure:
+    """🗓️カレンダービュー(追補v7§1)のgo.Heatmap組立(表示専用・selftest対象外)。
+    z=平均騰落率%(ゼロ中心発散配色RdYlGn)・テキスト注釈=判定アイコン+平均騰落率%+平均値幅%+n
+    (視認性優先で判定アイコンを必ず表示)。hoverは方向別確率・平均出来高・ボラ・閾値を
+    customdataへ事前整形して渡す(plotly.js hovertemplateのd3符号フラグ+,.2f非対応の既知の
+    罠を踏襲・整形済み文字列をcustomdataへ)。
+    """
+    idx_labels = list(mats["avg_g"].index)
+    cols = list(mats["avg_g"].columns)
+    z = mats["avg_g"].to_numpy(dtype=float)
+    abs_vals = np.abs(z[~np.isnan(z)])
+    vmax = float(abs_vals.max()) if abs_vals.size else 1.0
+    vmax = vmax if vmax > 0 else 1.0
+
+    text: list[list[str]] = []
+    customdata: list[list[list[str]]] = []
+    for lbl in idx_labels:
+        text_row: list[str] = []
+        cd_row: list[list[str]] = []
+        for wd in cols:
+            g = mats["avg_g"].loc[lbl, wd]
+            dom = mats["dominant_direction"].loc[lbl, wd]
+            if pd.isna(g) or not isinstance(dom, str):
+                text_row.append("—")
+                cd_row.append(["データなし", "—", "—", "—", "—", "—", "—"])
+                continue
+            rp, n = mats["avg_range_pct"].loc[lbl, wd], mats["n"].loc[lbl, wd]
+            icon = scan_direction_icon(dom)
+            text_row.append(f"{icon} {g:+.2f}%<br>幅{rp:.2f}%<br>n={int(n)}")
+            cd_row.append([
+                dom, _scan_fmt_pct(mats["p_up"].loc[lbl, wd]), _scan_fmt_pct(mats["p_down"].loc[lbl, wd]),
+                _scan_fmt_pct(mats["p_range"].loc[lbl, wd]), f"{mats['avg_volume'].loc[lbl, wd]:,.1f}",
+                f"{mats['avg_vola_pct'].loc[lbl, wd]:.3f}%", f"{mats['threshold_pct'].loc[lbl, wd]:.3f}%",
+            ])
+        text.append(text_row)
+        customdata.append(cd_row)
+
+    fig = go.Figure(data=go.Heatmap(
+        z=z, x=cols, y=idx_labels, colorscale="RdYlGn", zmid=0.0, zmin=-vmax, zmax=vmax,
+        text=text, texttemplate="%{text}", customdata=customdata,
+        hovertemplate=(
+            "%{y} %{x}<br>判定=%{customdata[0]}<br>P(上昇)=%{customdata[1]} P(下降)=%{customdata[2]} "
+            "P(レンジ)=%{customdata[3]}<br>平均出来高=%{customdata[4]}<br>ボラ=%{customdata[5]}"
+            "<br>閾値=%{customdata[6]}<extra></extra>"
+        ),
+        colorbar=dict(title="平均騰落率%"),
+    ))
     fig.update_layout(
-        template="plotly_dark", margin=dict(l=40, r=20, t=40, b=20), height=900,
-        xaxis_title="銘柄", yaxis_title="時刻範囲(JST・30分枠)",
+        template="plotly_dark", margin=dict(l=70, r=20, t=40, b=20),
+        height=(1500 if freq_minutes == 30 else 780),
+        xaxis_title="曜日", yaxis_title=f"時刻範囲(JST・{freq_minutes}分枠)",
     )
     return fig
 
 
 def render_scan_ranking_view(results: dict[str, Any]) -> None:
-    """⚡確率スキャナー: ランキングビュー本体(仕様§5)。銘柄横断フィルタ→上位セル表。"""
+    """⚡確率スキャナー: ランキングビュー本体(仕様§5)。銘柄横断フィルタ→上位セル表。
+
+    追補v7§4(ユーザー指示=探索優先・FDRや最低nで表示をブロックしない): 既定値を緩和
+    (最低n 30→5・FDRトグル既定OFF)。免責/n/CI/fdr_q列は残し、表示は正直だが遮断はしない。
+    """
     f1, f2, f3, f4 = st.columns(4)
     symbols_sel = f1.multiselect("銘柄", SCAN_SYMBOLS, default=SCAN_SYMBOLS, key="scan_rank_symbols")
     weekday_sel = f2.selectbox("曜日", ["(全曜日)"] + WEEKDAY_LABELS, key="scan_rank_weekday")
@@ -5667,8 +6108,11 @@ def render_scan_ranking_view(results: dict[str, Any]) -> None:
     month_val = None if month_sel == month_labels[0] else MONTH_ORDER[month_labels.index(month_sel) - 1]
 
     g1, g2, g3 = st.columns(3)
-    min_n = g1.number_input("最低n", min_value=1, value=30, step=5, key="scan_rank_min_n")
-    fdr_only = g2.toggle("FDR候補のみ(q<0.10)", value=True, key="scan_rank_fdr_only")
+    min_n = g1.number_input("最低n", min_value=1, value=5, step=5, key="scan_rank_min_n")
+    fdr_only = g2.toggle(
+        "統計的優位のみ(参考: FDR q<0.10)", value=False, key="scan_rank_fdr_only",
+        help="ONにするとFDR補正でq<0.10のセルのみに絞ります(既定OFF=探索目的のため全セルを表示)。",
+    )
     tail_th = g3.selectbox("テール確率の閾値", [0.3, 0.5, 1.0], index=1, key="scan_rank_tail_th",
                             format_func=lambda v: f"±{v}%")
 
@@ -5698,9 +6142,10 @@ def render_scan_ranking_view(results: dict[str, Any]) -> None:
     st.caption(f"該当セル: {len(filtered)}件(フィルタ前 {len(all_cells)}セル=銘柄×曜日×時間枠の組)")
     if filtered.empty:
         if fdr_only:
-            st.info(
-                "FDR候補(q<0.10)条件を満たすセルは現在ありません。「FDR候補のみ」をOFFにすると"
-                "全セルを参考値(統計的優位性は未確認)として表示できます。"
+            # 追補v7§4: ブロックする警告文でなく1行の参考注記に弱める(探索優先・掟2は注記で担保)。
+            st.caption(
+                "※方向の統計的優位はFDR補正では未確認(参考: fdr_q列)。"
+                "「統計的優位のみ」をOFFにすると頻度の実測値を全セル表示します。"
             )
         else:
             st.info("条件に合致するセルがありません。フィルタを緩めてください。")
@@ -5710,30 +6155,71 @@ def render_scan_ranking_view(results: dict[str, Any]) -> None:
     )
 
 
-def render_scan_heatmap_view(results: dict[str, Any]) -> None:
-    """⚡確率スキャナー: 1日マップビュー本体(仕様§5)。選択曜日の48枠×銘柄ヒートマップ。"""
-    st.caption("行=30分刻みの時間枠(JST)・列=銘柄。値は選択した曜日・全月合算セルの統計。")
-    h1, h2, h3 = st.columns(3)
-    weekday_sel = h1.selectbox("曜日", WEEKDAY_LABELS, key="scan_heat_weekday")
-    mode_keys = list(SCAN_HEATMAP_MODE_LABELS.keys())
-    mode_sel = h2.selectbox(
-        "表示値", mode_keys, format_func=lambda k: SCAN_HEATMAP_MODE_LABELS[k], key="scan_heat_mode")
-    tail_th = h3.selectbox(
-        "テール閾値(テール表示時のみ有効)", [0.3, 0.5, 1.0], index=1, key="scan_heat_tail_th",
-        format_func=lambda v: f"±{v}%", disabled=(mode_sel == "updown_diff"))
+@st.cache_data(ttl=3600, show_spinner=False)
+def _scan_calendar_cells_cached(
+    label: str, month: Optional[int], freq_minutes: int,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """🗓️カレンダービュー(追補v7§1)用セル集計のキャッシュラッパ。scan_results.jsonでなく
+    data_1mから直接オンデマンド集計する(月フィルタの柔軟性のため・ttl=3600)。
+    df読込・オカレンス生成はいずれもシンボル単位キャッシュ(_scan_load_1m_cached/
+    _scan_occurrences_cached)を経由し、月セレクタを変える度の再計算を避ける
+    (2026-07-18バグ修正#2: 月を変える度に8〜16秒のフリーズが発生していた対策)。"""
+    df = _scan_load_1m_cached(label)
+    if df.empty:
+        return pd.DataFrame(), {"label": label, "month": month,
+                                 "calendar_freq_minutes": freq_minutes, "n_occurrences_used": 0}
+    occ, occ_meta = _scan_occurrences_cached(label, freq_minutes)
+    return compute_month_calendar_cells(
+        df, month=month, freq_minutes=freq_minutes, precomputed_occ=(occ, occ_meta))
 
-    symbol_cells: dict[str, pd.DataFrame] = {}
-    for lbl in SCAN_SYMBOLS:
-        cells, _meta = scan_cells_for_symbol(lbl, results, None)
-        symbol_cells[lbl] = cells
-    if all(c.empty for c in symbol_cells.values()):
-        st.warning("該当データがありません(スキャン結果未生成)。")
+
+SCAN_CALENDAR_FREQ_LABELS: dict[str, int] = {"30分": 30, "1時間": 60}
+
+
+def render_scan_calendar_view() -> None:
+    """⚡確率スキャナー: 🗓️カレンダービュー本体(追補v7§1)。月×銘柄×粒度→曜日×時間帯の
+    カレンダーグリッド。scan_results.jsonでなくdata_1mから直接オンデマンド集計(月フィルタの
+    柔軟性のため)。月指定時はnが減る旨をヘッダに1行注記するのみで表示はブロックしない。"""
+    c1, c2, c3 = st.columns(3)
+    month_labels = ["(全月合算)"] + [f"{m}月" for m in MONTH_ORDER]
+    month_sel = c1.selectbox("月", month_labels, key="scan_cal_month")
+    month_val = None if month_sel == month_labels[0] else MONTH_ORDER[month_labels.index(month_sel) - 1]
+    symbol_sel = c2.selectbox("銘柄", SCAN_SYMBOLS, key="scan_cal_symbol")
+    freq_label = c3.selectbox("粒度", list(SCAN_CALENDAR_FREQ_LABELS.keys()), key="scan_cal_freq")
+    freq_minutes = SCAN_CALENDAR_FREQ_LABELS[freq_label]
+
+    with st.spinner(f"{symbol_sel}の1分足を集計中..."):
+        cells, meta = _scan_calendar_cells_cached(symbol_sel, month_val, freq_minutes)
+    if cells.empty:
+        st.warning(f"{symbol_sel}の該当データがありません(月フィルタ={month_sel})。")
         return
-    mat = build_scan_heatmap_matrix(symbol_cells, weekday_sel, mode_sel, tail_th)
-    st.plotly_chart(build_scan_heatmap_figure(mat, mode_sel), width="stretch")
+
+    ps, pe = meta.get("period_start"), meta.get("period_end")
+    n_occ = meta.get("n_occurrences_used", 0)
+    period_str = f"{str(ps)[:10]}〜{str(pe)[:10]}" if ps and pe else "不明"
+    # 2026-07-18修正: period_start/period_endはdata_1m全期間の値(月フィルタ前)のため、
+    # 月を選択した場合はクロス表タブの曜日フィルタ表示(例: (**月曜のみ**))と同じ流儀で
+    # 「集計期間中この月だけを対象にした」ことを期間表示自体に明記する(掟6)。
+    month_note = f"(**{month_sel}のみ**)" if month_val is not None else ""
     st.caption(
-        f"値={SCAN_HEATMAP_MODE_LABELS[mode_sel]}。個別セルのn/信頼区間/FDR判定は"
-        "「ランキング」または「セル詳細」で必ず確認すること(このビューは概観専用)。"
+        f"集計期間: {period_str}{month_note}(データ元: data_1m/{symbol_sel}/・1分足) | "
+        f"集計に使った全枠合計オカレンスn={n_occ}件 | 粒度={freq_label}"
+    )
+    warn_msg = scan_month_filter_warning(month_val, n_occ)
+    if warn_msg:
+        st.caption(f"⚠️ {warn_msg}(個々のセルのnはセル内に併記)")
+
+    mats = build_scan_calendar_matrix(cells, freq_minutes)
+    st.plotly_chart(build_scan_calendar_figure(mats, freq_minutes), width="stretch")
+    st.caption(
+        "セル表示 = 判定アイコン(↑上昇/↓下落/→レンジ。そのセルの最頻判定)+平均騰落率%"
+        "(色・緑=上昇/赤=下降)+平均値幅%(=平均(high-low)/open)+n(件数)。ホバーで方向別"
+        "確率・平均出来高・ボラ・判定閾値を表示。"
+    )
+    st.caption(
+        "判定基準: 枠の騰落率がその枠の過去中央値変動を上回るか(データ由来の適応閾値・k=1.0)。"
+        "確率は過去の発生頻度であり将来の保証ではない。個別セルの信頼区間/FDR判定は"
+        "「ランキング」または「セル詳細」ビューで必ず確認すること(このビューは概観専用)。"
     )
 
 
@@ -5914,7 +6400,7 @@ def render_scan_header_cards(meta: dict[str, Any], results: dict[str, Any]) -> N
     )
 
 
-SCAN_VIEW_LABELS: list[str] = ["🏆 ランキング", "🗓️ 1日マップ", "🔍 セル詳細"]
+SCAN_VIEW_LABELS: list[str] = ["🏆 ランキング", "🗓️ カレンダー", "🔍 セル詳細"]
 
 
 def render_scan_tab() -> None:
@@ -5924,7 +6410,26 @@ def render_scan_tab() -> None:
         "月×曜日×30分刻みの時間帯別に、過去の騰落方向・値幅の統計的傾向を洗い出す(短期売買の判断材料)。"
     )
 
+    # 2026-07-18修正: 🗓️カレンダービューはscan_results.jsonに依存せずdata_1mから直接集計する
+    # (追補v7§1)ため、scan_results.json不在時でもビュー選択・描画に到達できるようにする。
+    # results必須なのはランキング/セル詳細ビューのみ=そちらの分岐でだけNone警告を出す。
     results = load_scan_results()
+    if results is not None:
+        meta = results.get("meta", {})
+        render_scan_header_cards(meta, results)
+        st.divider()
+
+    view = st.segmented_control(
+        "ビュー", SCAN_VIEW_LABELS, default=SCAN_VIEW_LABELS[0],
+        key="scan_view_select", label_visibility="collapsed",
+    )
+    if not view:  # segmented_controlは選択解除でNoneを返す(既存v6流儀に合わせる)
+        view = SCAN_VIEW_LABELS[0]
+
+    if view == SCAN_VIEW_LABELS[1]:
+        render_scan_calendar_view()
+        return
+
     if results is None:
         st.warning(
             "スキャン結果(`scan_results.json`)がまだ生成されていません。以下をターミナルで実行すると"
@@ -5934,21 +6439,8 @@ def render_scan_tab() -> None:
         )
         return
 
-    meta = results.get("meta", {})
-    render_scan_header_cards(meta, results)
-    st.divider()
-
-    view = st.segmented_control(
-        "ビュー", SCAN_VIEW_LABELS, default=SCAN_VIEW_LABELS[0],
-        key="scan_view_select", label_visibility="collapsed",
-    )
-    if not view:  # segmented_controlは選択解除でNoneを返す(既存v6流儀に合わせる)
-        view = SCAN_VIEW_LABELS[0]
-
     if view == SCAN_VIEW_LABELS[0]:
         render_scan_ranking_view(results)
-    elif view == SCAN_VIEW_LABELS[1]:
-        render_scan_heatmap_view(results)
     else:
         render_scan_cell_detail_view(results)
 
@@ -6217,6 +6709,10 @@ def main() -> None:
             (date_start_b, date_end_b) if (compare_mode and date_start_b and date_end_b) else None,
             selected_labels,
             meta_a, meta_b if compare_mode else None,
+            # 追補v7§2: 曜日フィルタ選択時にcompute_session_stats(weekday=...)で再集計するため
+            # 生1h OHLCV(data_a/data_b)を渡す(バグ修正: 未接続だとUI表示だけで実データが
+            # フィルタされない状態だった)。
+            data_a=data_a, data_b=(data_b if compare_mode else None),
         )
 
     elif section == "🕯️ チャート":
@@ -6402,6 +6898,35 @@ def run_selftest() -> bool:
     check("3-7 NY重複 平均出来高", abs(got_c["avg_volume"] - exp_vol_c) < 1e-6,
           f"exp={exp_vol_c} got={got_c['avg_volume']}")
     check("3-8 NY重複 n_days=2", int(got_c["n_days"]) == 2)
+
+    # 3-9〜3-12: 追補v7§2 曜日フィルタ(compute_session_stats weekday引数)の既知解。
+    # bases[0]=2026-01-01(木)・bases[1]=2026-01-02(金)。アジア早朝(7-10)は日またぎなしなので
+    # weekday="木"指定でday_i=0のみ、weekday="金"指定でday_i=1のみに絞られるはず。
+    stats3_thu = compute_session_stats(synth_df, weekday="木")
+    got_a_thu = stats3_thu.loc[band_a]
+    check("3-9 曜日フィルタ(木): アジア早朝 平均騰落率がday_i=0単独と一致",
+          abs(got_a_thu["avg_return_pct"] - exp_returns[0]) < 1e-6,
+          f"exp={exp_returns[0]:.6f} got={got_a_thu['avg_return_pct']:.6f}")
+    check("3-10 曜日フィルタ(木): アジア早朝 n_days=1(火曜データは除外)",
+          int(got_a_thu["n_days"]) == 1, f"got={got_a_thu['n_days']}")
+    stats3_fri = compute_session_stats(synth_df, weekday="金")
+    got_a_fri = stats3_fri.loc[band_a]
+    check("3-11 曜日フィルタ(金): アジア早朝 平均騰落率がday_i=1単独と一致",
+          abs(got_a_fri["avg_return_pct"] - exp_returns[1]) < 1e-6,
+          f"exp={exp_returns[1]:.6f} got={got_a_fri['avg_return_pct']:.6f}")
+    check("3-12 曜日フィルタ(金): アジア早朝 平均出来高がday_i=1単独と一致",
+          abs(got_a_fri["avg_volume"] - exp_vols[1]) < 1e-6,
+          f"exp={exp_vols[1]} got={got_a_fri['avg_volume']}")
+    stats3_mon = compute_session_stats(synth_df, weekday="月")
+    got_a_mon = stats3_mon.loc[band_a]
+    check("3-13 曜日フィルタ(月・該当データなし): アジア早朝 n_days=0・NaN",
+          int(got_a_mon["n_days"]) == 0 and math.isnan(got_a_mon["avg_return_pct"]))
+    bad_wd_cst_raised = False
+    try:
+        compute_session_stats(synth_df, weekday="祝")
+    except ValueError:
+        bad_wd_cst_raised = True
+    check("3-14 compute_session_stats: 未知の曜日ラベルはValueError", bad_wd_cst_raised)
 
     # -----------------------------------------------------------------
     # 4. トレード集計: 合成トレードで 回数/勝率/合計損益/PF/最大DD/最大連敗 が既知解と一致
@@ -7809,6 +8334,17 @@ def run_selftest() -> bool:
           math.isnan(exact_binom_two_sided_pvalue(5, 10, 0.0)) and math.isnan(exact_binom_two_sided_pvalue(5, 10, 1.0))
           and math.isnan(exact_binom_two_sided_pvalue(5, 0, 0.5)))
 
+    # 19-4i2/j2: 大標本(n>1000)回帰テスト(2026-07-18バグ修正確認)。旧実装はmath.comb(n,i)を
+    # Python大整数のままfloatへ掛けており、5分内訳を曜日合算した実運用値(n≈1200-1826)で
+    # OverflowError("int too large to convert to float")を起こしていた。期待値はfractions module
+    # による高精度厳密計算(scipy不使用)でクロスチェック済み。
+    p_big1_19 = exact_binom_two_sided_pvalue(550, 1200, 0.5)
+    check("19-4i2 大標本(n=1200,k=550,p0=0.5)がOverflowErrorを起こさずfractions厳密値と一致",
+          math.isclose(p_big1_19, 0.004246, abs_tol=1e-6), f"got={p_big1_19:.6f}")
+    p_big2_19 = exact_binom_two_sided_pvalue(1000, 2000, 0.5)
+    check("19-4j2 大標本(n=2000,k=1000=最頻値,p0=0.5)は全pmfが閾値以下でp値≈1.0",
+          math.isclose(p_big2_19, 1.0, abs_tol=1e-6), f"got={p_big2_19:.9f}")
+
     q_19 = bh_fdr(np.array([0.01, 0.02, 0.03, 0.04, 0.5]))
     expected_q_19 = np.array([0.05, 0.05, 0.05, 0.05, 0.5])
     check("19-4g BH-FDR既知解(5セル)が手計算値と一致",
@@ -8042,6 +8578,332 @@ def run_selftest() -> bool:
         abs_ok_19 = False
     check("19-7d 全行Noneの数値列に対する.abs()がTypeErrorでクラッシュしない"
           "(style_scan_ranking_table実データ回帰テスト)", abs_ok_19)
+
+    # -----------------------------------------------------------------
+    # 20. 追補v7 F1: 5分枠集計(帯内)+月カレンダー集計(既存E1エンジン流用・純ロジック)
+    # -----------------------------------------------------------------
+    print("\n--- 20. 追補v7: 5分枠集計+月カレンダー集計 ---")
+
+    def _make_slot_bars_20(day: pd.Timestamp, hour: int, n: int, g_target: float,
+                            base: float = 100.0) -> pd.DataFrame:
+        """day+hour:00からn分の1分足を生成し、g=(close_last-open_first)/open_first*100が
+        厳密にg_targetになるよう最終バーのcloseだけを合わせる(既知解selftest用ヘルパー)。"""
+        bidx = pd.date_range(day + pd.Timedelta(hours=hour), periods=n, freq="1min")
+        bopen = base + np.arange(n) * 0.01
+        bclose = bopen + 0.01
+        bclose[-1] = bopen[0] * (1.0 + g_target / 100.0)
+        bhigh = np.maximum(bopen, bclose) + 0.02
+        blow = np.minimum(bopen, bclose) - 0.02
+        return pd.DataFrame({"open": bopen, "high": bhigh, "low": blow, "close": bclose,
+                              "volume": np.full(n, 3.0)}, index=bidx)
+
+    def _make_flat_bars_20(day: pd.Timestamp, hour: int, n: int = 5, price: float = 100.0) -> pd.DataFrame:
+        """完全に値動きゼロ(OHLC全て同値)の1分足(ゼロ変動セルの既知解selftest用)。"""
+        bidx = pd.date_range(day + pd.Timedelta(hours=hour), periods=n, freq="1min")
+        return pd.DataFrame({"open": np.full(n, price), "high": np.full(n, price),
+                              "low": np.full(n, price), "close": np.full(n, price),
+                              "volume": np.full(n, 1.0)}, index=bidx)
+
+    # 20-1: 5分毎集計の既知解(section19のdf19_full/occ5_19を再利用・独立計算とのクロスチェック)
+    slot96_idx_20 = np.arange(480, 485)  # 5分枠96(08:00-08:05)の生1分足5本(19-1のidx_19基準)
+    expected_g_96_20 = (close19[484] - open19[480]) / open19[480] * 100.0
+    expected_range_96_20 = (high19[slot96_idx_20].max() - low19[slot96_idx_20].min()) / open19[480] * 100.0
+    row96_19 = occ5_19[occ5_19["slot"] == 96].iloc[0]
+    check("20-1a build_scan_occurrencesのrange_pct列(値幅%)が生の1分足からの独立計算と一致",
+          math.isclose(row96_19["range_pct"], expected_range_96_20, rel_tol=1e-9)
+          and math.isclose(row96_19["g"], expected_g_96_20, rel_tol=1e-9),
+          f"got_range={row96_19['range_pct']:.6f} exp={expected_range_96_20:.6f} "
+          f"got_g={row96_19['g']:.6f} exp={expected_g_96_20:.6f}")
+
+    # 20-1b/c: 製品レベル関数(compute_five_min_band_stats)の既知解(騰落率/値幅/判定)。
+    # fixed閾値0.1%<全g値のため上昇が一意に確定(σ適応閾値は自己参照的にp_up<=0.5になりがちなため
+    # 判定の明確性を検証する目的でfixedモードを使う。境界ケースはselftest 20-4で扱う)。
+    dates_1b_20 = [pd.Timestamp("2026-04-06") + pd.Timedelta(weeks=w) for w in range(5)]
+    g_1b_20 = [0.4, 0.6, 0.5, 0.45, 0.55]
+    frames_1b_20 = [_make_slot_bars_20(d, 6, 5, g) for d, g in zip(dates_1b_20, g_1b_20)]
+    df_1b_20 = pd.concat(frames_1b_20).sort_index()
+    cells_1b_20, meta_1b_20 = compute_five_min_band_stats(
+        df_1b_20, "薄商い (6-7)", weekday=None, threshold_mode="fixed", fixed_threshold_pct=0.1)
+    row_1b_20 = cells_1b_20.iloc[0]
+    expected_range_1b_20 = float(np.mean(
+        [(f["high"].max() - f["low"].min()) / f["open"].iloc[0] * 100.0 for f in frames_1b_20]))
+    check("20-1b compute_five_min_band_stats: n=5・avg_g=平均g・判定=上昇(fixed閾値0.1)",
+          row_1b_20["n"] == 5 and math.isclose(row_1b_20["avg_g"], np.mean(g_1b_20), abs_tol=1e-9)
+          and row_1b_20["dominant_direction"] == "上昇" and math.isclose(row_1b_20["p_up"], 1.0),
+          f"n={row_1b_20['n']} avg_g={row_1b_20['avg_g']} dom={row_1b_20['dominant_direction']}")
+    check("20-1c compute_five_min_band_stats: avg_range_pct(平均値幅%)が独立計算(高安レンジ/始値)と一致",
+          math.isclose(row_1b_20["avg_range_pct"], expected_range_1b_20, rel_tol=1e-9),
+          f"got={row_1b_20['avg_range_pct']:.6f} exp={expected_range_1b_20:.6f}")
+
+    # 20-2: 曜日フィルタ適用後の既知解(仕様§5-2)。同一帯・同一5分枠に月曜3件+火曜2件を仕込み、
+    # weekday指定で正しい部分集合(n/avg_g/avg_range_pct)だけに絞られることを検証する。
+    mon_dates_20 = [pd.Timestamp("2026-01-05"), pd.Timestamp("2026-01-12"), pd.Timestamp("2026-01-19")]
+    tue_dates_20 = [pd.Timestamp("2026-01-06"), pd.Timestamp("2026-01-13")]
+    mon_g_20 = [0.4, 0.6, 0.5]
+    tue_g_20 = [-0.3, -0.1]
+    frames_mon_20 = [_make_slot_bars_20(d, 6, 5, g) for d, g in zip(mon_dates_20, mon_g_20)]
+    frames_tue_20 = [_make_slot_bars_20(d, 6, 5, g) for d, g in zip(tue_dates_20, tue_g_20)]
+    df_wd_20 = pd.concat(frames_mon_20 + frames_tue_20).sort_index()
+
+    cells_all_20, meta_all_20 = compute_five_min_band_stats(df_wd_20, "薄商い (6-7)", weekday=None)
+    check("20-2a 曜日フィルタなし(全曜日合算): n=5(月3+火2)・avg_gが5本平均と一致",
+          len(cells_all_20) == 1 and cells_all_20.iloc[0]["n"] == 5
+          and math.isclose(cells_all_20.iloc[0]["avg_g"], np.mean(mon_g_20 + tue_g_20), abs_tol=1e-9)
+          and meta_all_20["weekday_filter"] == "全曜日",
+          f"n={cells_all_20.iloc[0]['n']} avg_g={cells_all_20.iloc[0]['avg_g']}")
+
+    cells_mon_20, meta_mon_20 = compute_five_min_band_stats(df_wd_20, "薄商い (6-7)", weekday="月")
+    check("20-2b 曜日フィルタ(月)でn=3・avg_gが月曜3本平均と一致(火曜データは除外)",
+          len(cells_mon_20) == 1 and cells_mon_20.iloc[0]["n"] == 3
+          and math.isclose(cells_mon_20.iloc[0]["avg_g"], np.mean(mon_g_20), abs_tol=1e-9)
+          and meta_mon_20["weekday_filter"] == "月",
+          f"n={cells_mon_20.iloc[0]['n']} avg_g={cells_mon_20.iloc[0]['avg_g']}")
+
+    cells_tue_20, meta_tue_20 = compute_five_min_band_stats(df_wd_20, "薄商い (6-7)", weekday="火")
+    check("20-2c 曜日フィルタ(火)でn=2・avg_gが火曜2本平均と一致",
+          len(cells_tue_20) == 1 and cells_tue_20.iloc[0]["n"] == 2
+          and math.isclose(cells_tue_20.iloc[0]["avg_g"], np.mean(tue_g_20), abs_tol=1e-9),
+          f"n={cells_tue_20.iloc[0]['n']} avg_g={cells_tue_20.iloc[0]['avg_g']}")
+    try:
+        compute_five_min_band_stats(df_wd_20, "薄商い (6-7)", weekday="不明")
+        bad_wd_20 = False
+    except ValueError:
+        bad_wd_20 = True
+    check("20-2d 未知の曜日ラベルはValueError", bad_wd_20)
+
+    # 20-3: 月フィルタ付きカレンダー集計の既知解(仕様§5-3)。同一曜日・同一30分枠に
+    # 6月2件(decoy)+7月3件(対象)+8月1件(decoy)を仕込み、month=7抽出でn・avg_g・
+    # avg_range_pctが7月分だけの値になることを検証する。
+    june_dates_20 = [pd.Timestamp("2026-06-01"), pd.Timestamp("2026-06-08")]
+    june_g_20 = [1.0, 1.2]
+    july_dates_20 = [pd.Timestamp("2026-07-06"), pd.Timestamp("2026-07-13"), pd.Timestamp("2026-07-20")]
+    july_g_20 = [0.3, 0.5, 0.4]
+    aug_dates_20 = [pd.Timestamp("2026-08-03")]
+    aug_g_20 = [2.0]
+    frames_jun_20 = [_make_slot_bars_20(d, 10, 15, g) for d, g in zip(june_dates_20, june_g_20)]
+    frames_jul_20 = [_make_slot_bars_20(d, 10, 15, g) for d, g in zip(july_dates_20, july_g_20)]
+    frames_aug_20 = [_make_slot_bars_20(d, 10, 15, g) for d, g in zip(aug_dates_20, aug_g_20)]
+    df_cal_20 = pd.concat(frames_jun_20 + frames_jul_20 + frames_aug_20).sort_index()
+    expected_range_jul_20 = float(np.mean(
+        [(f["high"].max() - f["low"].min()) / f["open"].iloc[0] * 100.0 for f in frames_jul_20]))
+
+    cells_jul_20, meta_jul_20 = compute_month_calendar_cells(df_cal_20, month=7, freq_minutes=30)
+    check("20-3a 月フィルタ(7月)でn=3・avg_gが7月3件平均と一致(6/8月decoyは除外)",
+          len(cells_jul_20) == 1 and cells_jul_20.iloc[0]["n"] == 3
+          and math.isclose(cells_jul_20.iloc[0]["avg_g"], np.mean(july_g_20), abs_tol=1e-9)
+          and meta_jul_20["n_occurrences_used"] == 3,
+          f"n={cells_jul_20.iloc[0]['n']} avg_g={cells_jul_20.iloc[0]['avg_g']}")
+    check("20-3b 月フィルタ(7月)のavg_range_pct(平均値幅%)が独立計算と一致",
+          math.isclose(cells_jul_20.iloc[0]["avg_range_pct"], expected_range_jul_20, rel_tol=1e-9),
+          f"got={cells_jul_20.iloc[0]['avg_range_pct']:.6f} exp={expected_range_jul_20:.6f}")
+
+    cells_alljul_20, meta_alljul_20 = compute_month_calendar_cells(df_cal_20, month=None, freq_minutes=30)
+    check("20-3c 全月合算(month=None)はn=6(2+3+1)・avg_gが6件平均と一致",
+          cells_alljul_20.iloc[0]["n"] == 6
+          and math.isclose(cells_alljul_20.iloc[0]["avg_g"], np.mean(june_g_20 + july_g_20 + aug_g_20), abs_tol=1e-9),
+          f"n={cells_alljul_20.iloc[0]['n']} avg_g={cells_alljul_20.iloc[0]['avg_g']}")
+
+    cells_dec_20, meta_dec_20 = compute_month_calendar_cells(df_cal_20, month=12, freq_minutes=30)
+    check("20-3d 該当データなしの月(12月)は空セル・n_occurrences_used=0",
+          cells_dec_20.empty and meta_dec_20["n_occurrences_used"] == 0)
+    try:
+        compute_month_calendar_cells(df_cal_20, month=7, freq_minutes=5)
+        bad_freq_20 = False
+    except ValueError:
+        bad_freq_20 = True
+    check("20-3e 月カレンダー集計は30/60分粒度のみ対応(5分指定はValueError)", bad_freq_20)
+
+    # 20-4: 判定σ適応の境界(仕様§5-4)。a=ゼロ変動セル(OHLC全て同値→全g=0・閾値=0でもレンジ)、
+    # b=中央値ちょうど境界(全日で同一g_target→閾値=その値自体・厳密不等号でレンジ判定)。
+    flat_dates_20 = [pd.Timestamp("2026-02-02") + pd.Timedelta(weeks=w) for w in range(4)]
+    df_flat_20 = pd.concat([_make_flat_bars_20(d, 6) for d in flat_dates_20]).sort_index()
+    cells_flat_20, meta_flat_20 = compute_five_min_band_stats(df_flat_20, "薄商い (6-7)", weekday=None)
+    row_flat_20 = cells_flat_20.iloc[0]
+    check("20-4a ゼロ変動セル(全OHLC同値): avg_g=0・avg_range_pct=0・閾値=0でも判定=レンジ(p_range=1.0)",
+          row_flat_20["n"] == 4 and row_flat_20["avg_g"] == 0.0 and row_flat_20["avg_range_pct"] == 0.0
+          and math.isclose(row_flat_20["threshold_pct"], 0.0, abs_tol=1e-12)
+          and row_flat_20["dominant_direction"] == "レンジ" and row_flat_20["p_range"] == 1.0,
+          f"avg_g={row_flat_20['avg_g']} thr={row_flat_20['threshold_pct']} dom={row_flat_20['dominant_direction']}")
+
+    median_dates_20 = [pd.Timestamp("2026-03-02") + pd.Timedelta(weeks=w) for w in range(4)]
+    df_median_20 = pd.concat([_make_slot_bars_20(d, 6, 5, 0.3) for d in median_dates_20]).sort_index()
+    cells_median_20, meta_median_20 = compute_five_min_band_stats(df_median_20, "薄商い (6-7)", weekday=None)
+    row_median_20 = cells_median_20.iloc[0]
+    check("20-4b 中央値ちょうど境界(全日g=0.3で閾値も0.3): 厳密不等号のため上昇/下降でなくレンジ判定",
+          row_median_20["n"] == 4 and math.isclose(row_median_20["avg_g"], 0.3, abs_tol=1e-9)
+          and math.isclose(row_median_20["threshold_pct"], 0.3, abs_tol=1e-9)
+          and row_median_20["p_up"] == 0.0 and row_median_20["p_down"] == 0.0
+          and row_median_20["dominant_direction"] == "レンジ" and row_median_20["p_range"] == 1.0,
+          f"avg_g={row_median_20['avg_g']} thr={row_median_20['threshold_pct']} dom={row_median_20['dominant_direction']}")
+
+    # 20-5: 追補v7 F2純ロジック(build_scan_calendar_matrix/scan_direction_icon)。
+    # 月曜06:00-06:30(g=+0.5・上昇)と火曜07:00-07:30(g=-0.4・下降)のみデータを仕込み、
+    # ピボット後の行=時刻範囲ラベル・列=曜日で正しい位置に値が入り、他セルはNaNのままを検証。
+    # freq_minutes=30の有効グループ最低本数(scan_min_bars_for_valid_group)=15本のため
+    # n=15で生成する(n=5だと欠測扱いで除外されseltestが偽陰性になる罠を回避)。
+    df_mat_20 = pd.concat([
+        _make_slot_bars_20(pd.Timestamp("2026-01-05"), 6, 15, 0.5),   # 月曜・slot12(06:00-06:30)
+        _make_slot_bars_20(pd.Timestamp("2026-01-06"), 7, 15, -0.4),  # 火曜・slot14(07:00-07:30)
+    ]).sort_index()
+    cells_mat_20, _meta_mat_20 = compute_month_calendar_cells(
+        df_mat_20, month=None, freq_minutes=30, threshold_mode="fixed", fixed_threshold_pct=0.1)
+    mats_20 = build_scan_calendar_matrix(cells_mat_20, 30)
+    check("20-5a build_scan_calendar_matrix: 全マトリクスの形状は48枠×7曜日",
+          mats_20["avg_g"].shape == (48, 7), f"got={mats_20['avg_g'].shape}")
+    check("20-5b 月曜06:00-06:30セルはavg_g=+0.5・dominant_direction=上昇の正しい位置に入る",
+          math.isclose(mats_20["avg_g"].loc["06:00–06:30", "月"], 0.5, abs_tol=1e-9)
+          and mats_20["dominant_direction"].loc["06:00–06:30", "月"] == "上昇",
+          f"got_g={mats_20['avg_g'].loc['06:00–06:30', '月']} "
+          f"dom={mats_20['dominant_direction'].loc['06:00–06:30', '月']}")
+    check("20-5c 火曜07:00-07:30セルはavg_g=-0.4・dominant_direction=下降の正しい位置に入る",
+          math.isclose(mats_20["avg_g"].loc["07:00–07:30", "火"], -0.4, abs_tol=1e-9)
+          and mats_20["dominant_direction"].loc["07:00–07:30", "火"] == "下降",
+          f"got_g={mats_20['avg_g'].loc['07:00–07:30', '火']} "
+          f"dom={mats_20['dominant_direction'].loc['07:00–07:30', '火']}")
+    check("20-5d データの無いセル(水曜06:00-06:30)はNaN(未設定=データ欠如)",
+          pd.isna(mats_20["avg_g"].loc["06:00–06:30", "水"])
+          and pd.isna(mats_20["dominant_direction"].loc["06:00–06:30", "水"]))
+    try:
+        build_scan_calendar_matrix(cells_mat_20, 45)
+        bad_freq_mat_20 = False
+    except ValueError:
+        bad_freq_mat_20 = True
+    check("20-5e build_scan_calendar_matrixは未対応の粒度(45分)でValueError", bad_freq_mat_20)
+    mats_empty_20 = build_scan_calendar_matrix(cells_dec_20, 30)  # 20-3dで空だったcellsを再利用
+    check("20-5f 空cells入力は全NaNの48枠×7曜日マトリクスを返す(crashしない)",
+          mats_empty_20["avg_g"].shape == (48, 7) and mats_empty_20["avg_g"].isna().all().all())
+    check("20-5g scan_direction_iconは上昇/下降/レンジを↑/↓/→へ変換・未知ラベルはValueError",
+          scan_direction_icon("上昇") == "↑" and scan_direction_icon("下降") == "↓"
+          and scan_direction_icon("レンジ") == "→")
+    try:
+        scan_direction_icon("不明")
+        bad_icon_20 = False
+    except ValueError:
+        bad_icon_20 = True
+    check("20-5h scan_direction_icon: 未知のdominant_directionはValueError", bad_icon_20)
+
+    # 20-6: 大標本(n>1000)パイプライン回帰テスト(2026-07-18バグ修正確認)。実運用では
+    # compute_five_min_band_stats(weekday=None)が帯内の全曜日を1グループへ合算するため、
+    # 5年分データで1枠あたりn≈1800まで膨れ上がりexact_binom_two_sided_pvalue内でOverflowError
+    # が起きていた(#4指摘)。ここでは1分足を生成せず直接occ(1グループ・n=1500)を合成し、
+    # _compute_scan_cells_from_occurrences経由でp_value_binomまで例外なく計算できることを検証する。
+    n_big_20 = 1500
+    dates_big_20 = [pd.Timestamp("2020-01-06") + pd.Timedelta(weeks=w) for w in range(n_big_20)]
+    rows_big_20 = [
+        {"date": d.date(), "weekday": "月", "month": d.month, "slot": 10,
+         "g": 0.1 if i % 2 == 0 else -0.05, "mfe_up": 0.0, "mfe_down": 0.0,
+         "vola_pct": 0.1, "volume": 1.0, "n_bars": 3}
+        for i, d in enumerate(dates_big_20)
+    ]
+    occ_big_20 = pd.DataFrame(rows_big_20)
+    try:
+        cells_big_20 = _compute_scan_cells_from_occurrences(occ_big_20, 5, "adaptive", 1.0, 0.15, (), 0.0)
+        ok_big_20 = (len(cells_big_20) == 1 and cells_big_20.iloc[0]["n"] == n_big_20
+                     and not math.isnan(cells_big_20.iloc[0]["p_value_binom"]))
+        detail_big_20 = f"n={cells_big_20.iloc[0]['n']} p_value_binom={cells_big_20.iloc[0]['p_value_binom']}"
+    except OverflowError as e:
+        ok_big_20 = False
+        detail_big_20 = f"OverflowError: {e}"
+    check("20-6 大標本(曜日合算n=1500)でも_compute_scan_cells_from_occurrencesが"
+          "OverflowErrorを起こさずp_value_binomを計算できる", ok_big_20, detail_big_20)
+
+    # =====================================================================================
+    # 21. バグ狩り第2ラウンド確定指摘の回帰テスト(2026-07-18)
+    # =====================================================================================
+    print("\n--- 21. バグ狩り第2ラウンド確定指摘の回帰テスト ---")
+
+    # 21-1: filter_occurrences_by_date_range の既知解(指摘#1の土台関数)。閉区間・境界日を
+    # 両端とも含む・範囲外は空・空入力はno-opであることを検証する。
+    occ_21 = pd.DataFrame({
+        "date": [date(2026, 1, 1), date(2026, 1, 5), date(2026, 1, 10), date(2026, 1, 15)],
+        "g": [1.0, 2.0, 3.0, 4.0],
+    })
+    sub_21a = filter_occurrences_by_date_range(occ_21, date(2026, 1, 5), date(2026, 1, 10))
+    check("21-1a filter_occurrences_by_date_range: 閉区間で境界日を両端とも含む(n=2)",
+          len(sub_21a) == 2 and set(sub_21a["date"]) == {date(2026, 1, 5), date(2026, 1, 10)},
+          f"got_dates={list(sub_21a['date'])}")
+    sub_21b = filter_occurrences_by_date_range(occ_21, date(2027, 1, 1), date(2027, 1, 2))
+    check("21-1b filter_occurrences_by_date_range: 範囲外指定は空DataFrame(クラッシュしない)",
+          sub_21b.empty)
+    sub_21c = filter_occurrences_by_date_range(
+        pd.DataFrame(columns=occ_21.columns), date(2026, 1, 1), date(2026, 1, 2))
+    check("21-1c filter_occurrences_by_date_range: 空入力はno-opで空のまま", sub_21c.empty)
+
+    # 21-2: compute_five_min_band_stats(date_range=...) の回帰(指摘#1本体)。3週分のデータ
+    # (週替わりでg値を変えて仕込む)のうちdate_rangeで最初の2週だけに絞ったとき、n/avg_gが
+    # その2週だけの値になり、meta.period_start/period_endが渡したdate_rangeそのもの
+    # (データ全期間ではない)に置き換わることを検証する(親表キャプションの期間表示と一致
+    # させるための仕様)。
+    wk_dates_21 = [pd.Timestamp("2026-05-04"), pd.Timestamp("2026-05-11"), pd.Timestamp("2026-05-18")]
+    wk_g_21 = [0.2, 0.4, 0.9]
+    frames_21 = [_make_slot_bars_20(d, 8, 5, g) for d, g in zip(wk_dates_21, wk_g_21)]
+    df_21 = pd.concat(frames_21).sort_index()
+
+    cells_full_21, meta_full_21 = compute_five_min_band_stats(df_21, "アジア早朝 (7-10)", weekday=None)
+    check("21-2a date_range省略時はn=3(全期間)・meta.period_startがデータ最古の値",
+          cells_full_21.iloc[0]["n"] == 3
+          and pd.Timestamp(meta_full_21["period_start"]) == df_21.index.min(),
+          f"n={cells_full_21.iloc[0]['n']} period_start={meta_full_21['period_start']}")
+
+    range_21 = (date(2026, 5, 4), date(2026, 5, 11))
+    cells_ranged_21, meta_ranged_21 = compute_five_min_band_stats(
+        df_21, "アジア早朝 (7-10)", weekday=None, date_range=range_21)
+    check("21-2b date_range指定(最初2週)でn=2・avg_gが最初2週平均に絞られる(3週目0.9は除外)",
+          cells_ranged_21.iloc[0]["n"] == 2
+          and math.isclose(cells_ranged_21.iloc[0]["avg_g"], np.mean(wk_g_21[:2]), abs_tol=1e-9),
+          f"n={cells_ranged_21.iloc[0]['n']} avg_g={cells_ranged_21.iloc[0]['avg_g']}")
+    check("21-2c date_range指定時、meta.period_start/period_endは渡した期間そのもの"
+          "(データ全期間でなく親表キャプションと一致する値)",
+          meta_ranged_21["period_start"] == range_21[0] and meta_ranged_21["period_end"] == range_21[1],
+          f"got=({meta_ranged_21['period_start']}, {meta_ranged_21['period_end']}) exp={range_21}")
+
+    # 21-3: compute_five_min_band_stats_multi(date_range=...) の回帰(指摘#1・「全選択銘柄の
+    # 平均」モード)。2銘柄に同一date_rangeを適用したとき両銘柄とも絞り込まれ、
+    # meta.period_start/period_endが渡した期間と一致することを検証する。
+    df_21b = pd.concat(
+        [_make_slot_bars_20(d, 8, 5, g * 1.5) for d, g in zip(wk_dates_21, wk_g_21)]).sort_index()
+    cells_multi_21, meta_multi_21 = compute_five_min_band_stats_multi(
+        {"BTC": df_21, "ETH": df_21b}, "アジア早朝 (7-10)", weekday=None, date_range=range_21)
+    check("21-3a compute_five_min_band_stats_multi: date_range指定時は両銘柄ともn=2に絞られる",
+          cells_multi_21.iloc[0]["n"] == 2, f"n={cells_multi_21.iloc[0]['n']}")
+    check("21-3b compute_five_min_band_stats_multi: meta.period_start/endが渡した期間と一致",
+          meta_multi_21["period_start"] == range_21[0] and meta_multi_21["period_end"] == range_21[1],
+          f"got=({meta_multi_21['period_start']}, {meta_multi_21['period_end']})")
+
+    # 21-4: カレンダービュー月フリーズの回帰(指摘#2)。build_scan_occurrences(実データ)への
+    # 呼び出し回数を監視ラッパで数え、_scan_calendar_cells_cachedに異なる月(11,12,None)を
+    # 渡してもシンボル×粒度単位キャッシュ(_scan_occurrences_cached)により1回しか実行され
+    # ないことを検証する(修正前は月を変える度に8〜16秒のフルスクラッチ再計算が発生していた)。
+    _call_count_21: dict[str, int] = {"n": 0}
+    _orig_build_occ_21 = globals()["build_scan_occurrences"]
+
+    def _counting_build_occ_21(df_, freq_minutes=30):
+        _call_count_21["n"] += 1
+        return _orig_build_occ_21(df_, freq_minutes)
+
+    globals()["build_scan_occurrences"] = _counting_build_occ_21
+    try:
+        _c1_21, _m1_21 = _scan_calendar_cells_cached("BTC", 11, 30)
+        _c2_21, _m2_21 = _scan_calendar_cells_cached("BTC", 12, 30)
+        _c3_21, _m3_21 = _scan_calendar_cells_cached("BTC", None, 30)
+        ok_21_4 = _call_count_21["n"] == 1
+    finally:
+        globals()["build_scan_occurrences"] = _orig_build_occ_21
+    check("21-4 月セレクタを3回変えてもbuild_scan_occurrences実行は1回のみ"
+          "(シンボル×粒度単位キャッシュで重複計算を回避)",
+          ok_21_4, f"calls={_call_count_21['n']}")
+
+    # 21-5: load_1m後のgc.collect()呼び出しがDataFrameの中身を破壊しないことの回帰
+    # (指摘#3・低優先度だがコード変更を伴うため最低限の健全性は保証する)。実データBTCで
+    # dtype・列・行数・indexの単調増加・欠損なしを確認する。
+    df_gc_21 = load_1m("BTC")
+    check("21-5 load_1m: gc.collect()後もOHLCV列がfloat32・行数>0・indexにNaTなし・単調増加",
+          not df_gc_21.empty
+          and list(df_gc_21.columns) == SCAN_1M_COLS
+          and all(df_gc_21[c].dtype == np.float32 for c in SCAN_1M_COLS)
+          and not df_gc_21.index.isna().any()
+          and df_gc_21.index.is_monotonic_increasing,
+          f"rows={len(df_gc_21)} dtypes={[str(df_gc_21[c].dtype) for c in SCAN_1M_COLS]}")
 
     print("\n" + "=" * 78)
     if all_ok:
