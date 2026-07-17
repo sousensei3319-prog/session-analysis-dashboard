@@ -95,6 +95,10 @@ python session_dashboard/app.py --selftest
 - **📅 曜日・月別**（追補§4。詳細は本README末尾「12. 追補§4」参照）: 上段=曜日別アノマリー（サイドバーの選択期間の1時間足をそのまま流用、追加フェッチなし）、
   下段=月別アノマリー（選択期間とは**独立**に長期日足を別途取得。lookbackで3年/5年/10年を選択）。
   いずれもトレードCSVをアップロード済みなら曜日別・月別の勝率ヒートマップ／サマリーが自動反映される。
+- **⚡ 確率スキャナー**（追補v6。詳細は本README末尾「18. 追補v6」参照）: サイドバーの期間選択・銘柄選択とは
+  **独立**に動作する（BTC/ETH/SOL専用・`data_1m/`の1分足を`scan_job.py`が事前集計した`scan_results.json`を読む）。
+  月×曜日×30分刻みの時間帯別に騰落方向・値幅の統計的傾向（n/Wilson信頼区間/BH-FDR補正/前後半安定性/
+  手数料込み期待値）を提示する。ランキング／1日マップ／セル詳細の3ビュー構成。
 
 ## 5. トレード履歴CSVフォーマット仕様
 
@@ -208,10 +212,16 @@ gatherUsageStats = false
 
 ```
 session_dashboard/
-├─ app.py                  # アプリ本体（単一ファイル完結）
+├─ app.py                  # アプリ本体（単一ファイル完結。⚡確率スキャナーのUI/統計エンジンも同居）
+├─ scan_job.py              # ⚡確率スキャナー用スタンドアロンBGジョブ（追補v6§4。詳細は「18.3」参照）
+├─ backfill_1m.py           # BTC/ETH/SOL 1分足バックフィル/増分取得（scan_job.pyが呼び出す）
 ├─ README.md                # このファイル
 ├─ sample_trades.csv         # サンプルトレード履歴・弟子側（30件・全9帯網羅・複数銘柄・勝敗混在）
 ├─ sample_trades_mentor.csv  # サンプルトレード履歴・師匠側（30件・同期間/同銘柄群・成績が明確に良い合成データ）
+├─ data_1m/                 # 1分足データ（{BTC,ETH,SOL}/{YEAR}.parquet。ts unix秒int64+OHLCV float32）
+├─ scan_results.json         # ⚡確率スキャナーの集計結果（scan_job.pyが書き出し。UIはこれを読むだけ）
+├─ calendar_cache.json       # 経済指標カレンダーの取得キャッシュ（6h TTL、scan_job.py用）
+├─ scan_commentary.json      # （任意）セル詳細ビューに表示するリサーチコメント。無ければ非表示
 └─ .streamlit/
    └─ config.toml            # ダークテーマ設定
 ```
@@ -551,11 +561,107 @@ session_dashboard/
   `trades_<ラベル>`で識別）が全て価格チャート行のy軸（`y2`, `y3`, …）に配置され、ボラチャート行の
   y軸（`y`）には一切現れないことを機械検証。
 
+## 18. 追補v6: ⚡確率スキャナータブ
+
+目的（ユーザー依頼2026-07-11・仕様追補v6§0）: 「月×曜日×時刻の特定の数分間に価格がX%動く確率が高い箇所」を
+BTC/ETH/SOL専用の1分足で統計的に洗い出し、短期売買の判断材料にする。サイドバーの期間・銘柄選択とは
+**独立**に動作するタブで、`session_dashboard/`とは別プロセスの`scan_job.py`が事前計算した
+`scan_results.json`を読み込んで表示するだけ（このタブ自体は発注機能もHTTP取得も一切行わない＝掟5）。
+
+### 18.1 統計的誠実さのガード（最重要・掟2）
+
+本プロジェクトの前科（曜日アノマリー12ヶ月検証でFDR補正通過ゼロ／横断BTで戦場選抜不可／1分スキャは
+手数料壁で全滅）を踏まえ、以下のガードが**揃わない確率表示は「エッジ」と呼ばない**。タブ冒頭の
+「📐 統計ガードについて」expanderに常設で解説文を表示する。
+
+1. **n（サンプル数）と Wilson 95%信頼区間**を全セルに常時表示。n<30は目安として注記。
+2. **BH-FDR補正**（銘柄内セル横断・二項検定 vs 全体基準率）→ q値<0.10のセルのみ既定表示
+   （「FDR候補のみ」トグルで全表示に切替可）。
+3. **前半/後半の方向一致（安定性）**を各セルに表示。
+4. **手数料込み期待値**（往復0.10%控除後・設定可）を併記。
+5. 「確率は過去の発生頻度であり将来の保証ではない」旨と多重検定の注意書きを常設。
+   さらに「グロス/手数料比はレバレッジを変えても不変」というハイレバ算数警告カード（`st.error`）を
+   タブ最上部に常設し、本タブがポジションサイズ・レバレッジの助言でないことを明記する。
+
+### 18.2 データ層・階層グループ・統計エンジン（仕様§1-3・app.py内・純ロジック）
+
+- データ元: `data_1m/{BTC,ETH,SOL}/{YEAR}.parquet`（`backfill_1m.py`がPM側で構築・増分更新）。
+  `load_1m(label, years=None)`で読み込み、JST tz-aware indexへ変換。銘柄ごとに逐次処理し
+  メモリを抑える（float32維持）。
+- 階層: 1分足×5本=5分ブロック、5分ブロック×6本=30分グループ（JST 00:00起点・日またぎなし・1日48枠）。
+  各30分グループは時刻範囲ラベルと**所属セッション**（既存の一意hourマップ§7を30分粒度に継承）を持つ。
+  セルキーは `(月[1-12|全月合算], 曜日, 30分枠[0-47])`。5分粒度はセル詳細ビュー内の内訳表示に使用。
+- 各オカレンスの騰落率 `g = (close_last − open_first)/open_first ×100`、判定はσ適応（そのセルの過去|g|
+  分布の中央値×k、k=1.0既定）または固定閾値（±0.15%等）の切替式。吹っ飛び系はMFE_up/MFE_down
+  （高値/安値までの最大逸脱率）。
+- セル集計（`compute_scan_cells`）: n・平均/中央値騰落率・平均出来高・ボラ・P(上昇)/P(下降)/P(レンジ)＋
+  Wilson CI・テール確率（MFE≥0.3/0.5/1.0%）＋CI・二項検定p値→BH-FDR q値・前半/後半P(上昇)と方向一致
+  フラグ・手数料込み期待値。全て純関数でselftest対象（「18.5」参照）。
+
+### 18.3 `scan_job.py` の運用（仕様§4・スタンドアロン実行）
+
+`scan_job.py`はStreamlitと無関係に単独実行するバックグラウンドジョブで、`scan_results.json`を生成・
+更新する。ダッシュボード側（app.py）はこのJSONを読むだけで、自分では1分足の再取得もスキャン再計算も
+行わない（UIの応答性を保つため）。
+
+```bash
+python session_dashboard/scan_job.py --run     # 本番実行: 増分取得→3銘柄スキャン→JSON書出→カレンダー照合→Discord通知
+python session_dashboard/scan_job.py --dry     # 通知を送らずに生成のみ試す（動作確認用）
+python session_dashboard/scan_job.py --selftest # scan_job.py自体の純ロジックテスト（app.py --selftestとは別）
+python session_dashboard/scan_job.py --no-fetch # 1分足の増分取得をスキップ（既存data_1m/のみで再計算）
+python session_dashboard/scan_job.py --no-calendar # 経済指標カレンダー照合をスキップ
+```
+
+- **処理順**: ①`backfill_1m.py`相当の増分1分足取得 ②BTC/ETH/SOLを**銘柄ごとに逐次**スキャン再計算
+  （`del`+`gc.collect()`でメモリ解放。Oracle VM の `MemoryMax=450M` 制約内で完走する設計）
+  ③`scan_results.json`をアトミック書き出し（`updated_at`はJST・銘柄別セル配列＋`top_candidates`
+  ＝FDR q<0.10かつn≥30を満たす上位候補）④経済指標カレンダー照合（`calendar_cache.json`に6hキャッシュ。
+  取得失敗時は照合スキップ＝空フラグのまま本体は止めない）⑤Discord通知。
+- **Discord webhook**: 環境変数 `DISCORD_WEBHOOK_SESSION_SCAN`（無ければ `DISCORD_WEBHOOK_NEW_TEST`へ
+  フォールバック）。秘密情報はコード直書きせず`.env`経由（D-015準拠）。embed内容=更新日時＋銘柄別
+  トップ3候補セル（n/CI/FDR q/指標フラグ付き）＋免責1行。
+- **経済指標カレンダー**: `api.nasdaq.com/api/calendar/economicevents`（無料・Mozilla風UA必須）。
+  セルの時刻窓±15分に高重要度指標が重なる場合にフラグを付与するのみで、「指標はボラティリティを
+  拡大させるが方向は予測不可（検証済み知見）」という注記が必ず併記される。
+- Oracle側のsystemdタイマー設定（1日4回想定）・funnel経由のJSON公開・Claude定期リサーチ
+  （`scan_commentary.json`生成）は**PM側の運用作業**であり、本ワーカーのスコープ外（仕様§7）。
+
+### 18.4 UIの3ビュー（仕様§5・トレード履歴タブの後ろに追加）
+
+- **冒頭カード**（`render_scan_header_cards`）: `scan_results.json`の`updated_at`（JST・掟6）＋データ元
+  （`data_1m/`・ccxt binance）＋銘柄別集計期間とn＋経済指標カレンダー取込状況＋「18.1」の統計ガード解説
+  expander＋ハイレバ算数警告カード。`scan_results.json`が無い場合は`python scan_job.py --run`での生成
+  手順を案内して以降のビューは表示しない。
+- **🏆 ランキングビュー**（`render_scan_ranking_view`）: フィルタ（銘柄／セッション／曜日／月＝月指定時は
+  n激減警告／最低n＝既定30／「FDR候補のみ」トグル＝既定ON／テール閾値0.3・0.5・1.0%）で絞り込んだ上位
+  セルを表形式（時刻範囲｜セッション｜曜日｜n｜P(方向)＋CI｜テール確率＋CI｜FDR q｜前後半一致｜
+  手数料込みE[g]｜指標フラグ）で表示。確率セルは色分け（`_scan_prob_color`等）。
+  **表示はすべて事前整形済み文字列**（`st.dataframe`×pandas 3.0でStyler.formatが無視される罠を回避する
+  既存流儀＝`style_cross_table`と同じパターンを踏襲）。
+- **🗓️ 1日マップビュー**（`render_scan_heatmap_view`）: 選択した曜日について、48枠×3銘柄（BTC/ETH/SOL）
+  のヒートマップを表示。値はP(上昇)−P(下降)またはテール確率（切替可）。
+- **🔍 セル詳細ビュー**（`render_scan_cell_detail_view`）: 選んだセルの過去オカレンス一覧（日付・騰落率・
+  MFE↑↓）＋5分ブロック内訳統計＋既存の🔍トレードズームビュー機構を流用したチャート連携（オカレンスを
+  選ぶとその日その時刻の1分足ローソク足を表示）＋`scan_commentary.json`があれば併記表示（無ければ非表示）。
+
+### 18.5 selftest追加（既存の項目は不変・仕様§6の1-7全項目）
+
+`python session_dashboard/app.py --selftest`のセクション「19. 確率スキャナー統計エンジン(追補v6 E1/E2)」
+にて以下を機械検証している（合成データによる既知解一致・実データ取得は行わない）:
+
+1. 30分グループ化: JST境界（00:00/23:30）・5本×6本の整合・欠損バーの扱い
+2. セッション継承マッピング（16:00-17:00→ロンドンオープン等・24h×48枠全カバー）
+3. 判定既知解（σ適応／固定閾値・境界値）
+4. Wilson CI・BH-FDR・二項検定の既知解（手計算と一致）
+5. テール確率既知解（合成データでP(MFE≥x)を検証）
+6. カレンダー照合純ロジック（±15分窓・タイムゾーン）
+7. `scan_results.json`のroundtrip（書き出し→読み込み→同一）
+
 ## 起動時テストの実行例（本タスクでの確認手順）
 
 ```bash
 python -m py_compile session_dashboard/app.py   # 構文チェック
-python session_dashboard/app.py --selftest      # 全selftest（§1〜§17）PASS確認
+python session_dashboard/app.py --selftest      # 全selftest（§1〜19、⚡確率スキャナーの統計エンジン含む）PASS確認
 ```
 
 スモークテスト（ポート8598・稼働中の8501には触れない）:
@@ -563,5 +669,7 @@ python session_dashboard/app.py --selftest      # 全selftest（§1〜§17）PAS
 ```bash
 streamlit run session_dashboard/app.py --server.port 8598 --server.headless true &
 curl -m 5 -s -o /dev/null -w "%{http_code}\n" http://localhost:8598
-# 200を確認したらプロセスをkillしてポートを解放する
+# 200が返ってもStreamlitはSPAのためcurlのHTML本体には画面テキストが出ない。
+# 「⚡確率スキャナー」タブの描画確認は実ブラウザ（DevTools/CDP等）で行うこと。
+# 確認後は必ずプロセスをkillしてポートを解放する。
 ```
