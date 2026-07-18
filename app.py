@@ -6288,6 +6288,17 @@ def compute_five_min_breakdown(
     return _compute_scan_cells_from_occurrences(sub, 5, threshold_mode, k, fixed_threshold_pct, (), 0.0)
 
 
+def band_relative_slot_order(slot: int, band: str, freq_minutes: int) -> int:
+    """帯内の枠を「帯の開始時刻」起点の時系列順に並べるためのソートキー(2026-07-19修正)。
+    NY重複(21-1)のように日跨ぎする帯では絶対slot昇順だと00:xxが先頭・21:xxが末尾になる。
+    BAND_HOURSタプル先頭=帯の開始時刻を起点に (slot − 開始slot) mod 総枠数 を返し、
+    21:00→…→23:55→00:00→00:55 の正しい並びにする(日跨ぎしない帯は自然順のまま)。
+    """
+    slots_per_day = SCAN_SLOTS_PER_DAY[freq_minutes]
+    start_slot = BAND_HOURS[band][0] * (60 // freq_minutes)
+    return (int(slot) - start_slot) % slots_per_day
+
+
 def compute_five_min_band_stats(
     df_1m: pd.DataFrame,
     band: str,
@@ -6352,7 +6363,11 @@ def compute_five_min_band_stats(
     else:
         range_by_slot = sub.groupby("slot")["range_pct"].mean()
         cells["avg_range_pct"] = cells["slot"].map(range_by_slot)
-    cells = cells.sort_values("slot").reset_index(drop=True)
+    if not cells.empty:
+        _ord = cells["slot"].map(lambda s: band_relative_slot_order(int(s), band, 5))
+        cells = cells.assign(_ord=_ord).sort_values("_ord").drop(columns="_ord").reset_index(drop=True)
+    else:
+        cells = cells.reset_index(drop=True)
     meta: dict[str, Any] = {
         "band": band, "weekday_filter": weekday_label, "freq_minutes": 5,
         "period_start": period_start, "period_end": period_end,
@@ -6429,7 +6444,8 @@ def compute_five_min_band_stats_multi(
     # 各行net_biasの平均と一致する線形量のため新規集計にならない)。
     result["net_bias"] = scan_net_bias(result["p_up"], result["p_down"])
     result["trend_rate"] = scan_trend_rate(result["p_up"], result["p_down"])
-    result = result.sort_values("slot").reset_index(drop=True)
+    _ord = result["slot"].map(lambda s: band_relative_slot_order(int(s), band, 5))
+    result = result.assign(_ord=_ord).sort_values("_ord").drop(columns="_ord").reset_index(drop=True)
     period_starts = [m["period_start"] for m in metas if m.get("period_start") is not None]
     period_ends = [m["period_end"] for m in metas if m.get("period_end") is not None]
     meta = {
@@ -9808,6 +9824,17 @@ def run_selftest() -> bool:
     check("21-3b compute_five_min_band_stats_multi: meta.period_start/endが渡した期間と一致",
           meta_multi_21["period_start"] == range_21[0] and meta_multi_21["period_end"] == range_21[1],
           f"got=({meta_multi_21['period_start']}, {meta_multi_21['period_end']})")
+
+    # 26: 日跨ぎ帯(NY重複21-1)の5分内訳が帯開始時刻(21:00)起点で並ぶか(2026-07-19修正)
+    check("26-1a band_relative_slot_order: NY重複21:00(slot252)が先頭0",
+          band_relative_slot_order(21 * 12, "NY重複 (21-1)", 5) == 0)
+    check("26-1b band_relative_slot_order: NY重複23:55(slot287)は00:00(slot0)より前",
+          band_relative_slot_order(23 * 12 + 11, "NY重複 (21-1)", 5)
+          < band_relative_slot_order(0, "NY重複 (21-1)", 5))
+    check("26-1c band_relative_slot_order: NY重複00:55(slot11)が末尾47",
+          band_relative_slot_order(11, "NY重複 (21-1)", 5) == 47)
+    check("26-1d band_relative_slot_order: 日跨ぎしない帯(アジア早朝7:00=slot84)は先頭0",
+          band_relative_slot_order(7 * 12, "アジア早朝 (7-10)", 5) == 0)
 
     # 21-4: カレンダービュー月フリーズの回帰(指摘#2)。build_scan_occurrences(実データ)への
     # 呼び出し回数を監視ラッパで数え、_scan_calendar_cells_cachedに異なる月(11,12,None)を
