@@ -50,6 +50,8 @@ CALENDAR_CACHE_PATH = HERE / "calendar_cache.json"
 CALENDAR_CELLS_PATH = HERE / "calendar_cells.json"
 CALENDAR_CELLS_FREQS: list[int] = [30, 60]  # app.SCAN_SLOTS_PER_DAYが対応する月カレンダー粒度
 CALENDAR_CELLS_MONTHS: list[Optional[int]] = [None] + list(range(1, 13))  # None=全月合算
+# 仕様v8§5: calendar_cells.jsonは55MB超なら60分粒度を落とし30分のみで再書出(注記付き)
+CALENDAR_CELLS_SIZE_LIMIT_BYTES = 55 * 1024 * 1024  # 57,671,680 バイト
 CALENDAR_CACHE_TTL_SEC = 6 * 3600  # 仕様§4: 6hキャッシュ
 CALENDAR_DAYS_BEFORE = 1  # GMT/JST日境界のズレ吸収用に前日分も取得
 CALENDAR_DAYS_AFTER = 7   # 今日を含め直近7日で全曜日(月〜日)を1回ずつカバー
@@ -476,8 +478,10 @@ def build_calendar_cells_snapshot(
     load_fn: Optional[Callable[[str], pd.DataFrame]] = None,
 ) -> dict[str, Any]:
     """app.load_calendar_cells_snapshot/calendar_cells_snapshot_lookupが読む形式のdictを組み立てる
-    (仕様§1.2)。銘柄ごとに逐次load_1m→粒度ごとにbuild_scan_occurrencesを1回だけ実行し、
-    月はprecomputed_occで使い回す(app.compute_month_calendar_cellsの再計算回避と同じ作法)。
+    (仕様v8§5)。銘柄ごとに逐次load_1m→粒度ごとにbuild_scan_occurrencesを1回だけ実行し、
+    月×判定方式(app.SCAN_JUDGE_METHODS全件・各方式は既定パラメータ固定)はprecomputed_occで
+    使い回す(app.compute_month_calendar_cellsの再計算回避と同じ作法)。方式ごとにスリム列
+    (app.SLIM_CALENDAR_COLS)だけを保存しCI・テール等は含めない(容量対策・仕様§5)。
     銘柄処理後にdel+gcしメモリ規律(仕様§4)を維持する。load_fnはselftest用の差し替え口
     (省略時はapp.load_1m=実parquet読込)。
     """
@@ -493,13 +497,22 @@ def build_calendar_cells_snapshot(
                 occ, occ_meta = app.build_scan_occurrences(df, freq)
                 month_json: dict[str, Any] = {}
                 for month in months:
-                    cells, meta = app.compute_month_calendar_cells(
-                        df, month=month, freq_minutes=freq, precomputed_occ=(occ, occ_meta))
+                    method_json: dict[str, Any] = {}
+                    for method in app.SCAN_JUDGE_METHODS:
+                        k, judge_params = app.scan_judge_ui_params_to_compute_args(
+                            method, app.SCAN_JUDGE_METHOD_DEFAULTS[method])
+                        cells, meta = app.compute_month_calendar_cells(
+                            df, month=month, freq_minutes=freq, k=k,
+                            precomputed_occ=(occ, occ_meta),
+                            judge_method=method, judge_params=judge_params)
+                        slim = cells[app.SLIM_CALENDAR_COLS] if not cells.empty else cells
+                        method_json[method] = app.scan_cells_to_json_dict(slim, meta)
                     month_key = "all" if month is None else str(month)
-                    month_json[month_key] = app.scan_cells_to_json_dict(cells, meta)
+                    month_json[month_key] = method_json
                 del occ
                 freq_json[str(freq)] = month_json
-                log(f"  [calendar-cells][{label}] 粒度{freq}分: {len(months)}ヶ月分完了")
+                log(f"  [calendar-cells][{label}] 粒度{freq}分: "
+                    f"{len(months)}ヶ月×{len(app.SCAN_JUDGE_METHODS)}方式分完了")
         symbols_json[label] = freq_json
         del df
         gc.collect()
@@ -509,10 +522,44 @@ def build_calendar_cells_snapshot(
             "updated_at": datetime.now(JST).isoformat(),
             "generated_by": "scan_job.py --calendar-cells",
             "symbols": symbols, "freqs": freqs,
+            "judge_methods": list(app.SCAN_JUDGE_METHODS),
         },
         "symbols": symbols_json,
     }
 
+
+
+# =====================================================================================
+# 追補v8§5: calendar_cells.json書出+サイズ超過フォールバック(main()とselftestの両方から
+# 呼べるよう1本化。55MB超かつ60分粒度を含む場合は60分を除外し30分のみで再生成・再書出)
+# =====================================================================================
+
+def write_calendar_cells_snapshot(
+    symbols: list[str], freqs: list[int], months: list[Optional[int]],
+    path: Path = CALENDAR_CELLS_PATH,
+    load_fn: Optional[Callable[[str], pd.DataFrame]] = None,
+    size_limit_bytes: int = CALENDAR_CELLS_SIZE_LIMIT_BYTES,
+) -> tuple[dict[str, Any], int]:
+    """calendar_cells.jsonの組立→書出→サイズ超過フォールバック(仕様v8§5)。
+    戻り値=(実際に書き出したsnapshot, 書出後のファイルサイズbytes)。
+    size_limit_bytes/load_fn/pathはselftestでの差し替え口(小さい上限でフォールバック分岐を
+    決定的に再現できる)。
+    """
+    snapshot = build_calendar_cells_snapshot(symbols, freqs, months, load_fn=load_fn)
+    atomic_write_json(path, snapshot, compact=True)
+    size_bytes = path.stat().st_size
+    if size_bytes > size_limit_bytes and 60 in freqs:
+        log(f"[calendar-cells] サイズ超過検知: {size_bytes:,}B > {size_limit_bytes:,}B(上限) → "
+            f"60分粒度を除外し再書出")
+        freqs_fallback = [f for f in freqs if f != 60]
+        snapshot = build_calendar_cells_snapshot(symbols, freqs_fallback, months, load_fn=load_fn)
+        snapshot["meta"]["size_fallback_note"] = (
+            f"{size_limit_bytes:,}B上限超過(元サイズ{size_bytes:,}B)のため60分粒度を除外し"
+            f"30分のみで再生成(仕様v8§5)")
+        atomic_write_json(path, snapshot, compact=True)
+        size_bytes = path.stat().st_size
+        log(f"[calendar-cells] 再書出完了: {size_bytes:,}B")
+    return snapshot, size_bytes
 
 
 def main() -> None:
@@ -540,9 +587,9 @@ def main() -> None:
         t0 = time.time()
         log(f"カレンダーセル書出開始(symbols={symbols} freqs={freqs} "
             f"months={len(CALENDAR_CELLS_MONTHS)}件)")
-        snapshot = build_calendar_cells_snapshot(symbols, freqs, CALENDAR_CELLS_MONTHS)
-        atomic_write_json(CALENDAR_CELLS_PATH, snapshot, compact=True)
-        log(f"calendar_cells.json 書出完了: {CALENDAR_CELLS_PATH}(経過{time.time() - t0:.1f}秒)")
+        _, size_bytes = write_calendar_cells_snapshot(symbols, freqs, CALENDAR_CELLS_MONTHS)
+        log(f"calendar_cells.json 書出完了: {CALENDAR_CELLS_PATH}"
+            f"({size_bytes:,}B, 経過{time.time() - t0:.1f}秒)")
         sys.exit(0)
 
     if not args.run and not args.dry:
@@ -810,10 +857,16 @@ def run_selftest() -> bool:
     freq30_sj7 = snap_sj7["symbols"]["BTC"]["30"]
     check("SJ-7b 月キーがall/1/2の3つ揃っている", set(freq30_sj7.keys()) == {"all", "1", "2"},
           f"keys={list(freq30_sj7.keys())}")
+    check("SJ-7b2 all月の内側キーがSCAN_JUDGE_METHODS全6方式揃っている(仕様v8§5)",
+          set(freq30_sj7["all"].keys()) == set(app.SCAN_JUDGE_METHODS),
+          f"keys={list(freq30_sj7['all'].keys())}")
 
-    cells_all_sj7, _ = app.scan_cells_from_json_dict(freq30_sj7["all"])
-    cells_jan_sj7, _ = app.scan_cells_from_json_dict(freq30_sj7["1"])
-    cells_feb_sj7, _ = app.scan_cells_from_json_dict(freq30_sj7["2"])
+    cells_all_sj7, _ = app.scan_cells_from_json_dict(freq30_sj7["all"][app.SCAN_JUDGE_METHOD_DEFAULT])
+    cells_jan_sj7, _ = app.scan_cells_from_json_dict(freq30_sj7["1"][app.SCAN_JUDGE_METHOD_DEFAULT])
+    cells_feb_sj7, _ = app.scan_cells_from_json_dict(freq30_sj7["2"][app.SCAN_JUDGE_METHOD_DEFAULT])
+    check("SJ-7b3 スリム列のみでCI等の重量列は含まれない(仕様v8§5容量対策)",
+          "p_up_ci_low" not in cells_all_sj7.columns and "avg_g" in cells_all_sj7.columns,
+          f"cols={list(cells_all_sj7.columns)}")
     n_all_sj7 = int(cells_all_sj7.loc[cells_all_sj7["slot"] == 18, "n"].iloc[0])
     n_jan_sj7 = int(cells_jan_sj7.loc[cells_jan_sj7["slot"] == 18, "n"].iloc[0])
     n_feb_sj7 = int(cells_feb_sj7.loc[cells_feb_sj7["slot"] == 18, "n"].iloc[0])
@@ -833,11 +886,39 @@ def run_selftest() -> bool:
               f"n={n_rt_sj7} meta={meta_rt_sj7}")
         missing_sj7, _ = app.calendar_cells_snapshot_lookup(loaded_sj7, "ETH", None, 30)
         check("SJ-7f 未収録銘柄(ETH)の照会は空", missing_sj7.empty)
+        cells_median_sj7, _ = app.calendar_cells_snapshot_lookup(
+            loaded_sj7, "BTC", None, 30, method="median")
+        n_median_sj7 = int(cells_median_sj7.loc[cells_median_sj7["slot"] == 18, "n"].iloc[0])
+        check("SJ-7f2 method='median'を明示指定した照会も同じn=3で取得できる(全方式roundtrip)",
+              n_median_sj7 == 3, f"n={n_median_sj7}")
 
     empty_snap_sj7 = build_calendar_cells_snapshot(
         symbols=["ETH"], freqs=[30], months=[None], load_fn=lambda label: pd.DataFrame(columns=app.SCAN_1M_COLS))
     check("SJ-7g 空の1分足(load_fn)を渡した銘柄はfreq_jsonが空dictで書出クラッシュしない",
           empty_snap_sj7["symbols"]["ETH"] == {}, f"got={empty_snap_sj7['symbols']['ETH']}")
+
+    # SJ-7h: write_calendar_cells_snapshotのサイズ超過フォールバック(仕様v8§5)。
+    # size_limit_bytesを極小(1バイト)にして必ず超過させ、60分粒度が落ちて30分のみへ
+    # 縮退し注記が残ることを決定的に検証する。
+    with tempfile.TemporaryDirectory() as td_sj7h:
+        p_sj7h = Path(td_sj7h) / "calendar_cells.json"
+        snap_sj7h, size_sj7h = write_calendar_cells_snapshot(
+            symbols=["BTC"], freqs=[30, 60], months=[None], path=p_sj7h,
+            load_fn=lambda label: df_sj7, size_limit_bytes=1)
+        check("SJ-7h1 サイズ上限1Bを必ず超過させると60分粒度が除外される",
+              set(snap_sj7h["symbols"]["BTC"].keys()) == {"30"},
+              f"keys={list(snap_sj7h['symbols']['BTC'].keys())}")
+        check("SJ-7h2 フォールバック注記がmetaに記録される",
+              "size_fallback_note" in snap_sj7h["meta"], f"meta={snap_sj7h['meta']}")
+        check("SJ-7h3 再書出後のファイル実サイズが戻り値size_bytesと一致",
+              p_sj7h.stat().st_size == size_sj7h, f"file={p_sj7h.stat().st_size} ret={size_sj7h}")
+        # 上限に余裕があるケースはフォールバックが発火しない(60分粒度が残る)ことも確認
+        snap_sj7h2, _ = write_calendar_cells_snapshot(
+            symbols=["BTC"], freqs=[30, 60], months=[None], path=p_sj7h,
+            load_fn=lambda label: df_sj7, size_limit_bytes=CALENDAR_CELLS_SIZE_LIMIT_BYTES)
+        check("SJ-7h4 上限内(既定55MB)なら60分粒度は落ちない",
+              set(snap_sj7h2["symbols"]["BTC"].keys()) == {"30", "60"},
+              f"keys={list(snap_sj7h2['symbols']['BTC'].keys())}")
 
     print("\n" + "=" * 78)
     if all_ok:

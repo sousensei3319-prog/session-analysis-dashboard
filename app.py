@@ -3391,15 +3391,43 @@ def format_data_source_caption(
 
 def render_cross_five_min_breakdown(
     band: str, choice: str, weekday_arg: Optional[str], selected_labels: list[str],
-    period: tuple[date, date],
+    period: tuple[date, date], key_prefix: str = "",
 ) -> None:
-    """クロス表タブ「⏱ 5分毎の内訳」トグルON時の描画本体(追補v7§2)。data_1mを持つ
+    """クロス表タブ「⏱ 5分毎の内訳」トグルON時の描画本体(追補v7§2・v8§4)。data_1mを持つ
     BTC/ETH/SOL以外(GOLD等)は対象外メッセージを出す。「全選択銘柄の平均」時はselected_labelsの
     うちBTC/ETH/SOLだけを平均する(対象銘柄を注記)。
     period: サイドバーの期間選択(date_start, date_end)。親表・詳細帯表と同じ期間に絞り込む
     (2026-07-18バグ修正: 従来はdata_1m全履歴を無条件で使い親表と食い違っていた)。
+    key_prefix: compare_mode時に複数パネル(col_title)×複数帯(band)を同時描画するため、
+    st.selectbox/slider等のkeyを一意化する接尾辞(呼び出し側=render_cross_table_tabが
+    f"{col_title}_{band}"を渡す)。
     """
     date_start_, date_end_ = period
+    method = st.selectbox(
+        "判定方式", SCAN_JUDGE_METHOD_UI_ORDER, index=0,
+        format_func=lambda m: SCAN_JUDGE_METHOD_UI_LABELS[m], key=f"cross_5m_method_{key_prefix}",
+    )
+    specs = SCAN_JUDGE_PARAM_SLIDER_SPECS[method]
+    param_cols = st.columns(len(specs))
+    ui_params = {
+        pkey: param_cols[i].slider(label, mn, mx, dflt, step, key=f"cross_5m_param_{pkey}_{key_prefix}")
+        for i, (pkey, label, mn, mx, dflt, step) in enumerate(specs)
+    }
+    judge_k, judge_params = scan_judge_ui_params_to_compute_args(method, ui_params)
+    f1, f2, f3, f4 = st.columns(4)
+    direction_only = f1.toggle(
+        "方向ありのマスだけ強調", value=False, key=f"cross_5m_direction_only_{key_prefix}",
+        help="ONでレンジ(→)判定の行を淡色化します。")
+    min_range_pct_5m = f2.slider(
+        "平均値幅N%未満のマスを除外", 0.0, 1.0, 0.0, 0.05, key=f"cross_5m_min_range_{key_prefix}",
+        help="0=無効。指定値未満の行を淡色化します。")
+    min_n_5m = int(f3.number_input(
+        "n<Mのマスを淡色(0=無効)", min_value=0, value=0, step=5, key=f"cross_5m_min_n_{key_prefix}"))
+    # 仕様v8.1§4: 「→とみなす幅」デッドゾーン(🗓️カレンダービューと同じ規約・既定3%)。
+    delta_pct_5m = f4.slider(
+        "→とみなす幅(デッドゾーン)", 0, 15, 3, 1, key=f"cross_5m_delta_pct_{key_prefix}",
+        help="net_bias(P上−P下)の絶対値がこの幅以下なら→(レンジ)とみなします。")
+    delta_5m = delta_pct_5m / 100.0
     if choice == "全選択銘柄の平均":
         crypto_labels = sorted(lbl for lbl in selected_labels if lbl in SCAN_SYMBOLS)
         if not crypto_labels:
@@ -3408,13 +3436,17 @@ def render_cross_five_min_breakdown(
         if all(data_1m_available(lbl) for lbl in crypto_labels):
             with st.spinner("5分毎の内訳を集計中..."):
                 cells, meta = _cross_five_min_cells_multi_cached(
-                    tuple(crypto_labels), band, weekday_arg, date_start_, date_end_)
+                    tuple(crypto_labels), band, weekday_arg, date_start_, date_end_,
+                    judge_method=method, judge_k=judge_k, param_T=judge_params.get("T"),
+                    param_E=judge_params.get("E"), param_p=judge_params.get("p"))
         else:
             # #6指摘対処: 銘柄ごとにdata_1m有無が異なる(backfill部分欠損)場合、有る銘柄だけで
             # ないでなく、無い銘柄だけ個別にオンデマンド取得して補う(平均の黙った縮退を防ぐ)。
             with st.spinner(ONDEMAND_SPINNER_MSG):
                 cells, meta = _cross_five_min_cells_mixed_multi_cached(
-                    tuple(crypto_labels), band, weekday_arg, date_start_, date_end_)
+                    tuple(crypto_labels), band, weekday_arg, date_start_, date_end_,
+                    judge_method=method, judge_k=judge_k, param_T=judge_params.get("T"),
+                    param_E=judge_params.get("E"), param_p=judge_params.get("p"))
         excluded = [lbl for lbl in selected_labels if lbl not in SCAN_SYMBOLS]
         ondemand_labels = meta.get("ondemand_labels") or []
         ondemand_note = f"({'/'.join(ondemand_labels)}はオンデマンド取得で補完)" if ondemand_labels else ""
@@ -3423,14 +3455,19 @@ def render_cross_five_min_breakdown(
     elif choice in SCAN_SYMBOLS:
         if data_1m_available(choice):
             with st.spinner("5分毎の内訳を集計中..."):
-                cells, meta = _cross_five_min_cells_cached(choice, band, weekday_arg, date_start_, date_end_)
+                cells, meta = _cross_five_min_cells_cached(
+                    choice, band, weekday_arg, date_start_, date_end_,
+                    judge_method=method, judge_k=judge_k, param_T=judge_params.get("T"),
+                    param_E=judge_params.get("E"), param_p=judge_params.get("p"))
         else:
             if not ondemand_1m_period_ok(date_start_, date_end_):
                 st.info(ONDEMAND_PERIOD_GUIDANCE_MSG)
                 return
             with st.spinner(ONDEMAND_SPINNER_MSG):
                 cells, meta = _cross_five_min_cells_ondemand_cached(
-                    choice, band, weekday_arg, date_start_, date_end_)
+                    choice, band, weekday_arg, date_start_, date_end_,
+                    judge_method=method, judge_k=judge_k, param_T=judge_params.get("T"),
+                    param_E=judge_params.get("E"), param_p=judge_params.get("p"))
         note = f"対象銘柄: {choice}"
     else:
         st.caption(f"1分足データ対象外(暗号3銘柄=BTC/ETH/SOLのみ対応。{choice}は非対応)。")
@@ -3450,11 +3487,19 @@ def render_cross_five_min_breakdown(
         f"集計期間: {period_str}{wd_note} | {note} | 粒度=5分・{band} | "
         f"n={meta.get('n_occurrences_used', 0)}(枠合計){source_note}"
     )
+    # 仕様v8§4: 判定基準の脚注を選択方式に応じ動的表示(🗓️カレンダービューと同じ規約)。
+    footnote_params_5m = ({"k": judge_k} if method == "median" else judge_params)
     st.caption(
-        "判定=枠の騰落率がその枠の過去中央値変動を上回るか(データ由来の適応閾値・k=1.0)。"
-        "平均値幅%=平均(high-low)/open。"
+        f"{scan_judge_method_footnote(method, footnote_params_5m)} 平均値幅%=平均(high-low)/open。"
+        f"判定=矢印(↑上寄り/↓下寄り/→レンジ。net_bias=P上−P下の寄りをデッドゾーン"
+        f"±{delta_pct_5m}%で判定)・方向率%=P上+P下(=1−Pレンジ・動きやすさ)。"
     )
-    st.dataframe(style_five_min_band_table(cells), width="stretch", hide_index=True)
+    st.dataframe(
+        style_five_min_band_table(
+            cells, direction_only=direction_only, min_range_pct=min_range_pct_5m, min_n=min_n_5m,
+            delta=delta_5m),
+        width="stretch", hide_index=True,
+    )
 
 
 def render_cross_table_tab(
@@ -3565,7 +3610,9 @@ def render_cross_table_tab(
                         key=f"cross_5m_toggle_{col_title}_{band}",
                     )
                     if show5:
-                        render_cross_five_min_breakdown(band, choice, weekday_arg, selected_labels, period)
+                        render_cross_five_min_breakdown(
+                            band, choice, weekday_arg, selected_labels, period,
+                            key_prefix=f"{col_title}_{band}")
         csv_bytes = cross.to_csv(index=True).encode("utf-8-sig")
         st.download_button(
             "CSVダウンロード", data=csv_bytes, file_name=f"cross_table_{col_title}.csv",
@@ -4987,6 +5034,124 @@ SCAN_REFERENCE_ONLY_MIN_N = 30  # これ未満のnは表示上「参考値」バ
 SCAN_WILSON_Z = 1.959963984540054  # 95%信頼区間のz値(標準正規分布97.5%点)
 SCAN_SYMBOLS: list[str] = ["BTC", "ETH", "SOL"]  # 確率スキャナー対象(data_1m/保有銘柄。仕様§1)
 
+# ---- 追補v8§1: 判定方式(トレンド/レンジ)の既定パラメータ -----------------------------
+# A=値幅固定閾値(T) / B=トレンド効率(E) / C=VWAP基準(p) / B+C=推奨既定 / A+B+C=厳しめ
+# / median=従来のセル内|g|中央値適応閾値(参考・既定にしない)。
+#
+# 指摘対処(2026-07-18・v8実データ実証で検出): 初版既定(E=0.50,p=0.60)はBTC/ETH/SOL全履歴
+# 30分足(336セル)で厳しすぎ、B+Cのオカレンス単位方向判定率が0.2%程度まで縮退し336/336
+# セルが「レンジ」でmedian方式と実質同一の挙動になっていた(仕様§7(c)受入条件未達)。
+# E=0.25/p=0.55へ緩和しオカレンス単位の方向判定率を実データで検証済み改善(掟7=Python実測、
+# scratchpad calib_grid*.py)。ただし全336セル規模(5年・n≈260/セル)ではA/B/C/B+C/A+B+Cいずれも
+# グローバル固定閾値方式である以上、スライダー全域(E0.1〜0.9・p0.5〜0.9)を尽くしても
+# セル単位dominant_directionが「レンジ」以外になる組み合わせは実データ上存在しないことを
+# 網羅実測で確認済み(medianのみセル毎適応閾値のため必然的に方向が出る設計)。これは判定
+# ロジックのバグではなく、対象銘柄の30分足に強い時間帯季節性が無いという実データの性質。
+# オカレンス単位(セル未集計時点)では新既定で改善済み(旧0.2%→新15〜20%程度)。5分粒度
+# (クロス表内訳)は逆に効率値が高く出やすくE/pが相対的に緩くなるため、既定は両粒度で
+# 「レンジ0%」にも「レンジ0%(方向のみ)」にも極端化しない値として選定。カレンダー粒度で
+# セル単位の方向差を安定して出すには判定合成ロジック自体(AND→OR等)の見直しが必要で
+# あり、これはDECISIONS.mdでPM判断を仰ぐ設計論点として別途エスカレーション済み。
+SCAN_JUDGE_METHODS: tuple[str, ...] = ("median", "A", "B", "C", "B+C", "A+B+C")
+SCAN_JUDGE_METHOD_DEFAULT = "B+C"  # UI既定(仕様§4)。_compute_scan_cells_from_occurrencesの
+# 関数既定は後方互換のため"median"のまま(既存selftest・呼び出し元を変えない)。
+SCAN_JUDGE_METHOD_DEFAULTS: dict[str, dict[str, float]] = {
+    "median": {},
+    "A": {"T": 0.30},
+    "B": {"E": 0.25},
+    "C": {"p": 0.55},
+    "B+C": {"E": 0.25, "p": 0.55},
+    "A+B+C": {"T": 0.30, "E": 0.25, "p": 0.55},
+}
+# UI表示順(推奨既定を先頭。仕様v8§4)とラベル文言。
+SCAN_JUDGE_METHOD_UI_ORDER: tuple[str, ...] = ("B+C", "A+B+C", "A", "B", "C", "median")
+SCAN_JUDGE_METHOD_UI_LABELS: dict[str, str] = {
+    "B+C": "B＋C(推奨・既定)", "A+B+C": "A＋B＋C(厳しめ)",
+    "A": "A: 値幅(固定閾値)", "B": "B: トレンド効率", "C": "C: VWAP基準",
+    "median": "参考: 中央値(従来・方向判定には不向き)",
+}
+
+# UI用パラメータスライダー仕様(仕様v8§4): 方式ごとに表示するスライダーを
+# (paramキー, ラベル, min, max, 既定値, step) のリストで定義(純データ・DRY)。
+# "median"のkはjudge_paramsでなくcompute_scan_cells系のk引数へ渡す特別扱い(§1脚注と同じ規約)。
+SCAN_JUDGE_PARAM_SLIDER_SPECS: dict[str, list[tuple[str, str, float, float, float, float]]] = {
+    "A": [("T", "値幅閾値 T(%)", 0.05, 1.0, 0.30, 0.05)],
+    "B": [("E", "トレンド効率 E", 0.1, 0.9, 0.25, 0.05)],
+    "C": [("p", "VWAP片側維持 p", 0.5, 0.9, 0.55, 0.05)],
+    "B+C": [("E", "トレンド効率 E", 0.1, 0.9, 0.25, 0.05), ("p", "VWAP片側維持 p", 0.5, 0.9, 0.55, 0.05)],
+    "A+B+C": [("T", "値幅閾値 T(%)", 0.05, 1.0, 0.30, 0.05), ("E", "トレンド効率 E", 0.1, 0.9, 0.25, 0.05),
+              ("p", "VWAP片側維持 p", 0.5, 0.9, 0.55, 0.05)],
+    "median": [("k", "中央値倍率 k", 0.5, 3.0, 1.0, 0.1)],
+}
+
+# カレンダースナップショット(仕様v8§5)のスリム列: 識別列(weekday/slot)+必須7項目のみ
+# (dominant_direction/p_up/p_down/p_range/avg_g/avg_range_pct/n。テールCI等は含めない)。
+SLIM_CALENDAR_COLS: list[str] = [
+    "weekday", "slot", "n", "avg_g", "avg_range_pct",
+    "dominant_direction", "p_up", "p_down", "p_range",
+]
+
+
+def scan_judge_ui_params_to_compute_args(method: str, ui_params: dict[str, float]) -> tuple[float, dict[str, float]]:
+    """UIスライダー値(SCAN_JUDGE_PARAM_SLIDER_SPECS準拠のdict)を、compute_scan_cells系が
+    受け取る(k, judge_params)へ変換する純関数(仕様v8§4)。"median"のkだけ特別扱い(§1脚注と
+    同じ規約: kはjudge_paramsでなくthreshold_mode用のk引数)。それ以外の方式はui_paramsが
+    そのままjudge_params(T/E/pのキーが一致)。
+    """
+    if method == "median":
+        return float(ui_params.get("k", 1.0)), {}
+    return 1.0, dict(ui_params)
+
+
+def scan_judge_method_footnote(method: str, params: dict[str, Any]) -> str:
+    """選択中の判定方式に応じた判定基準の脚注文(仕様v8§4・動的表示)。paramsは解決済み値
+    (median方式のみ特別扱いでkey"k"=中央値倍率を渡す。他方式はSCAN_JUDGE_METHOD_DEFAULTS
+    とのマージ済みdictを渡す想定)。純ロジック(st非依存・selftest対象)。"""
+    if method == "median":
+        k = params.get("k", 1.0)
+        return (
+            f"参考:中央値(k={k:.2g}): 枠の騰落率がその枠の過去|g|中央値×kを上回るか。"
+            "中央値は定義上ほぼ半数が下回るため方向判定には不向き(既定にしない・目安のみ)。"
+        )
+    if method == "A":
+        return f"A: 値幅固定閾値。騰落率が±{params['T']:.2g}%を超えたら方向、それ以外レンジ。"
+    if method == "B":
+        return f"B: トレンド効率が{params['E']:.2g}以上(0〜1)かつ騰落方向に沿うとき方向、それ以外レンジ。"
+    if method == "C":
+        return f"C: VWAPより片側維持{params['p']:.0%}以上のとき方向、それ以外レンジ。"
+    if method == "B+C":
+        return (
+            f"B＋C: トレンド効率≥{params['E']:.2g} かつ VWAP片側維持≥{params['p']:.0%} が"
+            "一致したときだけ方向、一致しなければレンジ。"
+        )
+    if method == "A+B+C":
+        return (
+            f"A＋B＋C: 値幅閾値T={params['T']:.2g}% ・効率E={params['E']:.2g} ・"
+            f"VWAP p={params['p']:.0%} の3方式が全て一致したときだけ方向、それ以外レンジ。"
+        )
+    raise ValueError(f"未知の判定方式です: {method!r}(SCAN_JUDGE_METHODS参照)")
+
+
+def scan_cell_should_dim(
+    dominant_direction: Optional[str], avg_range_pct: Optional[float], n: Optional[float],
+    direction_only: bool = False, min_range_pct: float = 0.0, min_n: int = 0,
+) -> bool:
+    """補助フィルタ(仕様v8§2)の判定: 指定セルを淡色化(dim)すべきか(いずれか該当でOR)。
+    - direction_only=True: dominant_direction=="レンジ"のセルをdim。
+    - min_range_pct>0: avg_range_pct<min_range_pctのセルをdim(NaN/Noneは判定不能なのでdimしない)。
+    - min_n>0: n<min_nのセルをdim(NaN/Noneはdimしない)。
+    全既定(OFF)なら常にFalse(何もdimしない=既存表示のまま)。純ロジック(st非依存・selftest対象)。
+    """
+    if direction_only and dominant_direction == "レンジ":
+        return True
+    if min_range_pct > 0 and avg_range_pct is not None and not (
+            isinstance(avg_range_pct, float) and math.isnan(avg_range_pct)) and avg_range_pct < min_range_pct:
+        return True
+    if min_n > 0 and n is not None and not (
+            isinstance(n, float) and math.isnan(n)) and n < min_n:
+        return True
+    return False
+
 # ---- 追補v7.2§1.1: data_1m不在環境(クラウド)向けオンデマンド1分足取得 -----------------
 # (ONDEMAND_1M_MAX_DAYS/ONDEMAND_1M_CACHE_TTL_SECはL154付近=キャッシュTTL定数群に定義済み。
 # fetch_ondemand_1m_ohlcvのデコレータがモジュール読込時にこの値を要求するための配置)。
@@ -5091,11 +5256,21 @@ def build_scan_occurrences(df: pd.DataFrame, freq_minutes: int = 30) -> tuple[pd
     - mfe_up = (high_max-open_first)/open_first*100、mfe_down = (open_first-low_min)/open_first*100
     - グループ内バー数 < scan_min_bars_for_valid_group(freq_minutes)(粒度比例・既定30分枠=15本/
       5分枠=3本/60分枠=30本)は欠測扱いで除外し、meta["n_missing"]/meta["n_total_groups"]に記録する(仕様§2)。
+
+    追補v8§3で追加した判定方式用の特徴量列(方式非依存・ここで1度だけ計算しキャッシュする):
+    - path_pct: 窓内1分足の|Δclose|合計/open_first*100(実際に歩いた総距離%)。
+      窓先頭バーだけは前バー(別窓/別日)のcloseでなくopen_first(=自身のopen)からの
+      差を入口移動として算入する。
+    - efficiency: |g|/path_pct(0〜1、path_pct<1e-9はガードで0)。
+    - vwap: Σ((high+low+close)/3×volume)/Σvolume(出来高合計0はopen_firstで代替)。
+    - frac_above: 窓内バーでclose>vwap(そのグループのvwap)だった割合(0〜1)。
+    - close_above: close_last>vwap。
     """
     if freq_minutes not in SCAN_SLOTS_PER_DAY:
         raise ValueError(f"未対応の粒度です: {freq_minutes}分(30・5・60のみ)")
     empty_cols = ["date", "weekday", "month", "slot", "g", "mfe_up", "mfe_down", "vola_pct",
-                  "volume", "n_bars", "range_pct"]
+                  "volume", "n_bars", "range_pct",
+                  "efficiency", "path_pct", "vwap", "frac_above", "close_above"]
     if df.empty:
         return pd.DataFrame(columns=empty_cols), {"n_missing": 0, "n_total_groups": 0}
 
@@ -5106,6 +5281,15 @@ def build_scan_occurrences(df: pd.DataFrame, freq_minutes: int = 30) -> tuple[pd
     work["_date"] = work.index.date
 
     grouped = work.groupby(["_date", "_slot"], sort=True)
+
+    # v8§3: 行レベル特徴量の前計算(1パス・ベクトル化)。窓先頭バーの入口移動は
+    # open_firstからの差(=自身のopen-close差)。前バーのcloseは別窓/別日のため使わない。
+    is_first_in_group = grouped.cumcount() == 0
+    close_diff_abs = (work["close"] - work["close"].shift(1)).abs()
+    own_bar_move_abs = (work["close"] - work["open"]).abs()
+    work["_bar_move_abs"] = np.where(is_first_in_group, own_bar_move_abs, close_diff_abs)
+    work["_typical_vol"] = (work["high"] + work["low"] + work["close"]) / 3.0 * work["volume"]
+
     n_bars = grouped.size()
     open_first = grouped["open"].first()
     close_last = grouped["close"].last()
@@ -5113,10 +5297,22 @@ def build_scan_occurrences(df: pd.DataFrame, freq_minutes: int = 30) -> tuple[pd
     low_min = grouped["low"].min()
     vol_sum = grouped["volume"].sum()
     vola = grouped["_log_ret"].std(ddof=0) * 100.0
+    path_sum = grouped["_bar_move_abs"].sum()
+    typical_vol_sum = grouped["_typical_vol"].sum()
+    vwap_all = (typical_vol_sum / vol_sum.where(vol_sum > 0)).fillna(open_first)
+
+    # frac_above用のvwap merge back(仕様§3。グループのvwapを各バーへbroadcastしclose>vwapを判定)
+    typical_vol_group_sum = grouped["_typical_vol"].transform("sum")
+    vol_group_sum = grouped["volume"].transform("sum")
+    open_first_broadcast = grouped["open"].transform("first")
+    vwap_broadcast = np.where(vol_group_sum > 0, typical_vol_group_sum / vol_group_sum, open_first_broadcast)
+    work["_above_vwap"] = work["close"].to_numpy() > vwap_broadcast
+    frac_above_all = work.groupby(["_date", "_slot"], sort=True)["_above_vwap"].mean()
 
     occ = pd.DataFrame({
         "n_bars": n_bars, "open_first": open_first, "close_last": close_last,
         "high_max": high_max, "low_min": low_min, "volume": vol_sum, "vola_pct": vola,
+        "_path_sum": path_sum, "vwap": vwap_all, "frac_above": frac_above_all,
     }).reset_index().rename(columns={"_date": "date", "_slot": "slot"})
 
     n_total_groups = int(len(occ))
@@ -5131,8 +5327,23 @@ def build_scan_occurrences(df: pd.DataFrame, freq_minutes: int = 30) -> tuple[pd
     valid["weekday"] = [WEEKDAY_LABELS[pd.Timestamp(d).weekday()] for d in valid["date"]]
     valid["month"] = [pd.Timestamp(d).month for d in valid["date"]]
 
+    # v8§3: path_pct/efficiency/close_above(vwap/frac_aboveはoccに既に計算済み)
+    valid["path_pct"] = valid["_path_sum"] / valid["open_first"] * 100.0
+    # 指摘対処(2026-07-18): np.whereは両分岐を配列全体で先に評価するため、path_pct==0の
+    # 行では|g|/path_pctが文字通り0/0となりRuntimeWarning("invalid value encountered in
+    # divide")が出ていた(結果は0.0へ正しくマスクされ値自体に誤りはないが運用ログにノイズ
+    # 混入)。np.divideのwhere引数でガード対象行の実際の除算自体を回避し、結果は不変のまま
+    # 警告を出さないようにする。
+    path_pct_arr = valid["path_pct"].to_numpy()
+    g_abs_arr = valid["g"].abs().to_numpy()
+    valid_path_mask = path_pct_arr >= 1e-9
+    valid["efficiency"] = np.divide(
+        g_abs_arr, path_pct_arr, out=np.zeros_like(g_abs_arr, dtype=float), where=valid_path_mask)
+    valid["close_above"] = valid["close_last"] > valid["vwap"]
+
     out = valid[["date", "weekday", "month", "slot", "g", "mfe_up", "mfe_down", "vola_pct",
-                 "volume", "n_bars", "range_pct"]].reset_index(drop=True)
+                 "volume", "n_bars", "range_pct",
+                 "efficiency", "path_pct", "vwap", "frac_above", "close_above"]].reset_index(drop=True)
     meta = {"n_missing": int(n_missing), "n_total_groups": n_total_groups}
     return out, meta
 
@@ -5249,6 +5460,156 @@ def scan_cell_threshold(g_values: np.ndarray, mode: str = "adaptive", k: float =
     return float(np.median(np.abs(g_values)) * k)
 
 
+def _classify_direction_masks(features: dict[str, Any], method: str, params: dict[str, Any]):
+    """classify_occurrence(_vectorized)の内部ヘルパー。仕様v8§1の各方式について
+    (up_mask, down_mask)を返す(scalar/ndarray両対応。np.asarrayで正規化してから演算するため
+    Python組込boolの`~`バグ(~True==-2)を踏まない)。up/downは方式の定義上排他。
+    """
+    if method == "A":
+        g = np.asarray(features["g"], dtype=float)
+        t = params["T"]
+        return (g > t), (g < -t)
+    if method == "B":
+        g = np.asarray(features["g"], dtype=float)
+        eff = np.asarray(features["efficiency"], dtype=float)
+        cond = eff >= params["E"]
+        return (cond & (g > 0)), (cond & (g < 0))
+    if method == "C":
+        frac = np.asarray(features["frac_above"], dtype=float)
+        above = np.asarray(features["close_above"], dtype=bool)
+        p = params["p"]
+        return (above & (frac >= p)), ((~above) & (frac <= (1.0 - p)))
+    if method == "B+C":
+        up_b, down_b = _classify_direction_masks(features, "B", {"E": params["E"]})
+        up_c, down_c = _classify_direction_masks(features, "C", {"p": params["p"]})
+        return (up_b & up_c), (down_b & down_c)
+    if method == "A+B+C":
+        up_a, down_a = _classify_direction_masks(features, "A", {"T": params["T"]})
+        up_b, down_b = _classify_direction_masks(features, "B", {"E": params["E"]})
+        up_c, down_c = _classify_direction_masks(features, "C", {"p": params["p"]})
+        return (up_a & up_b & up_c), (down_a & down_b & down_c)
+    if method == "median":
+        g = np.asarray(features["g"], dtype=float)
+        thr = params["threshold"]
+        return (g > thr), (g < -thr)
+    raise ValueError(f"未知の判定方式です: {method!r}(SCAN_JUDGE_METHODS参照)")
+
+
+def classify_occurrence(features: dict[str, Any], method: str, params: dict[str, Any]) -> str:
+    """1オカレンス(1つの窓)を「上昇」「下降」「レンジ」に分類する純関数(仕様v8§1)。
+
+    features: g(全方式必須)・efficiency(B系)・frac_above/close_above(C系)・
+        threshold(medianのみ・呼び出し側でscan_cell_thresholdを計算し渡す)。
+    method: "A"|"B"|"C"|"B+C"|"A+B+C"|"median"(SCAN_JUDGE_METHODS)。
+    params: 方式ごとのパラメータ(A→T、B→E、C→p、B+C→E,p、A+B+C→T,E,p、median→threshold)。
+    """
+    up, down = _classify_direction_masks(features, method, params)
+    if bool(up):
+        return "上昇"
+    if bool(down):
+        return "下降"
+    return "レンジ"
+
+
+def classify_occurrence_vectorized(features: dict[str, Any], method: str, params: dict[str, Any]) -> np.ndarray:
+    """classify_occurrenceのベクトル化版。features値はnp.ndarray(同長)。
+    戻り値はdtype=objectのndarray(各要素"上昇"/"下降"/"レンジ")。
+    """
+    up, down = _classify_direction_masks(features, method, params)
+    up = np.asarray(up, dtype=bool)
+    down = np.asarray(down, dtype=bool)
+    out = np.full(up.shape, "レンジ", dtype=object)
+    out[down] = "下降"
+    out[up] = "上昇"  # 排他が前提だが念のため上昇>下降の優先順で上書き
+    return out
+
+
+# ---- 仕様追補v8.1§1: net_bias/trend_rate/bias_direction(Q-025決着=矢印を「上下の寄り」へ) --------
+# 既存p_up/p_down/p_range(判定方式を問わず既に選択方式で計算済み)からの再ラベルのみで、
+# 新規集計は一切行わない(罠③=方式非依存)。
+SCAN_BIAS_DELTA_DEFAULT = 0.03  # 「→とみなす幅」既定3ポイント(仕様v8.1§4スライダー既定)
+
+
+def scan_net_bias(p_up: float, p_down: float) -> float:
+    """net_bias = P(上昇) − P(下降)(−1〜+1。プラスが大きいほど上寄り・仕様v8.1§1)。"""
+    return p_up - p_down
+
+
+def scan_trend_rate(p_up: float, p_down: float) -> float:
+    """trend_rate = P(上昇) + P(下降) = 1 − P(レンジ)(0〜1・「方向率」=動きやすさ。仕様v8.1§1)。"""
+    return p_up + p_down
+
+
+def scan_bias_direction(net_bias: float, delta: float = SCAN_BIAS_DELTA_DEFAULT) -> str:
+    """net_biasから「寄り」(↑/↓/→相当の上昇/下降/レンジ)を判定する純関数(仕様v8.1§1)。
+    net_bias > delta → 上昇 / net_bias < -delta → 下降 / それ以外(境界ちょうど含む)→レンジ
+    (デッドゾーンの境界はレンジ側に倒す)。NaNは安全側でレンジを返す。
+    """
+    if net_bias is None or (isinstance(net_bias, float) and math.isnan(net_bias)):
+        return "レンジ"
+    if net_bias > delta:
+        return "上昇"
+    if net_bias < -delta:
+        return "下降"
+    return "レンジ"
+
+
+def scan_bias_opacity(trend_rate: float) -> float:
+    """trend_rate(方向率)から表示色の濃さ(opacity)を計算する純関数(仕様v8.1§2)。
+    opacity = 0.12 + 0.68 * min(1, trend_rate/0.5)(方向率50%以上で最も濃い0.80、0%で最も薄い0.12)。
+    NaNは最も薄い基準値を返す。
+    """
+    if trend_rate is None or (isinstance(trend_rate, float) and math.isnan(trend_rate)):
+        return 0.12
+    return 0.12 + 0.68 * min(1.0, trend_rate / 0.5)
+
+
+# カレンダーHeatmap用: 色相(bias_direction)×濃さ(trend_rate)をgo.Heatmapの単一zで表現する
+# ための実装(1セル毎の独立アルファをHeatmapは持てないため、背景合成済みrgbを離散
+# カラースケールの3バンド(下降/レンジ/上昇)へ焼き込む。仕様v8.1§2)。
+SCAN_BIAS_HUE_RGB: dict[str, tuple[int, int, int]] = {
+    "下降": (224, 64, 64), "レンジ": (140, 140, 140), "上昇": (56, 168, 96),
+}  # 既存_scan_prob_color/_scan_stable_colorと同じ配色
+SCAN_BIAS_CALENDAR_BG_RGB: tuple[int, int, int] = (17, 17, 17)  # plotly_darkの背景相当
+
+
+def scan_bias_blend_rgb(direction: str, trend_rate: float) -> str:
+    """bias_direction(色相)とtrend_rate(濃さ=scan_bias_opacity)を背景合成した不透明rgb文字列
+    にする(仕様v8.1§2)。"""
+    base = SCAN_BIAS_HUE_RGB[direction]
+    bg = SCAN_BIAS_CALENDAR_BG_RGB
+    a = scan_bias_opacity(trend_rate)
+    return "rgb(" + ",".join(f"{bg[i] * (1 - a) + base[i] * a:.0f}" for i in range(3)) + ")"
+
+
+def scan_bias_calendar_z(direction: Optional[str], trend_rate: float) -> float:
+    """カレンダーHeatmapのz値: 下降=[0,1/3)・レンジ=[1/3,2/3)・上昇=[2/3,1]の3バンドへ配置し、
+    バンド内の位置をtrend_rateの濃さ(scan_bias_opacityと同じ正規化)で表す
+    (SCAN_BIAS_CALENDAR_COLORSCALEと対。仕様v8.1§2)。NaN/未知directionはNaN(欠損セル=空欄)。
+    """
+    if direction not in SCAN_BIAS_HUE_RGB or trend_rate is None or (
+            isinstance(trend_rate, float) and math.isnan(trend_rate)):
+        return float("nan")
+    band = {"下降": 0, "レンジ": 1, "上昇": 2}[direction]
+    frac = min(1.0, trend_rate / 0.5)
+    return (band + frac) / 3.0
+
+
+def _scan_bias_colorscale() -> list[list[Any]]:
+    """3バンドそれぞれtrend_rate=0(最も薄い)→0.5以上(最も濃い)の線形グラデーションにし、
+    バンド境界は微小epsilonで色相を跨がないハードエッジにする(仕様v8.1§2)。"""
+    eps = 1e-4
+    stops: list[list[Any]] = []
+    for band, direction in enumerate(("下降", "レンジ", "上昇")):
+        lo, hi = band / 3.0, (band + 1) / 3.0
+        stops.append([lo + (eps if band > 0 else 0.0), scan_bias_blend_rgb(direction, 0.0)])
+        stops.append([hi - (eps if band < 2 else 0.0), scan_bias_blend_rgb(direction, 0.5)])
+    return stops
+
+
+SCAN_BIAS_CALENDAR_COLORSCALE: list[list[Any]] = _scan_bias_colorscale()
+
+
 def _compute_scan_cells_from_occurrences(
     occ: pd.DataFrame,
     freq_minutes: int,
@@ -5257,6 +5618,8 @@ def _compute_scan_cells_from_occurrences(
     fixed_threshold_pct: float,
     tail_thresholds: tuple[float, ...],
     fee_pct: float,
+    judge_method: str = "median",
+    judge_params: Optional[dict[str, Any]] = None,
 ) -> pd.DataFrame:
     """occ(build_scan_occurrencesの出力・月フィルタ適用済み)からセル(曜日×枠)統計を作る。
 
@@ -5266,7 +5629,16 @@ def _compute_scan_cells_from_occurrences(
     dominant_direction(上昇/下降/レンジ)は各確率の最大値。同値タイは 上昇>下降>レンジ の
     優先順で決定的に解決する(判定不能な絶対同点も再現可能な値を返すため)。
     列定義はSPEC_addendum_v6 §3参照。
+
+    judge_method/judge_params(仕様v8§1): セル毎のn_up/n_down/n_rangeの数え直しに使う
+    判定方式。既定"median"は従来どおりthreshold_mode/k/fixed_threshold_pct(scan_cell_threshold)
+    をそのまま使い、g>thr/g<-thrで判定する(=後方互換。既存呼び出し元・selftestは無改修で
+    従来どおり動く)。"A"/"B"/"C"/"B+C"/"A+B+C"を指定すると、seg毎にclassify_occurrence_vectorized
+    で数え直す(judge_paramsがNoneならSCAN_JUDGE_METHOD_DEFAULTSの既定値を使う)。
+    threshold_pct列自体は方式によらずscan_cell_threshold(informational)を返す
+    (dominant_direction等のdownstream計算は不変)。
     """
+    judge_params_resolved = {**SCAN_JUDGE_METHOD_DEFAULTS.get(judge_method, {}), **(judge_params or {})}
     tail_cols: list[str] = []
     for th in tail_thresholds:
         tail_cols += [f"p_mfe_up_{th}", f"p_mfe_up_{th}_ci_low", f"p_mfe_up_{th}_ci_high",
@@ -5277,6 +5649,7 @@ def _compute_scan_cells_from_occurrences(
         "p_up", "p_up_ci_low", "p_up_ci_high",
         "p_down", "p_down_ci_low", "p_down_ci_high",
         "p_range", "p_range_ci_low", "p_range_ci_high",
+        "net_bias", "trend_rate",
         "p_value_binom", "fdr_q",
         "p_up_first_half", "p_up_second_half", "direction_stable",
         "dominant_direction", "fee_adj_expected_pct",
@@ -5292,8 +5665,19 @@ def _compute_scan_cells_from_occurrences(
         n = int(len(sub))
         g = sub["g"].to_numpy(dtype=float)
         thr = scan_cell_threshold(g, threshold_mode, k, fixed_threshold_pct)
-        up_flag = g > thr
-        down_flag = g < -thr
+        if judge_method == "median":
+            up_flag = g > thr
+            down_flag = g < -thr
+        else:
+            features = {
+                "g": g,
+                "efficiency": sub["efficiency"].to_numpy(dtype=float),
+                "frac_above": sub["frac_above"].to_numpy(dtype=float),
+                "close_above": sub["close_above"].to_numpy(dtype=bool),
+            }
+            labels = classify_occurrence_vectorized(features, judge_method, judge_params_resolved)
+            up_flag = labels == "上昇"
+            down_flag = labels == "下降"
         n_up = int(up_flag.sum())
         n_down = int(down_flag.sum())
         total_n += n
@@ -5359,6 +5743,7 @@ def _compute_scan_cells_from_occurrences(
             "p_up": p_up, "p_up_ci_low": ci_up[0], "p_up_ci_high": ci_up[1],
             "p_down": p_down, "p_down_ci_low": ci_down[0], "p_down_ci_high": ci_down[1],
             "p_range": p_range, "p_range_ci_low": ci_range[0], "p_range_ci_high": ci_range[1],
+            "net_bias": scan_net_bias(p_up, p_down), "trend_rate": scan_trend_rate(p_up, p_down),
             "p_value_binom": p_value,
             "p_up_first_half": p_up_first, "p_up_second_half": p_up_second,
             "direction_stable": direction_stable,
@@ -5396,9 +5781,15 @@ def compute_scan_cells(
     tail_thresholds: tuple[float, ...] = SCAN_DEFAULT_TAIL_THRESHOLDS,
     fee_pct: float = SCAN_DEFAULT_FEE_PCT,
     precomputed_occ: Optional[tuple[pd.DataFrame, dict[str, Any]]] = None,
+    judge_method: str = "median",
+    judge_params: Optional[dict[str, Any]] = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """確率スキャナーの統計エンジン本体(仕様§3)。1分足df_1mから階層グループ化→
     セル(曜日×時間枠)統計を計算し、(cells_df, meta)を返す。
+
+    - judge_method/judge_params(追補v8§1): トレンド/レンジ判定方式("median"|"A"|"B"|"C"|
+      "B+C"|"A+B+C"。SCAN_JUDGE_METHODS)。既定"median"は従来どおり(後方互換・既存呼び出し元
+      無改修)。_compute_scan_cells_from_occurrencesへそのまま委譲する。
 
     - month=None: 全月合算(既定ビュー)。month=1-12: その月だけに絞る(n激減はUI側で警告)。
     - freq_minutes=30(既定・ランキング/ヒートマップ表示用)または5(セル詳細内訳用)。
@@ -5419,13 +5810,16 @@ def compute_scan_cells(
     period_end = df_1m.index.max() if not df_1m.empty else None
     occ_used = occ[occ["month"] == month].reset_index(drop=True) if month is not None else occ
     cells = _compute_scan_cells_from_occurrences(
-        occ_used, freq_minutes, threshold_mode, k, fixed_threshold_pct, tail_thresholds, fee_pct)
+        occ_used, freq_minutes, threshold_mode, k, fixed_threshold_pct, tail_thresholds, fee_pct,
+        judge_method=judge_method, judge_params=judge_params)
     meta: dict[str, Any] = {
         "label": label, "freq_minutes": freq_minutes, "month": month,
         "threshold_mode": threshold_mode, "k": k, "fixed_threshold_pct": fixed_threshold_pct,
         "fee_pct": fee_pct, "period_start": period_start, "period_end": period_end,
         "n_missing_groups": occ_meta["n_missing"], "n_total_groups": occ_meta["n_total_groups"],
         "n_occurrences_used": int(len(occ_used)), "updated_at": datetime.now(JST),
+        "judge_method": judge_method,
+        "judge_params": {**SCAN_JUDGE_METHOD_DEFAULTS.get(judge_method, {}), **(judge_params or {})},
     }
     return cells, meta
 
@@ -5438,6 +5832,8 @@ def compute_month_calendar_cells(
     k: float = 1.0,
     fixed_threshold_pct: float = 0.15,
     precomputed_occ: Optional[tuple[pd.DataFrame, dict[str, Any]]] = None,
+    judge_method: str = "median",
+    judge_params: Optional[dict[str, Any]] = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """月カレンダービュー用の集計(追補v7§1)。既存compute_scan_cells(E1エンジン本体)を
     月フィルタ・粒度そのまま流用し、avg_range_pct(平均値幅%=平均(high-low)/open)だけ追加する
@@ -5465,7 +5861,7 @@ def compute_month_calendar_cells(
     cells, meta = compute_scan_cells(
         df_1m, freq_minutes=freq_minutes, month=month,
         threshold_mode=threshold_mode, k=k, fixed_threshold_pct=fixed_threshold_pct,
-        precomputed_occ=(occ, occ_meta))
+        precomputed_occ=(occ, occ_meta), judge_method=judge_method, judge_params=judge_params)
     occ_used = occ[occ["month"] == month] if month is not None else occ
     cells = cells.copy()
     if cells.empty or occ_used.empty:
@@ -5532,6 +5928,23 @@ def scan_cells_from_json_dict(data: dict[str, Any]) -> tuple[pd.DataFrame, dict[
         if col not in non_numeric_cols:
             cells[col] = pd.to_numeric(cells[col], errors="coerce")
     return cells, meta
+
+
+def scan_ensure_bias_columns(cells: pd.DataFrame) -> pd.DataFrame:
+    """net_bias/trend_rate列を読込時に補完する(仕様v8.1§5)。calendar_cells.jsonのスリム
+    スナップショットはp_up/p_down/p_rangeは持つがnet_bias/trend_rate列は持たない(旧形式の
+    ままでも動くように、新規集計ではなくp_up/p_downからの導出をここで行う)。既に列がある
+    (ライブ集計・scan_results.json経由)場合は何もしない。p_up/p_down列自体が無い最旧形式の
+    スナップショットは補完せずそのまま返す(呼び出し側が従来表示にフォールバックする)。
+    """
+    if cells.empty or "net_bias" in cells.columns:
+        return cells
+    if "p_up" not in cells.columns or "p_down" not in cells.columns:
+        return cells
+    cells = cells.copy()
+    cells["net_bias"] = scan_net_bias(cells["p_up"], cells["p_down"])
+    cells["trend_rate"] = scan_trend_rate(cells["p_up"], cells["p_down"])
+    return cells
 
 
 def scan_slot_window_minutes(slot_index: int, freq_minutes: int,
@@ -5635,6 +6048,14 @@ def scan_direction_icon(dominant_direction: str) -> str:
     return SCAN_DIRECTION_ICON[dominant_direction]
 
 
+def scan_dominant_from_probs(p_up: float, p_down: float, p_range: float) -> str:
+    """(p_up, p_down, p_range)から最頻方向を決める(_compute_scan_cells_from_occurrencesと同じ
+    規則: 最大値・同値タイは 上昇>下降>レンジ の優先順)。判定方式(仕様v8§1)を問わず、既に
+    選択方式で計算済みの確率を平均した後の再判定(compute_five_min_band_stats_multi)に使う。"""
+    dom_pairs = [("上昇", p_up), ("下降", p_down), ("レンジ", p_range)]
+    return max(dom_pairs, key=lambda t: t[1])[0]
+
+
 def load_scan_results(path: Path = SCAN_RESULTS_PATH) -> Optional[dict[str, Any]]:
     """scan_results.jsonを読み込む(不在/壊れている場合はNone。呼び出し側で案内表示する)。"""
     try:
@@ -5670,10 +6091,13 @@ def load_calendar_cells_snapshot(path: Path = CALENDAR_CELLS_PATH) -> Optional[d
 
 def calendar_cells_snapshot_lookup(
     snapshot: Optional[dict[str, Any]], label: str, month: Optional[int], freq_minutes: int,
+    method: str = SCAN_JUDGE_METHOD_DEFAULT,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """calendar_cells.json全体dictから指定(銘柄,月,粒度)のcells/metaを取り出す(仕様§1.2)。
-    月キーはNone→"all"、1〜12→str(month)。粒度キーはstr(freq_minutes)。該当なしは空(空DataFrame,{})。
-    値の変換はscan_cells_from_json_dictと同じ(=scan_job.py側もscan_cells_to_json_dictで書く)。
+    """calendar_cells.json全体dictから指定(銘柄,月,粒度,判定方式)のcells/metaを取り出す
+    (仕様v8§5)。月キーはNone→"all"、1〜12→str(month)。粒度キーはstr(freq_minutes)。
+    methodキーはSCAN_JUDGE_METHODSの値そのもの(全方式が既定パラメータで事前計算済み)。
+    該当なしは空(空DataFrame,{})。cellsはスリム列(SLIM_CALENDAR_COLS)のみ
+    (avg_volume等は無い=呼び出し側のbuild_scan_calendar_matrix/figureがグレースフルデグレード)。
     """
     if not snapshot:
         return pd.DataFrame(), {}
@@ -5684,10 +6108,14 @@ def calendar_cells_snapshot_lookup(
     if not freq_bucket:
         return pd.DataFrame(), {}
     month_key = "all" if month is None else str(month)
-    entry = freq_bucket.get(month_key)
+    month_bucket = freq_bucket.get(month_key)
+    if not month_bucket:
+        return pd.DataFrame(), {}
+    entry = month_bucket.get(method)
     if entry is None:
         return pd.DataFrame(), {}
-    return scan_cells_from_json_dict(entry)
+    cells, meta = scan_cells_from_json_dict(entry)
+    return scan_ensure_bias_columns(cells), meta
 
 
 def calendar_data_mode(data_1m_ok: bool, snapshot: Optional[dict[str, Any]]) -> str:
@@ -5781,7 +6209,8 @@ def scan_month_filter_warning(month: Optional[int], n_occurrences_used: int,
 
 
 SCAN_CALENDAR_HOVER_COLS: list[str] = [
-    "dominant_direction", "p_up", "p_down", "p_range", "avg_volume", "avg_vola_pct", "threshold_pct",
+    "dominant_direction", "p_up", "p_down", "p_range", "net_bias", "trend_rate",
+    "avg_volume", "avg_vola_pct", "threshold_pct",
 ]
 
 
@@ -5789,6 +6218,10 @@ def build_scan_calendar_matrix(cells: pd.DataFrame, freq_minutes: int) -> dict[s
     """🗓️カレンダービュー(追補v7§1)用の行列組立: 行=時刻範囲ラベル(freq_minutes枠)・
     列=曜日(月〜日固定順)。compute_month_calendar_cells出力(曜日×slot=1行)をピボットし、
     表示に要る列ごとに同形状DataFrameをdictで返す(値なしの組み合わせはNaN=データ欠如)。
+
+    列がcellsに存在しない場合はスキップしNaNのまま残す(仕様v8§5: スナップショットのスリム
+    形式はavg_volume/avg_vola_pct/threshold_pct等の一部hover列を持たないため、そうした列は
+    そのままKeyErrorにせずhover表示だけ「—」に落ちる=グレースフルデグレード)。
     """
     if freq_minutes not in SCAN_SLOTS_PER_DAY:
         raise ValueError(f"未対応の粒度です: {freq_minutes}")
@@ -5800,13 +6233,14 @@ def build_scan_calendar_matrix(cells: pd.DataFrame, freq_minutes: int) -> dict[s
     if cells.empty:
         return mats
     sub = cells.set_index(["weekday", "slot"])
+    present_cols = [c for c in out_cols if c in sub.columns]
     for wd in cols:
         for s in range(n_slots):
             key = (wd, s)
             if key not in sub.index:
                 continue
             row = sub.loc[key]
-            for c in out_cols:
+            for c in present_cols:
                 mats[c].loc[idx_labels[s], wd] = row[c]
     return mats
 
@@ -5863,6 +6297,8 @@ def compute_five_min_band_stats(
     fixed_threshold_pct: float = 0.15,
     precomputed_occ5: Optional[tuple[pd.DataFrame, dict[str, Any]]] = None,
     date_range: Optional[tuple[date, date]] = None,
+    judge_method: str = "median",
+    judge_params: Optional[dict[str, Any]] = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """詳細帯内の「5分毎の内訳」集計(追補v7§2)。1分足df_1mを5分粒度へグループ化し、指定した
     詳細帯(band。BAND_HOURSのキー)に属する5分枠だけを対象に、既存E1エンジン
@@ -5908,7 +6344,9 @@ def compute_five_min_band_stats(
         if weekday is not None:
             sub = sub[sub["weekday"] == weekday]
         sub = sub.assign(weekday=weekday_label)
-    cells = _compute_scan_cells_from_occurrences(sub, 5, threshold_mode, k, fixed_threshold_pct, (), 0.0)
+    cells = _compute_scan_cells_from_occurrences(
+        sub, 5, threshold_mode, k, fixed_threshold_pct, (), 0.0,
+        judge_method=judge_method, judge_params=judge_params)
     if cells.empty:
         cells["avg_range_pct"] = pd.Series(dtype=float)
     else:
@@ -5920,6 +6358,8 @@ def compute_five_min_band_stats(
         "period_start": period_start, "period_end": period_end,
         "n_missing_groups": occ_meta["n_missing"], "n_total_groups": occ_meta["n_total_groups"],
         "n_occurrences_used": int(len(sub)), "updated_at": datetime.now(JST),
+        "judge_method": judge_method,
+        "judge_params": {**SCAN_JUDGE_METHOD_DEFAULTS.get(judge_method, {}), **(judge_params or {})},
     }
     return cells, meta
 
@@ -5933,17 +6373,23 @@ def compute_five_min_band_stats_multi(
     fixed_threshold_pct: float = 0.15,
     precomputed_occ5_map: Optional[dict[str, tuple[pd.DataFrame, dict[str, Any]]]] = None,
     date_range: Optional[tuple[date, date]] = None,
+    judge_method: str = "median",
+    judge_params: Optional[dict[str, Any]] = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """複数銘柄(BTC/ETH/SOL)のcompute_five_min_band_stats結果をslot単位で平均する
     (クロス表タブ「全選択銘柄の平均」モード用。追補v7§2)。数値列はslot毎の単純平均
     (aggregate_market_stats_multiと同じ「銘柄横断は単純平均」方針)、nは平均を四捨五入した整数。
-    dominant_directionは平均avg_gと平均threshold_pctの符号比較で再判定する
-    (各銘柄の判定を多数決するのではなく、平均後の値に同じσ適応ロジックを適用し直す)。
+    dominant_directionは平均p_up/p_down/p_rangeの最大値で再判定する(仕様v8§1で判定方式が
+    銘柄ごとに既に選択方式で計算済みのため、avg_g/threshold_pctの符号比較(median方式専用の
+    ロジック)ではなく_compute_scan_cells_from_occurrencesと同じ「確率最大値・同値タイは
+    上昇>下降>レンジ」規則を平均後のp_up/p_down/p_rangeへ適用し直す=どの判定方式でも正しい)。
 
     - precomputed_occ5_map: {label: (occ5, occ_meta)}を渡すと銘柄ごとのbuild_scan_occurrences
       再計算をスキップする(2026-07-18修正。既存呼び出し側は指定不要=Noneのまま)。
     - date_range: compute_five_min_band_stats同様、(start_date_, end_date_)へ絞り込む
       (2026-07-18バグ修正#1)。全銘柄へ同一期間を適用する。
+    - judge_method/judge_params(追補v8§1): 銘柄ごとのcompute_five_min_band_statsへそのまま
+      委譲する(既定"median"は従来どおり後方互換)。
     """
     labels = [lbl for lbl in dfs_1m if lbl in SCAN_SYMBOLS]
     per_symbol: dict[str, pd.DataFrame] = {}
@@ -5952,7 +6398,8 @@ def compute_five_min_band_stats_multi(
         occ5_arg = (precomputed_occ5_map or {}).get(lbl)
         cells, meta = compute_five_min_band_stats(
             dfs_1m[lbl], band, weekday, threshold_mode, k, fixed_threshold_pct,
-            precomputed_occ5=occ5_arg, date_range=date_range)
+            precomputed_occ5=occ5_arg, date_range=date_range,
+            judge_method=judge_method, judge_params=judge_params)
         per_symbol[lbl] = cells
         metas.append(meta)
     weekday_label = weekday if weekday is not None else "全曜日"
@@ -5975,9 +6422,13 @@ def compute_five_min_band_stats_multi(
     result["session_band"] = band
     result["weekday"] = weekday_label
     result["dominant_direction"] = [
-        "上昇" if g > t else ("下降" if g < -t else "レンジ")
-        for g, t in zip(result["avg_g"], result["threshold_pct"])
+        scan_dominant_from_probs(pu, pd_, pr)
+        for pu, pd_, pr in zip(result["p_up"], result["p_down"], result["p_range"])
     ]
+    # 仕様v8.1§1: net_bias/trend_rateは平均後のp_up/p_downから導出(平均p_up-平均p_down=
+    # 各行net_biasの平均と一致する線形量のため新規集計にならない)。
+    result["net_bias"] = scan_net_bias(result["p_up"], result["p_down"])
+    result["trend_rate"] = scan_trend_rate(result["p_up"], result["p_down"])
     result = result.sort_values("slot").reset_index(drop=True)
     period_starts = [m["period_start"] for m in metas if m.get("period_start") is not None]
     period_ends = [m["period_end"] for m in metas if m.get("period_end") is not None]
@@ -5989,6 +6440,8 @@ def compute_five_min_band_stats_multi(
         "n_total_groups": sum(m["n_total_groups"] for m in metas),
         "n_occurrences_used": sum(m["n_occurrences_used"] for m in metas),
         "updated_at": datetime.now(JST), "symbols": labels,
+        "judge_method": judge_method,
+        "judge_params": {**SCAN_JUDGE_METHOD_DEFAULTS.get(judge_method, {}), **(judge_params or {})},
     }
     return result, meta
 
@@ -6012,16 +6465,27 @@ def _scan_occurrences_cached(label: str, freq_minutes: int) -> tuple[pd.DataFram
     return build_scan_occurrences(df, freq_minutes)
 
 
+def _judge_ui_scalars_to_params(
+    judge_k: float, param_T: Optional[float], param_E: Optional[float], param_p: Optional[float],
+) -> dict[str, float]:
+    """st.cache_data用にフラット化されたT/E/pスカラー引数(仕様v8§4)をjudge_paramsのdictへ戻す
+    (_scan_calendar_cells_cached同梱ロジックの共通化・4つの5分内訳キャッシュラッパから使う)。"""
+    return {k: v for k, v in {"T": param_T, "E": param_E, "p": param_p}.items() if v is not None}
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cross_five_min_cells_cached(
     label: str, band: str, weekday: Optional[str], date_start_: date, date_end_: date,
+    judge_method: str = "median", judge_k: float = 1.0,
+    param_T: Optional[float] = None, param_E: Optional[float] = None, param_p: Optional[float] = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """クロス表タブ「⏱ 5分毎の内訳」用キャッシュラッパ(追補v7§2)。data_1mから直接集計する
+    """クロス表タブ「⏱ 5分毎の内訳」用キャッシュラッパ(追補v7§2・v8§4)。data_1mから直接集計する
     (_scan_calendar_cells_cachedと同じ作法・ttl=3600)。df読込・5分オカレンス生成はいずれも
     シンボル単位キャッシュ(_scan_load_1m_cached/_scan_5m_occurrences_cached)を経由し、
     (label,band,weekday)の組み合わせを変える度の再計算を避ける(2026-07-18修正)。
     date_start_/date_end_: サイドバーの期間選択(2026-07-18バグ修正#1: 親表と食い違っていた
-    対策。キャッシュキーに含め期間ごとに正しく別結果を返す)。"""
+    対策。キャッシュキーに含め期間ごとに正しく別結果を返す)。judge_method/judge_k/param_T/E/p:
+    仕様v8§4の判定方式スカラーフラット化(_scan_calendar_cells_cachedと対の設計)。"""
     df = _scan_load_1m_cached(label)
     if df.empty:
         return pd.DataFrame(), {
@@ -6030,30 +6494,38 @@ def _cross_five_min_cells_cached(
             "n_total_groups": 0, "n_occurrences_used": 0, "updated_at": datetime.now(JST),
         }
     occ5, occ_meta = _scan_5m_occurrences_cached(label)
+    judge_params = _judge_ui_scalars_to_params(judge_k, param_T, param_E, param_p)
     return compute_five_min_band_stats(
         df, band, weekday=weekday, precomputed_occ5=(occ5, occ_meta),
-        date_range=(date_start_, date_end_))
+        date_range=(date_start_, date_end_), k=judge_k,
+        judge_method=judge_method, judge_params=judge_params or None)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cross_five_min_cells_multi_cached(
     labels: tuple[str, ...], band: str, weekday: Optional[str], date_start_: date, date_end_: date,
+    judge_method: str = "median", judge_k: float = 1.0,
+    param_T: Optional[float] = None, param_E: Optional[float] = None, param_p: Optional[float] = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """クロス表タブ「全選択銘柄の平均」時の「⏱ 5分毎の内訳」用キャッシュラッパ(追補v7§2)。
+    """クロス表タブ「全選択銘柄の平均」時の「⏱ 5分毎の内訳」用キャッシュラッパ(追補v7§2・v8§4)。
     df読込・5分オカレンス生成はシンボル単位キャッシュ経由(2026-07-18修正)。
     date_start_/date_end_はサイドバーの期間選択(2026-07-18バグ修正#1)。"""
     dfs = {lbl: _scan_load_1m_cached(lbl) for lbl in labels}
     occ5_map = {lbl: _scan_5m_occurrences_cached(lbl) for lbl in labels}
+    judge_params = _judge_ui_scalars_to_params(judge_k, param_T, param_E, param_p)
     return compute_five_min_band_stats_multi(
         dfs, band, weekday=weekday, precomputed_occ5_map=occ5_map,
-        date_range=(date_start_, date_end_))
+        date_range=(date_start_, date_end_), k=judge_k,
+        judge_method=judge_method, judge_params=judge_params or None)
 
 
 @st.cache_data(ttl=ONDEMAND_1M_CACHE_TTL_SEC, show_spinner=False)
 def _cross_five_min_cells_ondemand_cached(
     label: str, band: str, weekday: Optional[str], date_start_: date, date_end_: date,
+    judge_method: str = "median", judge_k: float = 1.0,
+    param_T: Optional[float] = None, param_E: Optional[float] = None, param_p: Optional[float] = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """仕様§1.1: data_1m不在環境向け「⏱ 5分毎の内訳」オンデマンド版(_cross_five_min_cells_cached
+    """仕様§1.1・v8§4: data_1m不在環境向け「⏱ 5分毎の内訳」オンデマンド版(_cross_five_min_cells_cached
     のccxt直取得版)。呼び出し側は事前にondemand_1m_period_ok()で期間ガード済みであること。
     取得失敗(ネットワーク/取引所エラー)はクラッシュさせず空セルを返す(呼び出し側で案内表示)。"""
     routing = get_symbol_routing(label)
@@ -6071,7 +6543,10 @@ def _cross_five_min_cells_ondemand_cached(
     }
     if df.empty:
         return pd.DataFrame(), empty_meta
-    cells, meta = compute_five_min_band_stats(df, band, weekday=weekday, date_range=(date_start_, date_end_))
+    judge_params = _judge_ui_scalars_to_params(judge_k, param_T, param_E, param_p)
+    cells, meta = compute_five_min_band_stats(
+        df, band, weekday=weekday, date_range=(date_start_, date_end_), k=judge_k,
+        judge_method=judge_method, judge_params=judge_params or None)
     meta["ondemand"] = True
     meta["fetch_source"] = fetch_meta.get("source")
     return cells, meta
@@ -6080,8 +6555,10 @@ def _cross_five_min_cells_ondemand_cached(
 @st.cache_data(ttl=ONDEMAND_1M_CACHE_TTL_SEC, show_spinner=False)
 def _cross_five_min_cells_mixed_multi_cached(
     labels: tuple[str, ...], band: str, weekday: Optional[str], date_start_: date, date_end_: date,
+    judge_method: str = "median", judge_k: float = 1.0,
+    param_T: Optional[float] = None, param_E: Optional[float] = None, param_p: Optional[float] = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """仕様§1.1(#6指摘対処): 「全選択銘柄の平均」時、data_1mの有無が銘柄ごとに異なる(backfill
+    """仕様§1.1(#6指摘対処)・v8§4: 「全選択銘柄の平均」時、data_1mの有無が銘柄ごとに異なる(backfill
     途中の部分欠損)場合でも銘柄ごとに個別判定する。有る銘柄はライブ・無い銘柄はオンデマンド取得
     (期間>93日なら空扱い)で補い、平均が該当銘柄ごと黙って縮退しないようにする。オンデマンド
     対象銘柄はmeta["ondemand_labels"]に記録し呼び出し側で注記する。"""
@@ -6103,8 +6580,10 @@ def _cross_five_min_cells_mixed_multi_cached(
         except Exception:  # noqa: BLE001 - 取得失敗は空データ扱い(他銘柄は継続)
             df = pd.DataFrame(columns=SCAN_1M_COLS)
         dfs[lbl] = df
+    judge_params = _judge_ui_scalars_to_params(judge_k, param_T, param_E, param_p)
     cells, meta = compute_five_min_band_stats_multi(
-        dfs, band, weekday=weekday, date_range=(date_start_, date_end_))
+        dfs, band, weekday=weekday, date_range=(date_start_, date_end_), k=judge_k,
+        judge_method=judge_method, judge_params=judge_params or None)
     if ondemand_labels:
         meta["ondemand_labels"] = ondemand_labels
         meta["ondemand"] = True  # 単一銘柄オンデマンド経路(6075行)と同じ規約でcaptionのsource_note連動
@@ -6218,19 +6697,31 @@ def style_scan_ranking_table(cells: pd.DataFrame, tail_threshold: float, q_thres
     return styler
 
 
-def style_five_min_band_table(cells: pd.DataFrame) -> Any:
-    """クロス表タブ「⏱ 5分毎の内訳」表示用Styler(追補v7§2)。st.dataframe×pandas3.0の
-    Styler.format無視対策として表示文字列を事前整形したコピーを使う(style_cross_tableと同じ作法)。
-    列: 時刻|判定|平均騰落率(%)|上昇%|下落%|レンジ%|平均値幅(%)|平均出来高|ボラ(%)|n。
+def style_five_min_band_table(
+    cells: pd.DataFrame, direction_only: bool = False, min_range_pct: float = 0.0, min_n: int = 0,
+    delta: float = SCAN_BIAS_DELTA_DEFAULT,
+) -> Any:
+    """クロス表タブ「⏱ 5分毎の内訳」表示用Styler(追補v7§2・v8§2補助フィルタ・v8.1§3)。st.dataframe×
+    pandas3.0のStyler.format無視対策として表示文字列を事前整形したコピーを使う
+    (style_cross_tableと同じ作法)。列: 時刻|判定|方向率(%)|平均騰落率(%)|上昇%|下落%|レンジ%|
+    平均値幅(%)|平均出来高|ボラ(%)|n。判定列はbias_direction(net_bias,δ)へ切替(仕様v8.1§3・
+    Q-025決着=最頻判定からの再ラベル)。net_bias/trend_rateはcells["p_up"]/["p_down"]から都度導出
+    (新規集計はしない・cellsが既にnet_bias列を持つ場合と結果は同一)。direction_only/min_range_pct/
+    min_n該当行はscan_cell_should_dimに基づき全列を半透明グレー(既存の緑/赤配色に重ねてopacity)で
+    淡色化する(判定基準は従来どおりdominant_direction=後方互換・仕様v8.1§6)。
     """
-    display_cols = ["時刻", "判定", "平均騰落率(%)", "上昇%", "下落%", "レンジ%",
+    display_cols = ["時刻", "判定", "方向率(%)", "平均騰落率(%)", "上昇%", "下落%", "レンジ%",
                      "平均値幅(%)", "平均出来高", "ボラ(%)", "n"]
     if cells.empty:
         return pd.DataFrame(columns=display_cols).style
-    icons = [scan_direction_icon(d) for d in cells["dominant_direction"]]
+    net_bias_s = scan_net_bias(cells["p_up"], cells["p_down"])
+    trend_rate_s = scan_trend_rate(cells["p_up"], cells["p_down"])
+    bias_dirs = [scan_bias_direction(nb, delta) for nb in net_bias_s]
+    icons = [scan_direction_icon(d) for d in bias_dirs]
     display = pd.DataFrame({
         "時刻": cells["time_range"].values,
-        "判定": [f"{icon} {d}" for icon, d in zip(icons, cells["dominant_direction"])],
+        "判定": [f"{icon} {d}" for icon, d in zip(icons, bias_dirs)],
+        "方向率(%)": trend_rate_s.map(lambda v: "—" if pd.isna(v) else f"{v * 100:.0f}%").values,
         "平均騰落率(%)": cells["avg_g"].map(lambda v: "—" if pd.isna(v) else f"{v:+.3f}%").values,
         "上昇%": cells["p_up"].map(lambda v: "—" if pd.isna(v) else f"{v:.1%}").values,
         "下落%": cells["p_down"].map(lambda v: "—" if pd.isna(v) else f"{v:.1%}").values,
@@ -6245,15 +6736,23 @@ def style_five_min_band_table(cells: pd.DataFrame) -> Any:
     g_vals = cells["avg_g"].to_numpy(dtype=float)
     styler = display.style
     styler = styler.apply(lambda col: [diverging_color(v, vmax) for v in g_vals], subset=["平均騰落率(%)"])
+    # 仕様v8§2: 補助フィルタ該当行を全列dim(既存の色付けの上にopacityを重ねる=row-wise apply)。
+    dim_flags = [
+        scan_cell_should_dim(d, r, n, direction_only, min_range_pct, min_n)
+        for d, r, n in zip(cells["dominant_direction"], cells["avg_range_pct"], cells["n"])
+    ]
+    if any(dim_flags):
+        styler = styler.apply(
+            lambda row: ["opacity: 0.35" if dim_flags[row.name] else "" for _ in row], axis=1)
     return styler
 
 
-def build_scan_calendar_figure(mats: dict[str, pd.DataFrame], freq_minutes: int) -> go.Figure:
-    """🗓️カレンダービュー(追補v7§1)のgo.Heatmap組立(表示専用・selftest対象外)。
-    z=平均騰落率%(ゼロ中心発散配色RdYlGn)・テキスト注釈=判定アイコン+平均騰落率%+平均値幅%+n
-    (視認性優先で判定アイコンを必ず表示)。hoverは方向別確率・平均出来高・ボラ・閾値を
-    customdataへ事前整形して渡す(plotly.js hovertemplateのd3符号フラグ+,.2f非対応の既知の
-    罠を踏襲・整形済み文字列をcustomdataへ)。
+def _scan_calendar_heatmap_legacy(mats: dict[str, pd.DataFrame]) -> go.Figure:
+    """旧z=平均騰落率%(ゼロ中心発散配色RdYlGn)のHeatmap組立(仕様v8.1§5フォールバック専用:
+    net_bias/trend_rate列を持たない旧スナップショット向けに仕様v7当時の実装を保持する)。
+    テキスト注釈=判定アイコン(dominant_direction)+平均騰落率%+平均値幅%+n。hoverは方向別
+    確率・平均出来高・ボラ・閾値をcustomdataへ事前整形して渡す(plotly.js hovertemplateの
+    d3符号フラグ+,.2f非対応の既知の罠を踏襲)。
     """
     idx_labels = list(mats["avg_g"].index)
     cols = list(mats["avg_g"].columns)
@@ -6277,10 +6776,17 @@ def build_scan_calendar_figure(mats: dict[str, pd.DataFrame], freq_minutes: int)
             rp, n = mats["avg_range_pct"].loc[lbl, wd], mats["n"].loc[lbl, wd]
             icon = scan_direction_icon(dom)
             text_row.append(f"{icon} {g:+.2f}%<br>幅{rp:.2f}%<br>n={int(n)}")
+            # 仕様v8§5: スリムスナップショットはavg_volume/avg_vola_pct/threshold_pctを持たない
+            # (mats自体はキーが存在するがNaN埋め=グレースフルデグレード)。NaNは「—」表示にする
+            # (以前はf"{nan:,.1f}"="nan"という誤解を招く文字列になっていた)。
+            vol_v, vola_v, thr_v = (mats["avg_volume"].loc[lbl, wd], mats["avg_vola_pct"].loc[lbl, wd],
+                                     mats["threshold_pct"].loc[lbl, wd])
             cd_row.append([
                 dom, _scan_fmt_pct(mats["p_up"].loc[lbl, wd]), _scan_fmt_pct(mats["p_down"].loc[lbl, wd]),
-                _scan_fmt_pct(mats["p_range"].loc[lbl, wd]), f"{mats['avg_volume'].loc[lbl, wd]:,.1f}",
-                f"{mats['avg_vola_pct'].loc[lbl, wd]:.3f}%", f"{mats['threshold_pct'].loc[lbl, wd]:.3f}%",
+                _scan_fmt_pct(mats["p_range"].loc[lbl, wd]),
+                "—" if pd.isna(vol_v) else f"{vol_v:,.1f}",
+                "—" if pd.isna(vola_v) else f"{vola_v:.3f}%",
+                "—" if pd.isna(thr_v) else f"{thr_v:.3f}%",
             ])
         text.append(text_row)
         customdata.append(cd_row)
@@ -6295,6 +6801,88 @@ def build_scan_calendar_figure(mats: dict[str, pd.DataFrame], freq_minutes: int)
         ),
         colorbar=dict(title="平均騰落率%"),
     ))
+    return fig
+
+
+def _scan_calendar_heatmap_bias(mats: dict[str, pd.DataFrame], delta: float) -> go.Figure:
+    """新z=bias_direction(色相)×trend_rate(濃さ)のHeatmap組立(仕様v8.1§2・Q-025決着版)。
+    矢印=scan_bias_direction(net_bias, δ)。テキスト=矢印+方向率%+平均騰落%+n。hoverは
+    寄り(net_bias)・P上/下/レンジ・方向率・平均騰落・平均値幅・n・判定基準(デッドゾーン)。
+    """
+    idx_labels = list(mats["avg_g"].index)
+    cols = list(mats["avg_g"].columns)
+    z: list[list[float]] = []
+    text: list[list[str]] = []
+    customdata: list[list[list[str]]] = []
+    for lbl in idx_labels:
+        z_row: list[float] = []
+        text_row: list[str] = []
+        cd_row: list[list[str]] = []
+        for wd in cols:
+            nb, tr = mats["net_bias"].loc[lbl, wd], mats["trend_rate"].loc[lbl, wd]
+            g, n = mats["avg_g"].loc[lbl, wd], mats["n"].loc[lbl, wd]
+            if pd.isna(nb) or pd.isna(g):
+                z_row.append(float("nan"))
+                text_row.append("—")
+                cd_row.append(["データなし"] + ["—"] * 9)
+                continue
+            direction = scan_bias_direction(float(nb), delta)
+            z_row.append(scan_bias_calendar_z(direction, float(tr)))
+            icon = scan_direction_icon(direction)
+            text_row.append(f"{icon} {tr * 100:.0f}%<br>{g:+.2f}%<br>n={int(n)}")
+            rp = mats["avg_range_pct"].loc[lbl, wd]
+            cd_row.append([
+                direction, f"{nb:+.1%}", _scan_fmt_pct(mats["p_up"].loc[lbl, wd]),
+                _scan_fmt_pct(mats["p_down"].loc[lbl, wd]), _scan_fmt_pct(mats["p_range"].loc[lbl, wd]),
+                f"{tr:.1%}", f"{g:+.2f}%", "—" if pd.isna(rp) else f"{rp:.2f}%",
+                f"{int(n)}", f"±{delta:.0%}",
+            ])
+        z.append(z_row)
+        text.append(text_row)
+        customdata.append(cd_row)
+    return go.Figure(data=go.Heatmap(
+        z=z, x=cols, y=idx_labels, colorscale=SCAN_BIAS_CALENDAR_COLORSCALE, zmin=0.0, zmax=1.0,
+        showscale=False, text=text, texttemplate="%{text}", customdata=customdata,
+        hovertemplate=(
+            "%{y} %{x}<br>寄り=%{customdata[0]}(net_bias=%{customdata[1]})<br>"
+            "P(上)=%{customdata[2]} P(下)=%{customdata[3]} P(レンジ)=%{customdata[4]}<br>"
+            "方向率=%{customdata[5]}<br>平均騰落=%{customdata[6]} 平均値幅=%{customdata[7]} "
+            "n=%{customdata[8]}<br>判定基準: デッドゾーン%{customdata[9]}<extra></extra>"
+        ),
+    ))
+
+
+def build_scan_calendar_figure(
+    mats: dict[str, pd.DataFrame], freq_minutes: int,
+    direction_only: bool = False, min_range_pct: float = 0.0, min_n: int = 0,
+    delta: float = SCAN_BIAS_DELTA_DEFAULT,
+) -> go.Figure:
+    """🗓️カレンダービュー(追補v7§1・v8.1§2)のgo.Heatmap組立(表示専用・selftest対象外)。
+    矢印=bias_direction(net_bias, δ)・色相=寄りの向き(上昇緑/下降赤/レンジ中立グレー)・
+    濃さ=trend_rate(仕様v8.1§2・Q-025決着=矢印を「最頻判定」から「上下の寄り」へ変更)。
+    net_bias/trend_rate列を持たない旧スナップショット(仕様v8.1§5)は
+    _scan_calendar_heatmap_legacy(旧avg_g色分け)へフォールバックする。
+
+    direction_only/min_range_pct/min_n(仕様v8§2補助フィルタ)は従来どおりdominant_direction
+    (最頻判定・後方互換で残置)を使い、半透明グレーの重ね合わせで淡色化する(挙動不変)。
+    """
+    has_bias = "net_bias" in mats and bool(mats["net_bias"].notna().any().any())
+    fig = _scan_calendar_heatmap_bias(mats, delta) if has_bias else _scan_calendar_heatmap_legacy(mats)
+    idx_labels = list(mats["avg_g"].index)
+    cols = list(mats["avg_g"].columns)
+    if direction_only or min_range_pct > 0 or min_n > 0:
+        dim_z = [
+            [1.0 if scan_cell_should_dim(
+                mats["dominant_direction"].loc[lbl, wd], mats["avg_range_pct"].loc[lbl, wd],
+                mats["n"].loc[lbl, wd], direction_only, min_range_pct, min_n) else np.nan
+             for wd in cols]
+            for lbl in idx_labels
+        ]
+        if any(not math.isnan(v) for row in dim_z for v in row):
+            fig.add_trace(go.Heatmap(
+                z=dim_z, x=cols, y=idx_labels, showscale=False, hoverinfo="skip",
+                colorscale=[[0, "rgba(90,90,90,0.6)"], [1, "rgba(90,90,90,0.6)"]], zmin=0, zmax=1,
+            ))
     fig.update_layout(
         template="plotly_dark", margin=dict(l=70, r=20, t=40, b=20),
         height=(1500 if freq_minutes == 30 else 780),
@@ -6373,19 +6961,26 @@ def render_scan_ranking_view(results: dict[str, Any]) -> None:
 @st.cache_data(ttl=3600, show_spinner=False)
 def _scan_calendar_cells_cached(
     label: str, month: Optional[int], freq_minutes: int,
+    judge_method: str = "median", judge_k: float = 1.0,
+    param_T: Optional[float] = None, param_E: Optional[float] = None, param_p: Optional[float] = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """🗓️カレンダービュー(追補v7§1)用セル集計のキャッシュラッパ。scan_results.jsonでなく
+    """🗓️カレンダービュー(追補v7§1・v8§4)用セル集計のキャッシュラッパ。scan_results.jsonでなく
     data_1mから直接オンデマンド集計する(月フィルタの柔軟性のため・ttl=3600)。
     df読込・オカレンス生成はいずれもシンボル単位キャッシュ(_scan_load_1m_cached/
     _scan_occurrences_cached)を経由し、月セレクタを変える度の再計算を避ける
-    (2026-07-18バグ修正#2: 月を変える度に8〜16秒のフリーズが発生していた対策)。"""
+    (2026-07-18バグ修正#2: 月を変える度に8〜16秒のフリーズが発生していた対策)。
+    judge_method/judge_k/param_T/param_E/param_p(仕様v8§4): st.cache_dataのキーはスカラー
+    引数の方がdictより堅牢なため、判定方式パラメータをT/E/pのスカラーへフラット化して渡す
+    (scan_judge_ui_params_to_compute_argsのUI側変換と対の設計)。"""
     df = _scan_load_1m_cached(label)
     if df.empty:
         return pd.DataFrame(), {"label": label, "month": month,
                                  "calendar_freq_minutes": freq_minutes, "n_occurrences_used": 0}
     occ, occ_meta = _scan_occurrences_cached(label, freq_minutes)
+    judge_params = {k: v for k, v in {"T": param_T, "E": param_E, "p": param_p}.items() if v is not None}
     return compute_month_calendar_cells(
-        df, month=month, freq_minutes=freq_minutes, precomputed_occ=(occ, occ_meta))
+        df, month=month, freq_minutes=freq_minutes, precomputed_occ=(occ, occ_meta),
+        k=judge_k, judge_method=judge_method, judge_params=judge_params or None)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -6418,6 +7013,38 @@ def render_scan_calendar_view() -> None:
     snapshot = None if live_ok else _load_calendar_cells_snapshot_cached()
     data_mode = calendar_data_mode(live_ok, snapshot)
 
+    # 追補v8§4: 判定方式セレクタ(既定「B＋C」)。パラメータスライダーはライブ集計時のみ表示
+    # (スナップショットは既定パラメータ固定・仕様v8§5)。
+    method = st.selectbox(
+        "判定方式", SCAN_JUDGE_METHOD_UI_ORDER, index=0,
+        format_func=lambda m: SCAN_JUDGE_METHOD_UI_LABELS[m], key="scan_cal_method",
+    )
+    if data_mode == "live":
+        specs = SCAN_JUDGE_PARAM_SLIDER_SPECS[method]
+        param_cols = st.columns(len(specs))
+        ui_params = {
+            pkey: param_cols[i].slider(label, mn, mx, dflt, step, key=f"scan_cal_param_{pkey}")
+            for i, (pkey, label, mn, mx, dflt, step) in enumerate(specs)
+        }
+    else:
+        ui_params = {"k": 1.0} if method == "median" else dict(SCAN_JUDGE_METHOD_DEFAULTS[method])
+        st.caption("📸既定パラメータのスナップショット(この環境ではパラメータ調整不可)")
+    judge_k, judge_params = scan_judge_ui_params_to_compute_args(method, ui_params)
+
+    f1, f2, f3, f4 = st.columns(4)
+    direction_only = f1.toggle("方向ありのマスだけ強調", value=False, key="scan_cal_direction_only",
+                                help="ONでレンジ(→)判定のマスを淡色化します。")
+    min_range_pct_cal = f2.slider(
+        "平均値幅N%未満のマスを除外", 0.0, 1.0, 0.0, 0.05, key="scan_cal_min_range",
+        help="0=無効。指定値未満のマスを淡色化します。")
+    min_n_cal = int(f3.number_input("n<Mのマスを淡色(0=無効)", min_value=0, value=0, step=5, key="scan_cal_min_n"))
+    # 仕様v8.1§4: 「→とみなす幅」デッドゾーン(0〜15%・既定3%)。表示パラメータのため
+    # ライブ/スナップショットどちらでも常に有効(スナップショット再生成不要・仕様v8.1§5)。
+    delta_pct_cal = f4.slider(
+        "→とみなす幅(デッドゾーン)", 0, 15, 3, 1, key="scan_cal_delta_pct",
+        help="net_bias(P上−P下)の絶対値がこの幅以下なら→(レンジ)とみなします。")
+    delta_cal = delta_pct_cal / 100.0
+
     if data_mode == "none":
         st.info(
             "この環境ではカレンダー用データがありません(1分足・スナップショットとも未配置)。"
@@ -6426,9 +7053,11 @@ def render_scan_calendar_view() -> None:
         return
     if data_mode == "live":
         with st.spinner(f"{symbol_sel}の1分足を集計中..."):
-            cells, meta = _scan_calendar_cells_cached(symbol_sel, month_val, freq_minutes)
+            cells, meta = _scan_calendar_cells_cached(
+                symbol_sel, month_val, freq_minutes, judge_method=method, judge_k=judge_k,
+                param_T=judge_params.get("T"), param_E=judge_params.get("E"), param_p=judge_params.get("p"))
     else:
-        cells, meta = calendar_cells_snapshot_lookup(snapshot, symbol_sel, month_val, freq_minutes)
+        cells, meta = calendar_cells_snapshot_lookup(snapshot, symbol_sel, month_val, freq_minutes, method=method)
 
     if cells.empty:
         if data_mode == "snapshot":
@@ -6467,14 +7096,20 @@ def render_scan_calendar_view() -> None:
         st.caption(f"⚠️ {warn_msg}(個々のセルのnはセル内に併記)")
 
     mats = build_scan_calendar_matrix(cells, freq_minutes)
-    st.plotly_chart(build_scan_calendar_figure(mats, freq_minutes), width="stretch")
+    fig = build_scan_calendar_figure(
+        mats, freq_minutes, direction_only=direction_only,
+        min_range_pct=min_range_pct_cal, min_n=min_n_cal, delta=delta_cal)
+    st.plotly_chart(fig, width="stretch")
     st.caption(
-        "セル表示 = 判定アイコン(↑上昇/↓下落/→レンジ。そのセルの最頻判定)+平均騰落率%"
-        "(色・緑=上昇/赤=下降)+平均値幅%(=平均(high-low)/open)+n(件数)。ホバーで方向別"
-        "確率・平均出来高・ボラ・判定閾値を表示。"
+        f"セル表示 = 矢印(↑上寄り/↓下寄り/→レンジ。net_bias=P上−P下の寄りをデッドゾーン"
+        f"±{delta_pct_cal}%で判定)+方向率%(=P上+P下=1−Pレンジ・動きやすさ)+平均騰落率%+n(件数)。"
+        "色の濃さ=方向率(濃いほど動きやすい)、色相=矢印の向き(緑=上寄り/赤=下寄り/グレー=レンジ)。"
+        "ホバーで寄り(net_bias)・P上/下/レンジ・方向率・平均値幅・判定基準を表示。"
     )
+    # 仕様v8§4: 判定基準の脚注を選択方式に応じ動的表示。
+    footnote_params = ({"k": judge_k} if method == "median" else judge_params)
     st.caption(
-        "判定基準: 枠の騰落率がその枠の過去中央値変動を上回るか(データ由来の適応閾値・k=1.0)。"
+        f"{scan_judge_method_footnote(method, footnote_params)} "
         "確率は過去の発生頻度であり将来の保証ではない。個別セルの信頼区間/FDR判定は"
         "「ランキング」または「セル詳細」ビューで必ず確認すること(このビューは概観専用)。"
     )
@@ -9267,7 +9902,9 @@ def run_selftest() -> bool:
     cells_22, meta_22 = compute_month_calendar_cells(bars_22, month=None, freq_minutes=30)
     snapshot_22 = {
         "meta": {"updated_at": "2026-07-18T04:00:00+09:00", "generated_by": "test"},
-        "symbols": {"BTC": {"30": {"all": scan_cells_to_json_dict(cells_22, meta_22)}}},
+        "symbols": {"BTC": {"30": {"all": {
+            SCAN_JUDGE_METHOD_DEFAULT: scan_cells_to_json_dict(cells_22, meta_22),
+        }}}},
     }
     with tempfile.TemporaryDirectory() as td_22b:
         p_22 = Path(td_22b) / "calendar_cells.json"
@@ -9295,6 +9932,229 @@ def run_selftest() -> bool:
     check("22-6c 対処(クロス表5分内訳への誘導)が明記されている",
           "5分毎の内訳" in msg_22_btc and "93日" in msg_22_btc)
     check("22-6d 別銘柄でも銘柄名が正しく差し替わる", "ETH" in scan_cell_detail_unavailable_msg("ETH"))
+
+    print("\n--- 23. 追補v8§1/§3: 判定方式(トレンド/レンジ)切替 ---")
+
+    # 23-1: classify_occurrence 各方式の既知解(境界値)
+    check("23-1a A: g=T+ε→上昇", classify_occurrence({"g": 0.31}, "A", {"T": 0.30}) == "上昇")
+    check("23-1b A: g=Tちょうど→レンジ(境界は非包含>)",
+          classify_occurrence({"g": 0.30}, "A", {"T": 0.30}) == "レンジ")
+    check("23-1c A: g=-T-ε→下降", classify_occurrence({"g": -0.31}, "A", {"T": 0.30}) == "下降")
+    check("23-1d A: g=0→レンジ", classify_occurrence({"g": 0.0}, "A", {"T": 0.30}) == "レンジ")
+    check("23-1e B: efficiency>=E かつ g>0→上昇",
+          classify_occurrence({"g": 0.5, "efficiency": 0.6}, "B", {"E": 0.5}) == "上昇")
+    check("23-1f B: efficiency>=E かつ g<0→下降",
+          classify_occurrence({"g": -0.5, "efficiency": 0.6}, "B", {"E": 0.5}) == "下降")
+    check("23-1g B: efficiency<E→レンジ(gが大きくても)",
+          classify_occurrence({"g": 0.9, "efficiency": 0.4}, "B", {"E": 0.5}) == "レンジ")
+    check("23-1h B: efficiency=Eちょうど(境界は包含>=)→方向",
+          classify_occurrence({"g": 0.5, "efficiency": 0.5}, "B", {"E": 0.5}) == "上昇")
+    check("23-1i C: close_above かつ frac_above>=p→上昇",
+          classify_occurrence({"frac_above": 0.7, "close_above": True}, "C", {"p": 0.6}) == "上昇")
+    check("23-1j C: not close_above かつ frac_above<=1-p→下降",
+          classify_occurrence({"frac_above": 0.3, "close_above": False}, "C", {"p": 0.6}) == "下降")
+    check("23-1k C: close_above だが frac_above<p→レンジ",
+          classify_occurrence({"frac_above": 0.5, "close_above": True}, "C", {"p": 0.6}) == "レンジ")
+    check("23-1l C: frac_above=1-pちょうど(境界は包含<=)→下降",
+          classify_occurrence({"frac_above": 0.4, "close_above": False}, "C", {"p": 0.6}) == "下降")
+    check("23-1m median: g>threshold→上昇",
+          classify_occurrence({"g": 0.5}, "median", {"threshold": 0.3}) == "上昇")
+    check("23-1n median: g<-threshold→下降",
+          classify_occurrence({"g": -0.5}, "median", {"threshold": 0.3}) == "下降")
+    check("23-1o median: |g|<threshold→レンジ",
+          classify_occurrence({"g": 0.2}, "median", {"threshold": 0.3}) == "レンジ")
+    try:
+        classify_occurrence({"g": 0.1}, "未知方式", {})
+        check("23-1p 未知の方式はValueError", False)
+    except ValueError:
+        check("23-1p 未知の方式はValueError", True)
+
+    # 23-2a: 特徴量の既知解(合成1分足5本・5分枠1グループ・h=l=cで手計算しやすくし
+    # 1本だけh/lをずらしてvwapの(h+l+c)/3式も検証。closeは100,101,100,102,101)。
+    idx_23a = pd.date_range(pd.Timestamp("2026-02-02") + pd.Timedelta(hours=9), periods=5, freq="1min")
+    closes_23a = [100.0, 101.0, 100.0, 102.0, 101.0]
+    highs_23a = [100.0, 101.0, 104.0, 102.0, 101.0]
+    lows_23a = [100.0, 101.0, 98.0, 102.0, 101.0]
+    bars_23a = pd.DataFrame({
+        "open": closes_23a, "high": highs_23a, "low": lows_23a, "close": closes_23a,
+        "volume": [1.0] * 5,
+    }, index=idx_23a)
+    occ_23a, _meta_23a = build_scan_occurrences(bars_23a, freq_minutes=5)
+    check("23-2a n_bars=5の単一グループが1件だけ生成される", len(occ_23a) == 1, f"got={len(occ_23a)}")
+    row_23a = occ_23a.iloc[0]
+    # 手計算: g=(101-100)/100*100=1.0 / path=|100-100|+|101-100|+|100-101|+|102-100|+|101-102|
+    #   =0+1+1+2+1=5 → path_pct=5.0 → efficiency=1.0/5.0=0.2
+    check("23-2b g手計算一致", math.isclose(row_23a["g"], 1.0, abs_tol=1e-9), f"got={row_23a['g']}")
+    check("23-2c path_pct手計算一致(窓先頭=open_first起点)",
+          math.isclose(row_23a["path_pct"], 5.0, abs_tol=1e-9), f"got={row_23a['path_pct']}")
+    check("23-2d efficiency手計算一致", math.isclose(row_23a["efficiency"], 0.2, abs_tol=1e-9),
+          f"got={row_23a['efficiency']}")
+    # vwap: typical=[100,101,302/3,102,101](3本目のみh=104,l=98)、volume全て1
+    vwap_exp_23a = (100.0 + 101.0 + 302.0 / 3.0 + 102.0 + 101.0) / 5.0
+    check("23-2e vwap手計算一致((h+l+c)/3の出来高加重平均)",
+          math.isclose(row_23a["vwap"], vwap_exp_23a, abs_tol=1e-9),
+          f"got={row_23a['vwap']} exp={vwap_exp_23a}")
+    frac_exp_23a = 3.0 / 5.0  # close(100,101,100,102,101) > vwap(≈100.93) は101,102,101の3本
+    check("23-2f frac_above手計算一致", math.isclose(row_23a["frac_above"], frac_exp_23a, abs_tol=1e-9),
+          f"got={row_23a['frac_above']}")
+    check("23-2g close_above手計算一致(101>vwap)", bool(row_23a["close_above"]) is True)
+
+    # 23-2h: 入口移動は前窓(別グループ)のcloseを跨がずopen_firstからの差を使う(仕様§3)。
+    # 窓2(分5-9)の先頭バーはopen=150,close=200(own move=50)。もし誤って窓1最終close(101)
+    # からの差を使えば|200-101|=99になりpath_pctが33.33%でなく66%になってしまう。
+    idx_23h = pd.date_range(pd.Timestamp("2026-02-02") + pd.Timedelta(hours=9), periods=10, freq="1min")
+    closes_23h = closes_23a + [200.0, 200.0, 200.0, 200.0, 200.0]
+    opens_23h = closes_23a[:1] + closes_23a[1:] + [150.0, 200.0, 200.0, 200.0, 200.0]
+    bars_23h = pd.DataFrame({
+        "open": opens_23h, "high": closes_23h, "low": closes_23h, "close": closes_23h,
+        "volume": [1.0] * 10,
+    }, index=idx_23h)
+    occ_23h, _meta_23h = build_scan_occurrences(bars_23h, freq_minutes=5)
+    check("23-2h 5分×2グループが生成される", len(occ_23h) == 2, f"got={len(occ_23h)}")
+    row2_23h = occ_23h.sort_values("slot").iloc[1]  # 2件目=後の5分枠(slot値は絶対値で0/1でない)
+    check("23-2i 窓2のpath_pctは前窓closeを跨がない(50/150*100)",
+          math.isclose(row2_23h["path_pct"], 50.0 / 150.0 * 100.0, abs_tol=1e-9),
+          f"got={row2_23h['path_pct']}")
+    check("23-2j 窓2のefficiency=1.0(直線的に一方向)",
+          math.isclose(row2_23h["efficiency"], 1.0, abs_tol=1e-9), f"got={row2_23h['efficiency']}")
+
+    # 23-2k: 出来高合計0のグループはvwap=open_firstへフォールバック(仕様§3)。
+    idx_23k = pd.date_range(pd.Timestamp("2026-03-03") + pd.Timedelta(hours=9), periods=3, freq="1min")
+    bars_23k = pd.DataFrame({
+        "open": [100.0, 100.0, 100.0], "high": [100.0, 101.0, 99.0],
+        "low": [100.0, 101.0, 99.0], "close": [100.0, 101.0, 99.0], "volume": [0.0, 0.0, 0.0],
+    }, index=idx_23k)
+    occ_23k, _meta_23k = build_scan_occurrences(bars_23k, freq_minutes=5)
+    row_23k = occ_23k.iloc[0]
+    check("23-2l 出来高0はvwap=open_firstへフォールバック",
+          math.isclose(row_23k["vwap"], 100.0, abs_tol=1e-9), f"got={row_23k['vwap']}")
+    check("23-2m フォールバックvwapに対するfrac_above(1/3=101のみ超過)",
+          math.isclose(row_23k["frac_above"], 1.0 / 3.0, abs_tol=1e-9), f"got={row_23k['frac_above']}")
+
+    # 23-3: B+C / A+B+C の合成(一致→方向・不一致→レンジ)
+    feat_23_i = {"g": 0.5, "efficiency": 0.7, "close_above": True, "frac_above": 0.7}
+    check("23-3a B+C: B=上昇,C=上昇→上昇(一致)",
+          classify_occurrence(feat_23_i, "B+C", {"E": 0.5, "p": 0.6}) == "上昇")
+    check("23-3b A+B+C: A=上昇,B=上昇,C=上昇→上昇(全一致)",
+          classify_occurrence(feat_23_i, "A+B+C", {"T": 0.3, "E": 0.5, "p": 0.6}) == "上昇")
+    feat_23_ii = {"g": 0.5, "efficiency": 0.7, "close_above": False, "frac_above": 0.3}
+    check("23-3c B+C: B=上昇,C=下降→レンジ(不一致)",
+          classify_occurrence(feat_23_ii, "B+C", {"E": 0.5, "p": 0.6}) == "レンジ")
+    feat_23_iii = {"g": 0.9, "efficiency": 0.3, "close_above": True, "frac_above": 0.7}
+    check("23-3d B+C: B=レンジ(efficiency不足),C=上昇→レンジ(片方レンジは不一致扱い)",
+          classify_occurrence(feat_23_iii, "B+C", {"E": 0.5, "p": 0.6}) == "レンジ")
+    feat_23_iv = {"g": 0.5, "efficiency": 0.7, "close_above": False, "frac_above": 0.3}
+    check("23-3e A+B+C: A=上昇,B=上昇,C=下降→レンジ(3者不一致)",
+          classify_occurrence(feat_23_iv, "A+B+C", {"T": 0.3, "E": 0.5, "p": 0.6}) == "レンジ")
+    feat_23_v = {"g": -0.5, "efficiency": 0.7, "close_above": False, "frac_above": 0.3}
+    check("23-3f A+B+C: A=下降,B=下降,C=下降→下降(全一致)",
+          classify_occurrence(feat_23_v, "A+B+C", {"T": 0.3, "E": 0.5, "p": 0.6}) == "下降")
+
+    # 23-4: 方式切替でセルのdominant_directionが実際に変わる(合成データ・n=5同一セル)。
+    # g全て0.40で統一→中央値=0.40(自分自身と同値なので g>thr が非包含>で誰も超えず全レンジ)。
+    # 一方A(T=0.30固定)は全件0.40>0.30で上昇。efficiency/frac_above/close_above列はmedian
+    # モードでは参照しないダミー値(non-median呼び出しの列存在要件を満たすためのみ)。
+    n_23_4 = 5
+    occ_23_4 = pd.DataFrame({
+        "weekday": ["月"] * n_23_4, "slot": [0] * n_23_4, "g": [0.40] * n_23_4,
+        "mfe_up": [0.5] * n_23_4, "mfe_down": [0.1] * n_23_4, "volume": [100.0] * n_23_4,
+        "vola_pct": [0.2] * n_23_4,
+        "date": pd.date_range("2026-01-05", periods=n_23_4, freq="7D").date,
+        "efficiency": [0.9] * n_23_4, "frac_above": [0.9] * n_23_4, "close_above": [True] * n_23_4,
+    })
+    cells_med_23_4 = _compute_scan_cells_from_occurrences(
+        occ_23_4, 30, "adaptive", 1.0, 0.15, (0.3,), 0.10, judge_method="median")
+    check("23-4a median方式: dominant=レンジ(全件が自分自身の中央値と同値で非超過)",
+          cells_med_23_4.iloc[0]["dominant_direction"] == "レンジ",
+          f"got={cells_med_23_4.iloc[0]['dominant_direction']} p_range={cells_med_23_4.iloc[0]['p_range']}")
+    check("23-4b median方式: p_range=1.0(文字通り全レンジ)",
+          math.isclose(cells_med_23_4.iloc[0]["p_range"], 1.0, abs_tol=1e-9))
+    cells_a_23_4 = _compute_scan_cells_from_occurrences(
+        occ_23_4, 30, "adaptive", 1.0, 0.15, (0.3,), 0.10, judge_method="A", judge_params={"T": 0.30})
+    check("23-4c A方式(T=0.30固定): dominant=上昇へ切替わる(同一データでも方式で結果が変わる)",
+          cells_a_23_4.iloc[0]["dominant_direction"] == "上昇",
+          f"got={cells_a_23_4.iloc[0]['dominant_direction']}")
+    check("23-4d A方式: p_up=1.0", math.isclose(cells_a_23_4.iloc[0]["p_up"], 1.0, abs_tol=1e-9))
+    cells_a_default_23_4 = _compute_scan_cells_from_occurrences(
+        occ_23_4, 30, "adaptive", 1.0, 0.15, (0.3,), 0.10, judge_method="A")
+    check("23-4e judge_params省略時はSCAN_JUDGE_METHOD_DEFAULTSのT=0.30が使われる",
+          cells_a_default_23_4.iloc[0]["dominant_direction"] == "上昇")
+
+    # -----------------------------------------------------------------
+    # 24: 追補v8§2/§4 補助フィルタ+UI変換ヘルパ(純ロジック)
+    # -----------------------------------------------------------------
+    print("\n--- 24. 追補v8§2/§4: 補助フィルタ+UIパラメータ変換 ---")
+    check("24-1a scan_cell_should_dim: 全既定OFFはdimしない",
+          not scan_cell_should_dim("レンジ", 0.05, 10, False, 0.0, 0))
+    check("24-1b scan_cell_should_dim: direction_only=Trueでレンジをdim",
+          scan_cell_should_dim("レンジ", 0.05, 10, True, 0.0, 0))
+    check("24-1c scan_cell_should_dim: direction_only=Trueでも方向ありはdimしない",
+          not scan_cell_should_dim("上昇", 0.05, 10, True, 0.0, 0))
+    check("24-1d scan_cell_should_dim: avg_range_pct<min_range_pctをdim",
+          scan_cell_should_dim("上昇", 0.05, 10, False, 0.10, 0))
+    check("24-1e scan_cell_should_dim: n<min_nをdim", scan_cell_should_dim("上昇", 0.05, 5, False, 0.0, 10))
+    check("24-1f scan_cell_should_dim: NaN(avg_range_pct)は判定不能につきdimしない",
+          not scan_cell_should_dim("上昇", float("nan"), 10, False, 0.10, 0))
+
+    check("24-2a SCAN_JUDGE_PARAM_SLIDER_SPECSはSCAN_JUDGE_METHODS全6方式を持つ",
+          set(SCAN_JUDGE_PARAM_SLIDER_SPECS.keys()) == set(SCAN_JUDGE_METHODS),
+          f"keys={list(SCAN_JUDGE_PARAM_SLIDER_SPECS.keys())}")
+    check("24-2b scan_judge_ui_params_to_compute_args: median以外はui_paramsがそのままjudge_params",
+          scan_judge_ui_params_to_compute_args("B+C", {"E": 0.6, "p": 0.7}) == (1.0, {"E": 0.6, "p": 0.7}))
+    check("24-2c scan_judge_ui_params_to_compute_args: medianはkをjudge_paramsでなくk引数へ",
+          scan_judge_ui_params_to_compute_args("median", {"k": 1.5}) == (1.5, {}))
+
+    cells_24_3 = pd.DataFrame({
+        "time_range": ["09:00-09:05", "09:05-09:10"], "dominant_direction": ["上昇", "レンジ"],
+        "avg_g": [0.5, 0.01], "p_up": [0.8, 0.3], "p_down": [0.1, 0.3], "p_range": [0.1, 0.4],
+        "avg_range_pct": [0.3, 0.02], "avg_volume": [100.0, 90.0], "avg_vola_pct": [0.2, 0.1],
+        "n": [40, 35],
+    })
+    html_off_24_3 = style_five_min_band_table(cells_24_3).to_html()
+    check("24-3a style_five_min_band_table: 補助フィルタ全既定OFFはopacity付与なし",
+          "opacity: 0.35" not in html_off_24_3)
+    html_on_24_3 = style_five_min_band_table(cells_24_3, direction_only=True).to_html()
+    check("24-3b style_five_min_band_table: direction_only=Trueでレンジ行にopacity付与",
+          "opacity: 0.35" in html_on_24_3)
+
+    print("\n--- 25. 追補v8.1§1/§2/§7: net_bias/trend_rate/bias_direction/opacity(Q-025決着) ---")
+
+    # 25-1: net_bias/trend_rate算出(既知のp_up/p_down/p_rangeから・新規集計でない再ラベルのみ)。
+    nb_25_1 = scan_net_bias(0.6, 0.25)
+    tr_25_1 = scan_trend_rate(0.6, 0.25)
+    check("25-1a scan_net_bias(0.6,0.25)=0.35(=P上−P下)", math.isclose(nb_25_1, 0.35), f"got={nb_25_1}")
+    check("25-1b scan_trend_rate(0.6,0.25)=0.85(=P上+P下=1−P(レンジ0.15))",
+          math.isclose(tr_25_1, 0.85), f"got={tr_25_1}")
+
+    # 25-2: bias_direction(δ)の境界(net_bias=δちょうど→レンジ・±δ外→方向。境界はレンジ側)。
+    check("25-2a net_bias=δ(0.03)ちょうどはレンジ(境界はレンジ側)",
+          scan_bias_direction(0.03, 0.03) == "レンジ")
+    check("25-2b net_bias=δ+微小値は上昇", scan_bias_direction(0.0300001, 0.03) == "上昇")
+    check("25-2c net_bias=−δ(−0.03)ちょうどはレンジ(境界はレンジ側)",
+          scan_bias_direction(-0.03, 0.03) == "レンジ")
+    check("25-2d net_bias=−δ−微小値は下降", scan_bias_direction(-0.0300001, 0.03) == "下降")
+    check("25-2e カスタムδ=0.05でnet_bias=0.05はレンジ・0.051は上昇",
+          scan_bias_direction(0.05, 0.05) == "レンジ" and scan_bias_direction(0.051, 0.05) == "上昇")
+
+    # 25-3: opacity(trend_rate)の端点(0/0.5/1)。0.5以上で最も濃い0.80、0%で最も薄い0.12(仕様式どおり)。
+    check("25-3a trend_rate=0はopacity=0.12(最も薄い)",
+          math.isclose(scan_bias_opacity(0.0), 0.12), f"got={scan_bias_opacity(0.0)}")
+    check("25-3b trend_rate=0.5はopacity=0.80(最も濃い)",
+          math.isclose(scan_bias_opacity(0.5), 0.80), f"got={scan_bias_opacity(0.5)}")
+    check("25-3c trend_rate=1.0もopacity=0.80(0.5超はキャップ)",
+          math.isclose(scan_bias_opacity(1.0), 0.80), f"got={scan_bias_opacity(1.0)}")
+
+    # 25-4: 実データBTC全月30分でbias_directionの矢印がばらける確認(合成でなく実データ検証・Q-025決着の核心)。
+    cells_25_4, _meta_25_4 = compute_month_calendar_cells(df_gc_21, month=None, freq_minutes=30)
+    dirs_25_4 = [scan_bias_direction(nb, SCAN_BIAS_DELTA_DEFAULT) for nb in cells_25_4["net_bias"]]
+    up_25 = sum(1 for d in dirs_25_4 if d == "上昇")
+    down_25 = sum(1 for d in dirs_25_4 if d == "下降")
+    range_25 = sum(1 for d in dirs_25_4 if d == "レンジ")
+    print(f"    [25-4実データ内訳] BTC全月30分 n_cells={len(dirs_25_4)} "
+          f"上昇={up_25} 下降={down_25} レンジ={range_25}")
+    check("25-4 実データBTC全月30分: bias_direction内訳が全→でない(↑↓とも1件以上)",
+          up_25 > 0 and down_25 > 0 and range_25 < len(dirs_25_4),
+          f"up={up_25} down={down_25} range={range_25} total={len(dirs_25_4)}")
 
     print("\n" + "=" * 78)
     if all_ok:
