@@ -37,6 +37,7 @@ import hmac
 import math
 import re
 import statistics
+import tempfile
 import traceback
 import inspect
 from dataclasses import dataclass, field
@@ -154,6 +155,13 @@ MINUTE_CACHE_TTL_SEC = 900   # 1分足(ccxt暗号専用)の短期キャッシュ
 FINE_CACHE_TTL_SEC = 1800    # 5分足/15分足の短期キャッシュ(v6.1: 600→1800)
 MINUTE_CACHE_TTL_MIN = MINUTE_CACHE_TTL_SEC // 60
 FINE_CACHE_TTL_MIN = FINE_CACHE_TTL_SEC // 60
+
+# ---- 追補v7.2§1.1: data_1m不在環境(クラウド)向けオンデマンド1分足取得のTTL/上限 ------
+# (fetch_ondemand_1m_ohlcvの@st.cache_data(ttl=...)がモジュール読込時に評価するため、
+# 定義はここ=同関数より前に置く必要がある。値そのものの意味はSCAN_SYMBOLS等と同じ並びの
+# 下方セクションに集約したいが、参照順の制約でこの位置に置く)。
+ONDEMAND_1M_MAX_DAYS = 93  # 1mの取得量上限(仕様§1.1: 93日≈134k本×銘柄)
+ONDEMAND_1M_CACHE_TTL_SEC = 3600  # 仕様§1.1: st.cache_data ttl=3600
 
 # v6.3: チャート描画の自動間引き上限(1行あたりの最大バー数)。分足×長期間などで
 # 数千〜数万本をSVG描画するとホバーが「かくかく」する(クライアント側の負荷)ため、
@@ -2064,6 +2072,18 @@ def fetch_ccxt_ohlcv_1m(
     return df, _build_fetch_meta(df.attrs.get("actual_source", f"ccxt({exchange_id})"), symbol, df)
 
 
+# 追補v7.2§1.1: data_1m不在環境向けオンデマンド1分足取得。既存_fetch_ccxt_ohlcv_impl
+# (timeframe='1m'固定・地域ブロック時のhyperliquidフォールバック共有)をそのまま使い、
+# fetch_ccxt_ohlcv_1m(ttl=900)とは別枠でttl=3600の専用キャッシュを持つ(仕様§1.1明記のttl値)。
+@st.cache_data(ttl=ONDEMAND_1M_CACHE_TTL_SEC, show_spinner=False)
+def fetch_ondemand_1m_ohlcv(
+    exchange_id: str, symbol: str, since_ms: int, until_ms: int,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    df = _fetch_ccxt_ohlcv_impl(exchange_id, symbol, since_ms, until_ms, timeframe="1m")
+    source = f"オンデマンド取得:ccxt({df.attrs.get('actual_source', exchange_id)})"
+    return df, _build_fetch_meta(source, symbol, df)
+
+
 @st.cache_data(ttl=FINE_CACHE_TTL_SEC, show_spinner=False)
 def fetch_ccxt_ohlcv_fine(
     exchange_id: str, symbol: str, since_ms: int, until_ms: int, timeframe: str,
@@ -3385,29 +3405,50 @@ def render_cross_five_min_breakdown(
         if not crypto_labels:
             st.caption("1分足データ対象外(暗号3銘柄=BTC/ETH/SOLのみ集計可能。選択銘柄に含まれていません)。")
             return
-        with st.spinner("5分毎の内訳を集計中..."):
-            cells, meta = _cross_five_min_cells_multi_cached(
-                tuple(crypto_labels), band, weekday_arg, date_start_, date_end_)
+        if all(data_1m_available(lbl) for lbl in crypto_labels):
+            with st.spinner("5分毎の内訳を集計中..."):
+                cells, meta = _cross_five_min_cells_multi_cached(
+                    tuple(crypto_labels), band, weekday_arg, date_start_, date_end_)
+        else:
+            # #6指摘対処: 銘柄ごとにdata_1m有無が異なる(backfill部分欠損)場合、有る銘柄だけで
+            # ないでなく、無い銘柄だけ個別にオンデマンド取得して補う(平均の黙った縮退を防ぐ)。
+            with st.spinner(ONDEMAND_SPINNER_MSG):
+                cells, meta = _cross_five_min_cells_mixed_multi_cached(
+                    tuple(crypto_labels), band, weekday_arg, date_start_, date_end_)
         excluded = [lbl for lbl in selected_labels if lbl not in SCAN_SYMBOLS]
-        note = f"対象銘柄: {'/'.join(crypto_labels)}の平均" + (
+        ondemand_labels = meta.get("ondemand_labels") or []
+        ondemand_note = f"({'/'.join(ondemand_labels)}はオンデマンド取得で補完)" if ondemand_labels else ""
+        note = f"対象銘柄: {'/'.join(crypto_labels)}の平均{ondemand_note}" + (
             f"({'/'.join(excluded)}は1分足データ対象外のため除外)" if excluded else "")
     elif choice in SCAN_SYMBOLS:
-        with st.spinner("5分毎の内訳を集計中..."):
-            cells, meta = _cross_five_min_cells_cached(choice, band, weekday_arg, date_start_, date_end_)
+        if data_1m_available(choice):
+            with st.spinner("5分毎の内訳を集計中..."):
+                cells, meta = _cross_five_min_cells_cached(choice, band, weekday_arg, date_start_, date_end_)
+        else:
+            if not ondemand_1m_period_ok(date_start_, date_end_):
+                st.info(ONDEMAND_PERIOD_GUIDANCE_MSG)
+                return
+            with st.spinner(ONDEMAND_SPINNER_MSG):
+                cells, meta = _cross_five_min_cells_ondemand_cached(
+                    choice, band, weekday_arg, date_start_, date_end_)
         note = f"対象銘柄: {choice}"
     else:
         st.caption(f"1分足データ対象外(暗号3銘柄=BTC/ETH/SOLのみ対応。{choice}は非対応)。")
         return
 
     if cells.empty:
-        st.info("該当データがありません。")
+        st.info(
+            "この期間・銘柄には1分足データがありません。対象はBTC/ETH/SOL、"
+            "この環境でオンデマンド取得できる期間は最長93日です(期間や銘柄を変えて再試行してください)。"
+        )
         return
     ps, pe = meta.get("period_start"), meta.get("period_end")
     period_str = f"{str(ps)[:10]}〜{str(pe)[:10]}" if ps is not None and pe is not None else "不明"
     wd_note = f"(**{weekday_arg}曜のみ**)" if weekday_arg else ""
+    source_note = " | データ元: オンデマンド取得(ccxt)" if meta.get("ondemand") else ""
     st.caption(
         f"集計期間: {period_str}{wd_note} | {note} | 粒度=5分・{band} | "
-        f"n={meta.get('n_occurrences_used', 0)}(枠合計)"
+        f"n={meta.get('n_occurrences_used', 0)}(枠合計){source_note}"
     )
     st.caption(
         "判定=枠の騰落率がその枠の過去中央値変動を上回るか(データ由来の適応閾値・k=1.0)。"
@@ -3452,12 +3493,14 @@ def render_cross_table_tab(
 
     options = ["全選択銘柄の平均"] + selected_labels
     choice = st.selectbox("銘柄セレクタ", options, key="cross_table_symbol_choice")
+    st.caption("個別銘柄か、選択中の全銘柄平均かを切替えます。")
 
     # 追補v7§2: 曜日フィルタ(大枠・詳細帯・5分内訳の全集計に適用)。既定「全曜日」は無フィルタで
     # 従来どおりstats_a/bをそのまま使う(既定表示の再計算コストは増やさない)。
     weekday_options = ["全曜日"] + WEEKDAY_LABELS
     weekday_sel = st.selectbox("曜日で絞る", weekday_options, key="cross_table_weekday_filter")
     weekday_arg = None if weekday_sel == "全曜日" else weekday_sel
+    st.caption("選ぶと、下の表全体(親表・詳細帯・5分内訳)がその曜日だけで再集計されます。")
     if weekday_arg is not None:
         st.caption(
             "※曜日フィルタは市場統計(騰落率/出来高/ボラティリティ・5分内訳)にのみ適用します"
@@ -3508,12 +3551,14 @@ def render_cross_table_tab(
         vmax = compute_diverging_vmax(cross, DIVERGING_RETURN_COLUMNS)
         parent_df, detail_by_parent = split_cross_table(cross)
         st.dataframe(style_cross_table(parent_df, diverging_vmax=vmax), width="stretch")
+        st.caption("表の色: 騰落率=緑ほど上げ・赤ほど下げ / 勝率=緑ほど高い・赤ほど低い(50%未満は赤系で強調)。")
         for parent in PARENT_ORDER:
             with st.expander(f"{parent} の詳細帯", expanded=False, key=f"cross_expander_{col_title}_{parent}"):
                 st.dataframe(
                     style_cross_table(detail_by_parent[parent], diverging_vmax=vmax), width="stretch"
                 )
                 # 追補v7§2: 詳細帯ごとに「⏱ 5分毎の内訳」トグル(既定OFF・重い集計のため)。
+                st.caption("ONにすると、その帯を5分刻みに分解した表を表示します(対象=BTC/ETH/SOL)。")
                 for band in (b for b in BAND_ORDER if BAND_TO_PARENT[b] == parent):
                     show5 = st.toggle(
                         f"⏱ 5分毎の内訳: {band}", value=False,
@@ -3624,6 +3669,14 @@ def render_chart_tab(
     if not data:
         st.info("サイドバーで銘柄を1つ以上選択してください。")
         return
+    with st.expander("❓ 見方", expanded=False):
+        st.markdown(
+            "- **🌊 ボラチャート**(上段): 期間先頭を0%とした累積騰落率で、銘柄間の値幅を比較\n"
+            "- **💹 価格チャート**(下段): 銘柄ごとの実価格ローソク足\n"
+            "- ホバーすると、その時刻の全銘柄の詳細が1つの箱にまとまって出ます\n"
+            "- 下の**🔍トレードズームビュー**でトレードを1件選ぶと、その前後だけを分足で拡大表示できます"
+            "(「🤝まとめて比較」で他データセットの同局面トレードも重ね描き可能)"
+        )
     st.caption(_period_caption(period))
 
     if timeframe_choice in INTRADAY_INTERVAL_MAP:
@@ -4136,6 +4189,7 @@ def render_session_analysis_tab(
     if not data_a:
         st.info("サイドバーで銘柄を1つ以上選択してください。")
         return
+    st.caption("📈 帯別の騰落率・銘柄間の相関・曜日×時間帯の一括ヒートマップで、市場の癖を俯瞰します。")
 
     def _panel(
         data: dict[str, pd.DataFrame], stats: dict[str, pd.DataFrame], period: tuple[date, date], title: str,
@@ -4485,6 +4539,7 @@ def render_weekday_month_tab(
     追補v4§1.2: 複数トレードデータセット時のみ「トレード統計の対象」selectboxを表示し、
     選択されたデータセットのtrades_assigned/trade_statsを両セクションへ伝播させる。
     """
+    st.caption("📅 曜日ごとの傾向と、長期の月別季節性(3/5/10年)を確認するタブです。")
     trade_labels = list(trade_datasets.keys()) if trade_datasets else []
     if len(trade_labels) >= 2:
         active_trade_label = st.selectbox(
@@ -4567,6 +4622,15 @@ def render_trade_history_tab() -> None:
     if "trade_seen_file_ids" not in st.session_state:
         st.session_state["trade_seen_file_ids"] = set()
     records: list[dict[str, Any]] = st.session_state["trade_dataset_records"]
+
+    with st.expander("❓ CSVの作り方・手順", expanded=False):
+        st.markdown(
+            "① 「テンプレートCSV」をダウンロード\n\n"
+            "② Entry_Time(JST)/Exit_Time(JST)/Symbol/PnL_USD/PnL_Percent/Win_Lossの列を埋める\n\n"
+            "③ 「トレード履歴CSVをアップロード」で読み込み、ラベル(弟子/師匠/任意名)を付ける\n\n"
+            "まず試すだけなら「サンプル(弟子+師匠)を読み込む」ボタンで、実際の市場価格に基づく"
+            "デモデータをすぐ体験できます。詳しい列の仕様は📖使い方ガイドページ参照。"
+        )
 
     col_up, col_tmpl, col_sample = st.columns([2, 1, 1])
     with col_up:
@@ -4923,6 +4987,14 @@ SCAN_REFERENCE_ONLY_MIN_N = 30  # これ未満のnは表示上「参考値」バ
 SCAN_WILSON_Z = 1.959963984540054  # 95%信頼区間のz値(標準正規分布97.5%点)
 SCAN_SYMBOLS: list[str] = ["BTC", "ETH", "SOL"]  # 確率スキャナー対象(data_1m/保有銘柄。仕様§1)
 
+# ---- 追補v7.2§1.1: data_1m不在環境(クラウド)向けオンデマンド1分足取得 -----------------
+# (ONDEMAND_1M_MAX_DAYS/ONDEMAND_1M_CACHE_TTL_SECはL154付近=キャッシュTTL定数群に定義済み。
+# fetch_ondemand_1m_ohlcvのデコレータがモジュール読込時にこの値を要求するための配置)。
+ONDEMAND_SPINNER_MSG = "1分足を取得中(初回は1〜2分かかります)..."
+ONDEMAND_PERIOD_GUIDANCE_MSG = (
+    "期間を90日以内にすると、この環境でも5分内訳を表示できます(1分足を都度取得するため)。"
+)
+
 # ---- 追補v6§4: 経済指標カレンダー照合(純ロジック定数。実HTTP取得はscan_job.py側) ----
 CALENDAR_IMPORTANCE_ORDER: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
 CALENDAR_WINDOW_MINUTES_DEFAULT = 15  # セルの時刻窓に対する前後許容分(仕様§4: ±15分)
@@ -4977,6 +5049,21 @@ def load_1m(label: str, years: Optional[list[int]] = None) -> pd.DataFrame:
     df = df[SCAN_1M_COLS]
     gc.collect()
     return df
+
+
+def data_1m_available(label: str, base_dir: Optional[Path] = None) -> bool:
+    """label用のdata_1mが1件でも存在するか(仕様§1: ライブ/オンデマンド/スナップショット分岐の
+    判定に使う軽量チェック)。load_1mのようにparquetを読み込まず、ファイル存在だけを見るため
+    クラウド環境で毎回無駄なI/Oを発生させない。base_dirはselftestでのテスト用差し替え引数。
+    """
+    d = (base_dir if base_dir is not None else DATA_1M_DIR) / label
+    return d.exists() and any(d.glob("*.parquet"))
+
+
+def ondemand_1m_period_ok(start_date_: date, end_date_: date, max_days: int = ONDEMAND_1M_MAX_DAYS) -> bool:
+    """仕様§1.1: オンデマンド1分足取得のガード条件(期間<=max_days日。_period_captionと同じ
+    日数定義=(end-start).daysを使う)。純ロジック(st非依存)。"""
+    return (end_date_ - start_date_).days <= max_days
 
 
 def scan_slot_label(slot_index: int, freq_minutes: int) -> str:
@@ -5566,6 +5653,67 @@ def load_scan_commentary(path: Path = SCAN_COMMENTARY_PATH) -> Optional[dict[str
         return None
 
 
+# ---- 追補v7.2§1.2: data_1m不在環境向けカレンダービュー・スナップショット(scan_job.py --calendar-cells
+# が書き出すcalendar_cells.json)。scan_results.jsonと同じ「不在/壊れはNoneを返し呼び出し側で案内」
+# 流儀を踏襲する。 -----------------------------------------------------------------------------
+CALENDAR_CELLS_PATH = Path(__file__).parent / "calendar_cells.json"
+
+
+def load_calendar_cells_snapshot(path: Path = CALENDAR_CELLS_PATH) -> Optional[dict[str, Any]]:
+    """calendar_cells.jsonを読み込む(不在/壊れている場合はNone。load_scan_resultsと同じ流儀)。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def calendar_cells_snapshot_lookup(
+    snapshot: Optional[dict[str, Any]], label: str, month: Optional[int], freq_minutes: int,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """calendar_cells.json全体dictから指定(銘柄,月,粒度)のcells/metaを取り出す(仕様§1.2)。
+    月キーはNone→"all"、1〜12→str(month)。粒度キーはstr(freq_minutes)。該当なしは空(空DataFrame,{})。
+    値の変換はscan_cells_from_json_dictと同じ(=scan_job.py側もscan_cells_to_json_dictで書く)。
+    """
+    if not snapshot:
+        return pd.DataFrame(), {}
+    sym = (snapshot.get("symbols") or {}).get(label)
+    if not sym:
+        return pd.DataFrame(), {}
+    freq_bucket = sym.get(str(freq_minutes))
+    if not freq_bucket:
+        return pd.DataFrame(), {}
+    month_key = "all" if month is None else str(month)
+    entry = freq_bucket.get(month_key)
+    if entry is None:
+        return pd.DataFrame(), {}
+    return scan_cells_from_json_dict(entry)
+
+
+def calendar_data_mode(data_1m_ok: bool, snapshot: Optional[dict[str, Any]]) -> str:
+    """仕様§1.2の3分岐判定(純ロジック・st非依存): ①data_1mあり→'live' ②無いがsnapshot
+    (load_calendar_cells_snapshotの戻り値)あり→'snapshot' ③どちらも無し→'none'。"""
+    if data_1m_ok:
+        return "live"
+    if snapshot is not None:
+        return "snapshot"
+    return "none"
+
+
+def format_snapshot_updated_at(updated_at_iso: Optional[str]) -> str:
+    """calendar_cells.jsonのmeta.updated_at(ISO8601文字列)を「◯月◯日 ◯時」表記へ整形する
+    (仕様§1.2の📸スナップショット表示キャプション用・純ロジック)。パース不能/Noneは「不明」。"""
+    if not updated_at_iso:
+        return "不明"
+    try:
+        ts = pd.Timestamp(updated_at_iso)
+    except (ValueError, TypeError):
+        return "不明"
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert("Asia/Tokyo")
+    return ts.strftime("%m月%d日 %H時")
+
+
 def scan_results_symbol_frame(results: Optional[dict[str, Any]], label: str) -> tuple[pd.DataFrame, dict[str, Any]]:
     """scan_results.json全体dictから指定銘柄のcells/metaを取り出す(不在時は空)。"""
     if results is None:
@@ -5901,6 +6049,68 @@ def _cross_five_min_cells_multi_cached(
         date_range=(date_start_, date_end_))
 
 
+@st.cache_data(ttl=ONDEMAND_1M_CACHE_TTL_SEC, show_spinner=False)
+def _cross_five_min_cells_ondemand_cached(
+    label: str, band: str, weekday: Optional[str], date_start_: date, date_end_: date,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """仕様§1.1: data_1m不在環境向け「⏱ 5分毎の内訳」オンデマンド版(_cross_five_min_cells_cached
+    のccxt直取得版)。呼び出し側は事前にondemand_1m_period_ok()で期間ガード済みであること。
+    取得失敗(ネットワーク/取引所エラー)はクラッシュさせず空セルを返す(呼び出し側で案内表示)。"""
+    routing = get_symbol_routing(label)
+    since_ms = _jst_date_to_utc_ms(date_start_)
+    until_ms = _jst_date_to_utc_ms(date_end_ + timedelta(days=1))
+    try:
+        df, fetch_meta = fetch_ondemand_1m_ohlcv(routing["exchange"], routing["ticker"], since_ms, until_ms)
+    except Exception:  # noqa: BLE001 - 取得失敗は空データ扱い(仕様§1.1: 画面を落とさない)
+        df, fetch_meta = pd.DataFrame(columns=SCAN_1M_COLS), {}
+    empty_meta = {
+        "band": band, "weekday_filter": weekday or "全曜日", "freq_minutes": 5,
+        "period_start": date_start_, "period_end": date_end_, "n_missing_groups": 0,
+        "n_total_groups": 0, "n_occurrences_used": 0, "updated_at": datetime.now(JST),
+        "ondemand": True, "fetch_source": fetch_meta.get("source"),
+    }
+    if df.empty:
+        return pd.DataFrame(), empty_meta
+    cells, meta = compute_five_min_band_stats(df, band, weekday=weekday, date_range=(date_start_, date_end_))
+    meta["ondemand"] = True
+    meta["fetch_source"] = fetch_meta.get("source")
+    return cells, meta
+
+
+@st.cache_data(ttl=ONDEMAND_1M_CACHE_TTL_SEC, show_spinner=False)
+def _cross_five_min_cells_mixed_multi_cached(
+    labels: tuple[str, ...], band: str, weekday: Optional[str], date_start_: date, date_end_: date,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """仕様§1.1(#6指摘対処): 「全選択銘柄の平均」時、data_1mの有無が銘柄ごとに異なる(backfill
+    途中の部分欠損)場合でも銘柄ごとに個別判定する。有る銘柄はライブ・無い銘柄はオンデマンド取得
+    (期間>93日なら空扱い)で補い、平均が該当銘柄ごと黙って縮退しないようにする。オンデマンド
+    対象銘柄はmeta["ondemand_labels"]に記録し呼び出し側で注記する。"""
+    dfs: dict[str, pd.DataFrame] = {}
+    ondemand_labels: list[str] = []
+    for lbl in labels:
+        if data_1m_available(lbl):
+            dfs[lbl] = _scan_load_1m_cached(lbl)
+            continue
+        ondemand_labels.append(lbl)
+        if not ondemand_1m_period_ok(date_start_, date_end_):
+            dfs[lbl] = pd.DataFrame(columns=SCAN_1M_COLS)
+            continue
+        routing = get_symbol_routing(lbl)
+        since_ms = _jst_date_to_utc_ms(date_start_)
+        until_ms = _jst_date_to_utc_ms(date_end_ + timedelta(days=1))
+        try:
+            df, _fm = fetch_ondemand_1m_ohlcv(routing["exchange"], routing["ticker"], since_ms, until_ms)
+        except Exception:  # noqa: BLE001 - 取得失敗は空データ扱い(他銘柄は継続)
+            df = pd.DataFrame(columns=SCAN_1M_COLS)
+        dfs[lbl] = df
+    cells, meta = compute_five_min_band_stats_multi(
+        dfs, band, weekday=weekday, date_range=(date_start_, date_end_))
+    if ondemand_labels:
+        meta["ondemand_labels"] = ondemand_labels
+        meta["ondemand"] = True  # 単一銘柄オンデマンド経路(6075行)と同じ規約でcaptionのsource_note連動
+    return cells, meta
+
+
 def slice_1m_window_for_occurrence(
     df_1m: pd.DataFrame, occurrence_date: Any, slot: int, freq_minutes: int, pad_minutes: int = 30,
 ) -> pd.DataFrame:
@@ -6099,6 +6309,7 @@ def render_scan_ranking_view(results: dict[str, Any]) -> None:
     追補v7§4(ユーザー指示=探索優先・FDRや最低nで表示をブロックしない): 既定値を緩和
     (最低n 30→5・FDRトグル既定OFF)。免責/n/CI/fdr_q列は残し、表示は正直だが遮断はしない。
     """
+    st.caption("銘柄・曜日・セッション・月で絞り込み、下の最低n・統計優位トグルでさらに絞れます。")
     f1, f2, f3, f4 = st.columns(4)
     symbols_sel = f1.multiselect("銘柄", SCAN_SYMBOLS, default=SCAN_SYMBOLS, key="scan_rank_symbols")
     weekday_sel = f2.selectbox("曜日", ["(全曜日)"] + WEEKDAY_LABELS, key="scan_rank_weekday")
@@ -6130,7 +6341,11 @@ def render_scan_ranking_view(results: dict[str, Any]) -> None:
         if warn_msg:
             st.caption(f"⚠️ {lbl}: {warn_msg}")
     if not frames:
-        st.warning("該当データがありません(スキャン結果未生成、またはこの銘柄のデータ不足)。")
+        st.warning(
+            "選択した銘柄・月にはランキング表示できるセルがありません"
+            "(scan_job.pyのスキャン結果が未生成、またはこの銘柄・月のデータが不足しています。"
+            "銘柄・月・最低nの条件を変えて再試行してください)。"
+        )
         return
     all_cells = pd.concat(frames, ignore_index=True)
 
@@ -6173,13 +6388,24 @@ def _scan_calendar_cells_cached(
         df, month=month, freq_minutes=freq_minutes, precomputed_occ=(occ, occ_meta))
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def _load_calendar_cells_snapshot_cached() -> Optional[dict[str, Any]]:
+    """load_calendar_cells_snapshotのUIキャッシュラッパ(#4指摘: 45MB JSONを未キャッシュのまま
+    毎rerun読み直していた対策)。ttl=1800秒=30分は1日4回更新cadenceに対して十分短い。純関数
+    load_calendar_cells_snapshot自体は@st.cache_data無しでselftestからpath引数付きで直接
+    呼べる状態を保つ(_scan_load_1m_cachedと同じ流儀)。"""
+    return load_calendar_cells_snapshot()
+
+
 SCAN_CALENDAR_FREQ_LABELS: dict[str, int] = {"30分": 30, "1時間": 60}
 
 
 def render_scan_calendar_view() -> None:
-    """⚡確率スキャナー: 🗓️カレンダービュー本体(追補v7§1)。月×銘柄×粒度→曜日×時間帯の
-    カレンダーグリッド。scan_results.jsonでなくdata_1mから直接オンデマンド集計(月フィルタの
-    柔軟性のため)。月指定時はnが減る旨をヘッダに1行注記するのみで表示はブロックしない。"""
+    """⚡確率スキャナー: 🗓️カレンダービュー本体(追補v7§1・v7.2§1.2)。月×銘柄×粒度→曜日×
+    時間帯のカレンダーグリッド。①data_1mがあればライブ集計(従来) ②無ければcalendar_cells.json
+    (scan_job.py --calendar-cellsが書出。1日4回更新想定)のスナップショット ③どちらも無ければ
+    案内、の3分岐(仕様§1.2)。月指定時はnが減る旨をヘッダに1行注記するのみで表示はブロックしない。"""
+    st.caption("月×銘柄×粒度を選ぶと、その組み合わせの曜日×時間帯カレンダーが表示されます。")
     c1, c2, c3 = st.columns(3)
     month_labels = ["(全月合算)"] + [f"{m}月" for m in MONTH_ORDER]
     month_sel = c1.selectbox("月", month_labels, key="scan_cal_month")
@@ -6188,10 +6414,33 @@ def render_scan_calendar_view() -> None:
     freq_label = c3.selectbox("粒度", list(SCAN_CALENDAR_FREQ_LABELS.keys()), key="scan_cal_freq")
     freq_minutes = SCAN_CALENDAR_FREQ_LABELS[freq_label]
 
-    with st.spinner(f"{symbol_sel}の1分足を集計中..."):
-        cells, meta = _scan_calendar_cells_cached(symbol_sel, month_val, freq_minutes)
+    live_ok = data_1m_available(symbol_sel)
+    snapshot = None if live_ok else _load_calendar_cells_snapshot_cached()
+    data_mode = calendar_data_mode(live_ok, snapshot)
+
+    if data_mode == "none":
+        st.info(
+            "この環境ではカレンダー用データがありません(1分足・スナップショットとも未配置)。"
+            "本家ダッシュボード(READMEのURL参照)なら同じ画面をライブ集計で確認できます。"
+        )
+        return
+    if data_mode == "live":
+        with st.spinner(f"{symbol_sel}の1分足を集計中..."):
+            cells, meta = _scan_calendar_cells_cached(symbol_sel, month_val, freq_minutes)
+    else:
+        cells, meta = calendar_cells_snapshot_lookup(snapshot, symbol_sel, month_val, freq_minutes)
+
     if cells.empty:
-        st.warning(f"{symbol_sel}の該当データがありません(月フィルタ={month_sel})。")
+        if data_mode == "snapshot":
+            st.info(
+                f"{symbol_sel}・{month_sel}・{freq_label}のスナップショットがありません"
+                "(サーバー側の集計対象外の可能性。月や粒度を変えて再試行してください)。"
+            )
+        else:
+            st.info(
+                f"{symbol_sel}の{month_sel}には1分足データがありません"
+                "(対象銘柄はBTC/ETH/SOL、対象期間は2021年以降です。月や銘柄を変えて再試行してください)。"
+            )
         return
 
     ps, pe = meta.get("period_start"), meta.get("period_end")
@@ -6201,10 +6450,18 @@ def render_scan_calendar_view() -> None:
     # 月を選択した場合はクロス表タブの曜日フィルタ表示(例: (**月曜のみ**))と同じ流儀で
     # 「集計期間中この月だけを対象にした」ことを期間表示自体に明記する(掟6)。
     month_note = f"(**{month_sel}のみ**)" if month_val is not None else ""
-    st.caption(
-        f"集計期間: {period_str}{month_note}(データ元: data_1m/{symbol_sel}/・1分足) | "
-        f"集計に使った全枠合計オカレンスn={n_occ}件 | 粒度={freq_label}"
-    )
+    if data_mode == "snapshot":
+        snap_str = format_snapshot_updated_at((snapshot or {}).get("meta", {}).get("updated_at"))
+        st.caption(
+            f"📸 スナップショット表示({snap_str}時点・サーバーが定期的に再計算) | "
+            f"集計期間: {period_str}{month_note} | データ元: calendar_cells.json({symbol_sel}) | "
+            f"集計に使った全枠合計オカレンスn={n_occ}件 | 粒度={freq_label}"
+        )
+    else:
+        st.caption(
+            f"集計期間: {period_str}{month_note}(データ元: data_1m/{symbol_sel}/・1分足) | "
+            f"集計に使った全枠合計オカレンスn={n_occ}件 | 粒度={freq_label}"
+        )
     warn_msg = scan_month_filter_warning(month_val, n_occ)
     if warn_msg:
         st.caption(f"⚠️ {warn_msg}(個々のセルのnはセル内に併記)")
@@ -6230,14 +6487,32 @@ def _scan_load_1m_cached(label: str) -> pd.DataFrame:
     return load_1m(label)
 
 
+def scan_cell_detail_unavailable_msg(symbol: str) -> str:
+    """セル詳細ビュー(仕様§5)がdata_1m不在環境で無説明の空表示になっていた問題への対処
+    (#1指摘)。過去オカレンス一覧・5分ブロック内訳・ズームビューは全履歴を要するため93日上限の
+    オンデマンド取得では代替できず、理由+対処を明記したメッセージで案内する(純ロジック・
+    selftest対象。st非依存)。"""
+    return (
+        f"この環境には{symbol}の1分足データがないため、過去オカレンス一覧・5分ブロック内訳・"
+        "ズームビューは表示できません(全履歴を読み込む必要があり、この環境で使えるオンデマンド"
+        "取得の上限93日では代替できません)。直近93日以内の傾向は「クロス表」タブの"
+        "「⏱ 5分毎の内訳」(オンデマンド取得)で確認できます。全履歴を見るには1分足データを"
+        "持つ環境(ローカル/Oracle本家ダッシュボード)をご利用ください。"
+    )
+
+
 def render_scan_cell_detail_view(results: dict[str, Any]) -> None:
     """⚡確率スキャナー: セル詳細ビュー本体(仕様§5)。過去オカレンス+5分内訳+ズーム+コメント。"""
+    st.caption("銘柄・曜日・時間枠を選ぶと、そのセルの過去オカレンス一覧と5分内訳が表示されます。")
     d1, d2, d3 = st.columns(3)
     symbol_sel = d1.selectbox("銘柄", SCAN_SYMBOLS, key="scan_detail_symbol")
     weekday_sel = d2.selectbox("曜日", WEEKDAY_LABELS, key="scan_detail_weekday")
     cells, meta = scan_cells_for_symbol(symbol_sel, results, None)
     if cells.empty:
-        st.warning(f"{symbol_sel}のスキャン結果がありません。")
+        st.warning(
+            f"{symbol_sel}のスキャン結果がありません"
+            "(scan_job.py --run(または--dry)を再実行するとこの銘柄のスキャン結果が生成されます)。"
+        )
         return
     sub = cells[cells["weekday"] == weekday_sel].sort_values("slot")
     slot_options = list(zip(sub["slot"], sub["time_range"]))
@@ -6264,6 +6539,10 @@ def render_scan_cell_detail_view(results: dict[str, Any]) -> None:
     if row.get("calendar_flag"):
         st.caption(str(row["calendar_flag"]) + "(指標はボラ拡大させるが方向は予測不可・検証済み知見)")
 
+    if not data_1m_available(symbol_sel):
+        st.info(scan_cell_detail_unavailable_msg(symbol_sel))
+        return
+
     with st.spinner(f"{symbol_sel}の1分足を読み込み中..."):
         df_1m = _scan_load_1m_cached(symbol_sel)
     occ, _occ_meta = build_scan_occurrences(df_1m, 30)
@@ -6272,7 +6551,10 @@ def render_scan_cell_detail_view(results: dict[str, Any]) -> None:
         f"過去オカレンス: {len(occ_sel)}件 | 集計期間: {meta.get('period_start')} 〜 {meta.get('period_end')}"
     )
     if occ_sel.empty:
-        st.info("オカレンスがありません。")
+        st.info(
+            f"この曜日・時間枠には過去オカレンスがありません({symbol_sel}のデータ範囲内では"
+            "未発生。曜日や時間枠を変えると表示できる場合があります)。"
+        )
         return
     occ_display = occ_sel.copy()
     occ_display["date"] = occ_display["date"].astype(str)
@@ -6298,7 +6580,10 @@ def render_scan_cell_zoom_and_commentary(
     occ5, _ = build_scan_occurrences(df_1m, 5)
     breakdown = compute_five_min_breakdown(occ5, weekday_sel, slot_idx)
     if breakdown.empty:
-        st.info("5分内訳データがありません。")
+        st.info(
+            "この曜日・時間枠は5分粒度に分解すると有効なオカレンス数が最低本数に届かず、"
+            "内訳を計算できませんでした(別の曜日・時間枠を選ぶと表示できる場合があります)。"
+        )
     else:
         # P(上昇)/P(下降)にWilson 95%CIを併記(仕様§0-1・ランキング表と同じ_scan_fmt_ci流儀。
         # 値自体はcompute_five_min_breakdown内で既に計算済みだったが表示列から漏れていた)。
@@ -6320,7 +6605,10 @@ def render_scan_cell_zoom_and_commentary(
     date_sel = occ_sel["date"].iloc[date_labels.index(date_sel_label)]
     window_df = slice_1m_window_for_occurrence(df_1m, date_sel, slot_idx, 30)
     if window_df.empty:
-        st.info("該当窓の1分足データがありません。")
+        st.info(
+            "選択した日のこの時間枠は、読み込み済みの1分足データの範囲外です"
+            "(データ境界付近の可能性。別のオカレンス日を選ぶと表示できます)。"
+        )
     else:
         fig = go.Figure(data=go.Candlestick(
             x=window_df.index, open=window_df["open"], high=window_df["high"],
@@ -6425,6 +6713,10 @@ def render_scan_tab() -> None:
     )
     if not view:  # segmented_controlは選択解除でNoneを返す(既存v6流儀に合わせる)
         view = SCAN_VIEW_LABELS[0]
+    st.caption(
+        "🏆ランキング=条件で並べ替えて探す / 🗓️カレンダー=月×曜日×時間の癖を一覧 / "
+        "🔍セル詳細=気になるセルの過去の実例を深掘り"
+    )
 
     if view == SCAN_VIEW_LABELS[1]:
         render_scan_calendar_view()
@@ -6476,6 +6768,15 @@ def main() -> None:
 
     today = date.today()
 
+    # 追補v7.2§2-1: サイドバー最上部の3ステップガイド(既定閉・押し付けがましくないUI)。
+    with st.sidebar.expander("❓ このダッシュボードの使い方(3ステップ)", expanded=False):
+        st.markdown(
+            "① 下の①〜④で**期間と銘柄**を選ぶ\n\n"
+            "② 表示セクション(タブ)で**市場の癖**を見る(クロス表/チャート/セッション分析 等)\n\n"
+            "③ 📒トレード履歴タブで**トレードCSVを読み込む**と、自分の成績が市場の癖に重なって見える\n\n"
+            "もっと詳しく知りたい場合は、左メニューの「📖 使い方ガイド」ページへ。"
+        )
+
     # ------------------------------------------------------------------
     # サイドバー: §3-1 期間選択
     # ------------------------------------------------------------------
@@ -6520,6 +6821,7 @@ def main() -> None:
         st.sidebar.warning("開始日が終了日より後だったため、開始日=終了日に補正しました。")
 
     compare_mode = st.sidebar.toggle("比較モード (Period A / B)", key="compare_mode")
+    st.sidebar.caption("ONで2つの期間(A/B)を同時に集計し、各タブへ並べて比較表示します。")
     date_start_b: Optional[date] = None
     date_end_b: Optional[date] = None
     if compare_mode:
@@ -6618,6 +6920,7 @@ def main() -> None:
         "背景帯の濃さ", min_value=5, max_value=70, value=25, step=5,
         key="bg_opacity_pct", disabled=not show_bg_toggle,
     )
+    st.sidebar.caption("チャートのセッション背景色の濃さ(表示期間が14日を超えると自動的に非表示)。")
     bg_opacity = bg_opacity_pct / 100.0
     show_bg = show_bg_toggle
     if period_days > 120:
@@ -6633,6 +6936,7 @@ def main() -> None:
         "トレードマーカー表示", value=True, key="show_trade_markers",
         help="チャートにエントリー▲/決済✕マーカーを重ねる(トレードCSV読込時のみ有効)。",
     )
+    st.sidebar.caption("ONでチャートにエントリー▲/決済✕を重ね描き(トレードCSV読込済みの時だけ有効)。")
     selected_marker_labels: list[str] = []
     if show_trade_markers and trade_ds_labels_for_ui:
         if len(trade_ds_labels_for_ui) > 1:
@@ -8904,6 +9208,93 @@ def run_selftest() -> bool:
           and not df_gc_21.index.isna().any()
           and df_gc_21.index.is_monotonic_increasing,
           f"rows={len(df_gc_21)} dtypes={[str(df_gc_21[c].dtype) for c in SCAN_1M_COLS]}")
+
+    print("\n--- 22. 追補v7.2§1: データ不在環境対応(純ロジック) ---")
+
+    # 22-1: data_1m_available(base_dir差し替え・実parquet読込なしの存在チェックのみ)
+    with tempfile.TemporaryDirectory() as td_22a:
+        empty_dir_22 = Path(td_22a)
+        check("22-1a data_1m_available: 対象銘柄ディレクトリが無ければFalse",
+              data_1m_available("BTC", base_dir=empty_dir_22) is False)
+        sub_22 = empty_dir_22 / "BTC"
+        sub_22.mkdir()
+        check("22-1b data_1m_available: ディレクトリはあるがparquetが無ければFalse",
+              data_1m_available("BTC", base_dir=empty_dir_22) is False)
+        (sub_22 / "2026.parquet").write_bytes(b"x")
+        check("22-1c data_1m_available: parquetファイルが1件でもあればTrue",
+              data_1m_available("BTC", base_dir=empty_dir_22) is True)
+
+    # 22-2: ondemand_1m_period_ok(仕様§1.1: オンデマンド取得の期間上限=93日)
+    d0_22 = date(2026, 1, 1)
+    check("22-2a ちょうど93日はOK(境界)", ondemand_1m_period_ok(d0_22, d0_22 + timedelta(days=93)) is True)
+    check("22-2b 94日はNG(上限超過)", ondemand_1m_period_ok(d0_22, d0_22 + timedelta(days=94)) is False)
+    check("22-2c 0日(同日)はOK", ondemand_1m_period_ok(d0_22, d0_22) is True)
+    check("22-2d ガイダンス文言に「90日以内」「1分足」の案内が明記されている(仕様§1.1)",
+          "90日以内" in ONDEMAND_PERIOD_GUIDANCE_MSG and "1分足" in ONDEMAND_PERIOD_GUIDANCE_MSG,
+          f"msg={ONDEMAND_PERIOD_GUIDANCE_MSG!r}")
+
+    # 22-3: calendar_data_mode(仕様§1.2の3分岐。data_1mありなら常にlive優先)
+    check("22-3a data_1mあり→'live'(snapshot無しでも)", calendar_data_mode(True, None) == "live")
+    check("22-3b data_1mあり→'live'(snapshotがあっても優先はlive)",
+          calendar_data_mode(True, {"symbols": {}}) == "live")
+    check("22-3c data_1m無しだがsnapshotあり→'snapshot'",
+          calendar_data_mode(False, {"symbols": {}}) == "snapshot")
+    check("22-3d 両方無し→'none'", calendar_data_mode(False, None) == "none")
+
+    # 22-4: format_snapshot_updated_at(ISO8601→「◯月◯日 ◯時」JST表記・不能時は「不明」)
+    check("22-4a JST ISO文字列を「MM月DD日 HH時」に整形",
+          format_snapshot_updated_at("2026-07-18T13:05:00+09:00") == "07月18日 13時",
+          f"got={format_snapshot_updated_at('2026-07-18T13:05:00+09:00')!r}")
+    check("22-4b UTC ISO文字列はJSTへ変換してから整形(13:05Z→22:05 JST)",
+          format_snapshot_updated_at("2026-07-18T13:05:00+00:00") == "07月18日 22時",
+          f"got={format_snapshot_updated_at('2026-07-18T13:05:00+00:00')!r}")
+    check("22-4c None入力は「不明」", format_snapshot_updated_at(None) == "不明")
+    check("22-4d 空文字列は「不明」", format_snapshot_updated_at("") == "不明")
+    check("22-4e パース不能な文字列は「不明」(クラッシュしない)",
+          format_snapshot_updated_at("not-a-date") == "不明")
+
+    # 22-5: calendar_cells_snapshot_lookup+load_calendar_cells_snapshotのend-to-end roundtrip
+    # (scan_job.py側SJ-7の書き手とセットのapp.py読み手単体確認・合成1分足のみでparquet非依存)。
+    # 30分粒度の有効グループには>=15本(scan_min_bars_for_valid_group)必要なため各日20本用意する
+    # (2026-07-18修正: 旧10本はscan_min_bars_for_valid_group(30)=15未満で全グループが欠測扱いになり
+    # cells_22が常に空になっていた=下の22-5bが本文側でなくフィクスチャ不足で失敗していたバグ)。
+    dates_22 = [pd.Timestamp("2026-01-05"), pd.Timestamp("2026-01-12")]
+    bars_22 = pd.concat([
+        pd.DataFrame({"open": [100.0] * 20, "high": [100.2] * 20, "low": [99.8] * 20,
+                      "close": [100.1] * 20, "volume": [1.0] * 20},
+                     index=pd.date_range(d + pd.Timedelta(hours=9), periods=20, freq="1min"))
+        for d in dates_22]).sort_index()
+    cells_22, meta_22 = compute_month_calendar_cells(bars_22, month=None, freq_minutes=30)
+    snapshot_22 = {
+        "meta": {"updated_at": "2026-07-18T04:00:00+09:00", "generated_by": "test"},
+        "symbols": {"BTC": {"30": {"all": scan_cells_to_json_dict(cells_22, meta_22)}}},
+    }
+    with tempfile.TemporaryDirectory() as td_22b:
+        p_22 = Path(td_22b) / "calendar_cells.json"
+        p_22.write_text(json.dumps(snapshot_22), encoding="utf-8")
+        loaded_22 = load_calendar_cells_snapshot(p_22)
+        check("22-5a load_calendar_cells_snapshot: 書出したJSONを復元できる", loaded_22 is not None)
+        cells_rt_22, _meta_rt_22 = calendar_cells_snapshot_lookup(loaded_22, "BTC", None, 30)
+        check("22-5b calendar_cells_snapshot_lookup: BTC/全月/30分でセルを取得できる(空でない)",
+              not cells_rt_22.empty, f"rows={len(cells_rt_22)}")
+        check("22-5c 未収録銘柄(ETH)の照会は空DataFrame",
+              calendar_cells_snapshot_lookup(loaded_22, "ETH", None, 30)[0].empty)
+        check("22-5d 未収録粒度(60分)の照会は空DataFrame",
+              calendar_cells_snapshot_lookup(loaded_22, "BTC", None, 60)[0].empty)
+        check("22-5e 未収録月(7月)の照会は空DataFrame",
+              calendar_cells_snapshot_lookup(loaded_22, "BTC", 7, 30)[0].empty)
+        check("22-5f 壊れたJSON(不正構文)の読込はNone(クラッシュしない)",
+              load_calendar_cells_snapshot(Path(td_22b) / "missing.json") is None)
+    check("22-5g calendar_cells_snapshot_lookup: snapshot=Noneは空DataFrame",
+          calendar_cells_snapshot_lookup(None, "BTC", None, 30)[0].empty)
+
+    # 22-6: scan_cell_detail_unavailable_msg(#1指摘対処: セル詳細ビューのdata_1m不在案内)。
+    msg_22_btc = scan_cell_detail_unavailable_msg("BTC")
+    check("22-6a 銘柄名が本文に含まれる", "BTC" in msg_22_btc, f"msg={msg_22_btc!r}")
+    check("22-6b 理由(1分足データが無い旨)が明記されている", "1分足データがない" in msg_22_btc)
+    check("22-6c 対処(クロス表5分内訳への誘導)が明記されている",
+          "5分毎の内訳" in msg_22_btc and "93日" in msg_22_btc)
+    check("22-6d 別銘柄でも銘柄名が正しく差し替わる", "ETH" in scan_cell_detail_unavailable_msg("ETH"))
 
     print("\n" + "=" * 78)
     if all_ok:
