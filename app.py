@@ -597,6 +597,190 @@ def _lacks_time_component(v: Any) -> bool:
     return _TIME_COMPONENT_RE.search(str(v)) is None
 
 
+# ============ ブローカー明細エクスポートの取り込み(BingX・2026-07-21) ============
+# BingXは「注文履歴(Order History)」=Open/Close個別約定、「取引履歴(Transaction History)」
+# =入出金/実現損益/手数料の明細、の2種をエクスポートできる。どちらもアプリ内部形式
+# (1行=1完結トレード)ではないため、ここでポジション会計により往復トレードへ再構築する。
+_BINGX_SYNTH_MAP = {
+    "NCCOGOLD2USD": "GOLD", "NCCOSILVER2USD": "SILVER", "NCCOXAG2USD": "SILVER",
+    "NCCOOILWTI2USD": "WTI", "NCCO1OILWTI2USD": "WTI",
+    "NCCOOILBRENT2USD": "BRENT", "NCCO1OILBRENT2USD": "BRENT",
+    "NCSINASDAQ1002USD": "NASDAQ", "NCSINIKKEI2252USD": "NIKKEI", "NCSISP5002USD": "SP500",
+}
+
+
+def _bingx_symbol(pair: Any) -> str:
+    """'XAUT-USDT'→'XAUT'、合成銘柄'NCCOGOLD2USD-USDT'→'GOLD'等へ正規化。"""
+    base = str(pair).strip().upper()
+    for suf in ("-USDT", "-USD", "USDT"):
+        if base.endswith(suf):
+            base = base[: -len(suf)]
+            break
+    base = base.rstrip("-")
+    return _BINGX_SYNTH_MAP.get(base, base)
+
+
+def _bingx_parse_lev(v: Any) -> Optional[int]:
+    """'50X'→50 / '1X'→1 / '1'→1 / 空→None。"""
+    s = str(v).strip().upper().rstrip("X")
+    try:
+        return int(float(s))
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_bingx_order_history(cols) -> bool:
+    c = {str(x).strip().lower() for x in cols}
+    return {"type", "pair", "realized pnl"}.issubset(c) and any("time" in x for x in c)
+
+
+def _is_bingx_transaction_history(cols) -> bool:
+    c = {str(x).strip().lower() for x in cols}
+    return {"type", "details", "amount", "futures"}.issubset(c) and any("time" in x for x in c)
+
+
+def reconstruct_bingx_order_history(df: pd.DataFrame) -> tuple[pd.DataFrame, list[tuple[str, str]]]:
+    """BingX注文履歴(Open/Close個別約定)→往復トレードへ再構築。
+    ポジション会計: Openで数量・加重平均建値・建玉時刻を集約、CloseでRealized PNLを確定損益とし、
+    エントリー=集約平均建値/建玉時刻、エグジット=当該Closeの約定価格/時刻で1トレードを発行する
+    (部分決済は複数トレードになる=各実現イベントが1トレード)。ヘッジ(Long/Short)は別建玉。
+    時刻はUTC+8→JST(+1h)。損益はRealized PNL列(手数料別)。"""
+    cmap = {str(c).strip().lower(): c for c in df.columns}
+
+    def col(*names):
+        for n in names:
+            if n in cmap:
+                return cmap[n]
+        return None
+
+    c_time = col("time(utc+8)", "time(utc+0)", "time(utc)", "time")
+    c_pair = col("pair", "symbol")
+    c_type = cmap.get("type")
+    c_qty = col("quantity", "amount", "qty", "size")
+    c_deal = col("dealprice", "avgprice", "price")
+    c_lev = cmap.get("leverage")
+    c_pnl = col("realized pnl", "realized pnl(usdt)", "realizedpnl")
+    tmp = df.copy()
+    tmp["_t"] = pd.to_datetime(tmp[c_time], errors="coerce")
+    tmp = tmp.sort_values("_t", kind="stable")
+    pos: dict = {}
+    trades: list = []
+    orphan = 0
+    for _, r in tmp.iterrows():
+        parts = str(r[c_type]).replace("　", " ").split()
+        if len(parts) < 2:
+            continue
+        act, side = parts[0].capitalize(), parts[-1].capitalize()
+        if act not in ("Open", "Close") or side not in ("Long", "Short"):
+            continue
+        pair = r[c_pair]
+        try:
+            q = float(r[c_qty])
+        except (TypeError, ValueError):
+            q = 0.0
+        try:
+            px = float(r[c_deal])
+        except (TypeError, ValueError):
+            px = 0.0
+        lev = _bingx_parse_lev(r[c_lev]) if c_lev else None
+        t = r["_t"]
+        key = (str(pair), side)
+        if act == "Open":
+            st_ = pos.setdefault(key, {"qty": 0.0, "cost": 0.0, "open_time": t, "lev": lev})
+            if st_["qty"] <= 1e-12:
+                st_["open_time"] = t
+                st_["lev"] = lev
+            st_["qty"] += q
+            st_["cost"] += q * px
+        else:
+            try:
+                rpnl = float(r[c_pnl]) if c_pnl else 0.0
+            except (TypeError, ValueError):
+                rpnl = 0.0
+            sgn = 1.0 if side == "Long" else -1.0
+            st_ = pos.get(key)
+            if st_ and st_["qty"] > 1e-12 and px > 0:
+                avg = st_["cost"] / st_["qty"]
+                cq = min(q, st_["qty"])
+                trades.append({
+                    "Entry_Time": st_["open_time"], "Exit_Time": t,
+                    "Symbol": _bingx_symbol(pair), "PnL_USD": rpnl,
+                    "PnL_Percent": (px / avg - 1.0) * 100.0 * sgn if avg else None,
+                    "Win_Loss": "win" if rpnl > 0 else "loss", "Side": side.upper(),
+                    "Leverage": st_["lev"], "Entry_Price": avg, "Exit_Price": px})
+                st_["qty"] -= cq
+                st_["cost"] -= cq * avg
+                if st_["qty"] <= 1e-12:
+                    st_["qty"] = 0.0
+                    st_["cost"] = 0.0
+            else:
+                orphan += 1
+                trades.append({
+                    "Entry_Time": t, "Exit_Time": t, "Symbol": _bingx_symbol(pair),
+                    "PnL_USD": rpnl, "PnL_Percent": None,
+                    "Win_Loss": "win" if rpnl > 0 else "loss", "Side": side.upper(),
+                    "Leverage": lev, "Entry_Price": None, "Exit_Price": px if px > 0 else None})
+    out = pd.DataFrame(trades)
+    open_left = sum(1 for s in pos.values() if s["qty"] > 1e-9)
+    if not out.empty:
+        for cc in ("Entry_Time", "Exit_Time"):
+            out[cc] = (pd.to_datetime(out[cc], errors="coerce")
+                       + pd.Timedelta(hours=1)).dt.strftime("%Y-%m-%d %H:%M:%S")
+    msgs = [("info",
+             f"BingX注文履歴を検出: {len(df)}約定 → {len(out)}トレードへ再構築しました"
+             f"(建玉前クローズ{orphan}件=エントリー情報なし・エクスポート時点で未決済{open_left}件は除外)。"
+             "時刻はUTC+8→JST(+1h)換算、損益はRealized PNL(手数料別)です。")]
+    return out, msgs
+
+
+def reconstruct_bingx_transaction_history(df: pd.DataFrame) -> tuple[pd.DataFrame, list[tuple[str, str]]]:
+    """BingX取引履歴(入出金/実現損益/手数料の明細)→実現損益(Realized PnL)行だけをトレード化。
+    エントリー時刻/価格を含まないため、時刻は決済時刻・価格分析は不可(注文履歴CSVの方が高精度)。"""
+    cmap = {str(c).strip().lower(): c for c in df.columns}
+    c_time = cmap.get("time(utc+8)") or cmap.get("time(utc+0)") or cmap.get("time")
+    c_type = cmap.get("type")
+    c_det = cmap.get("details")
+    c_amt = cmap.get("amount")
+    c_fut = cmap.get("futures")
+    rows: list = []
+    for _, r in df.iterrows():
+        if str(r[c_type]).strip().lower().replace(" ", "") != "realizedpnl":
+            continue
+        fut = r[c_fut]
+        if fut is None or (isinstance(fut, float) and pd.isna(fut)) or not str(fut).strip():
+            continue
+        det = str(r[c_det]).lower()
+        side = "LONG" if "sell to close" in det else ("SHORT" if "buy to close" in det else None)
+        try:
+            amt = float(r[c_amt])
+        except (TypeError, ValueError):
+            continue
+        t = pd.to_datetime(r[c_time], errors="coerce")
+        t = (t + pd.Timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S") if pd.notna(t) else None
+        rows.append({"Entry_Time": t, "Exit_Time": t, "Symbol": _bingx_symbol(fut),
+                     "PnL_USD": amt, "PnL_Percent": None, "Win_Loss": "win" if amt > 0 else "loss",
+                     "Side": side, "Leverage": None, "Entry_Price": None, "Exit_Price": None})
+    out = pd.DataFrame(rows)
+    msgs = [("warning",
+             f"BingX取引履歴(Transaction History)を検出: 実現損益{len(out)}件を取り込みました。"
+             "この形式はエントリー時刻・価格を含まないため、時刻は決済時刻扱い・価格分析は不可です。"
+             "セッション帯や建値を精密に見るには「注文履歴(Order History)」CSVの利用を推奨します。")]
+    return out, msgs
+
+
+def _adapt_broker_export(raw_df: pd.DataFrame) -> tuple[pd.DataFrame, list[tuple[str, str]]]:
+    """アップロードDataFrameがBingXエクスポートなら往復トレードへ再構築。非該当ならそのまま返す。"""
+    try:
+        cols = list(raw_df.columns)
+        if _is_bingx_order_history(cols):
+            return reconstruct_bingx_order_history(raw_df)
+        if _is_bingx_transaction_history(cols):
+            return reconstruct_bingx_transaction_history(raw_df)
+    except Exception as e:  # noqa: BLE001
+        return raw_df, [("warning", f"ブローカー形式の自動判定に失敗しました(通常CSVとして処理します): {e}")]
+    return raw_df, []
+
+
 def normalize_trades_csv(raw_df: pd.DataFrame) -> tuple[Optional[pd.DataFrame], list[tuple[str, str]]]:
     """アップロードされたトレードCSVの列名ゆらぎ吸収・型変換・壊れた行の除去を行う。
 
@@ -607,6 +791,13 @@ def normalize_trades_csv(raw_df: pd.DataFrame) -> tuple[Optional[pd.DataFrame], 
     errors: list[tuple[str, str]] = []
     if raw_df is None or raw_df.empty:
         return None, [("error", "CSVが空です。")]
+
+    # ブローカー明細(BingX注文/取引履歴)なら往復トレードへ再構築してから通常処理へ(2026-07-21)
+    raw_df, broker_msgs = _adapt_broker_export(raw_df)
+    errors.extend(broker_msgs)
+    if raw_df is None or raw_df.empty:
+        return None, errors + [("error", "取り込める完結トレードがありませんでした"
+                                "(全て未決済、または対応形式ではありません)。")]
 
     rename_map: dict[str, str] = {}
     for col in raw_df.columns:
@@ -4642,6 +4833,21 @@ def _decode_trade_csv_bytes(content: bytes) -> tuple[Optional[pd.DataFrame], lis
     return None, decode_errs
 
 
+def _read_uploaded_trade_bytes(content: bytes, name: str) -> tuple[Optional[pd.DataFrame], list[str]]:
+    """アップロードされたトレード履歴(CSV/Excel)をraw DataFrameへ読み込む(2026-07-21)。
+    拡張子が.xlsx/.xlsならExcel(openpyxl)、それ以外はCSV(utf-8-sig→cp932)。"""
+    low = (name or "").lower()
+    if low.endswith((".xlsx", ".xls")):
+        try:
+            return pd.read_excel(io.BytesIO(content)), []
+        except ImportError:
+            return None, ["Excelを読むにはopenpyxlが必要です(requirements.txtに追加してください)。"
+                          "CSVに書き出して再アップロードでも取り込めます。"]
+        except Exception as e:  # noqa: BLE001
+            return None, [f"Excel読み込みに失敗しました: {e}"]
+    return _decode_trade_csv_bytes(content)
+
+
 def _add_trade_dataset_record(
     records: list[dict[str, Any]], label_base: str, raw_df: pd.DataFrame, source_name: str,
 ) -> None:
@@ -4670,19 +4876,25 @@ def render_trade_history_tab() -> None:
         st.session_state["trade_seen_file_ids"] = set()
     records: list[dict[str, Any]] = st.session_state["trade_dataset_records"]
 
-    with st.expander("❓ CSVの作り方・手順", expanded=False):
+    with st.expander("❓ CSV/Excelの作り方・BingX明細の取り込み", expanded=False):
         st.markdown(
-            "① 「テンプレートCSV」をダウンロード\n\n"
-            "② Entry_Time(JST)/Exit_Time(JST)/Symbol/PnL_USD/PnL_Percent/Win_Lossの列を埋める\n\n"
-            "③ 「トレード履歴CSVをアップロード」で読み込み、ラベル(弟子/師匠/任意名)を付ける\n\n"
-            "まず試すだけなら「サンプル(弟子+師匠)を読み込む」ボタンで、実際の市場価格に基づく"
-            "デモデータをすぐ体験できます。詳しい列の仕様は📖使い方ガイドページ参照。"
+            "**A) 自分でCSVを作る場合**\n\n"
+            "① 「テンプレートCSV」をDL ② Entry_Time(JST)/Exit_Time(JST)/Symbol/PnL_USD/"
+            "PnL_Percent/Win_Lossの列を埋める ③ アップロードしてラベルを付ける\n\n"
+            "**B) BingXの明細をそのまま取り込む場合(2026-07-21対応)**\n\n"
+            "BingXの「注文履歴(Order History)」または「取引履歴(Transaction History)」を"
+            "**CSVでもExcel(.xlsx)でも**そのままアップロードできます。Open/Close約定を自動で"
+            "往復トレードに再構築します(時刻はUTC+8→JST換算)。\n\n"
+            "・**注文履歴(Order History)を推奨**=建値・エグジット価格・レバレッジまで復元できます。\n\n"
+            "・取引履歴(Transaction History)は実現損益のみのため、価格分析はできません(時刻=決済時刻)。\n\n"
+            "まず試すだけなら「サンプル(弟子+師匠)を読み込む」ボタン。詳しい仕様は📖使い方ガイド参照。"
         )
 
     col_up, col_tmpl, col_sample = st.columns([2, 1, 1])
     with col_up:
         uploaded_files = st.file_uploader(
-            "トレード履歴CSVをアップロード(複数可)", type=["csv"], key="trade_uploader_multi",
+            "トレード履歴をアップロード(CSV/Excel・BingX明細も可・複数可)",
+            type=["csv", "xlsx", "xls"], key="trade_uploader_multi",
             accept_multiple_files=True,
         )
     with col_tmpl:
@@ -4702,7 +4914,7 @@ def render_trade_history_tab() -> None:
         if f.file_id in st.session_state["trade_seen_file_ids"]:
             continue
         st.session_state["trade_seen_file_ids"].add(f.file_id)
-        raw_df, decode_errs = _decode_trade_csv_bytes(f.getvalue())
+        raw_df, decode_errs = _read_uploaded_trade_bytes(f.getvalue(), f.name)
         if raw_df is None:
             st.error(
                 f"{f.name}: CSVの読み込みに失敗しました(utf-8-sig / cp932 のどちらでもデコードできません)。"
@@ -7982,6 +8194,64 @@ def run_selftest() -> bool:
 
     norm_missing, err_missing = normalize_trades_csv(pd.DataFrame({"Symbol": ["BTC"], "PnL_USD": [1]}))
     check("5-6 必須列欠落(Entry_Time無し)はNoneを返す", norm_missing is None and len(err_missing) >= 1)
+
+    # 5-7〜5-11: BingXブローカー明細の取り込み(2026-07-21)
+    # 5-7 記号正規化(合成銘柄含む)
+    check("5-7 _bingx_symbol: -USDT除去+合成銘柄マップ",
+          _bingx_symbol("XAUT-USDT") == "XAUT" and _bingx_symbol("NCCOGOLD2USD-USDT") == "GOLD"
+          and _bingx_symbol("NCSINASDAQ1002USD-USDT") == "NASDAQ" and _bingx_parse_lev("50X") == 50)
+    # 5-8 注文履歴の再構築: Open→Close(部分決済)+ヘッジ両建て+建玉前クローズ+未決済除外
+    oh = pd.DataFrame([
+        # BTC: Open2回(平均建値)→部分Close→残Close(2トレード・LONG)
+        {"Time(UTC+8)": "2026-01-01 10:00:00", "Pair": "BTC-USDT", "Type": "Open Long",
+         "Leverage": "10X", "DealPrice": 100.0, "Quantity": 1.0, "Realized PNL": 0},
+        {"Time(UTC+8)": "2026-01-01 10:05:00", "Pair": "BTC-USDT", "Type": "Open Long",
+         "Leverage": "10X", "DealPrice": 120.0, "Quantity": 1.0, "Realized PNL": 0},
+        {"Time(UTC+8)": "2026-01-01 11:00:00", "Pair": "BTC-USDT", "Type": "Close Long",
+         "Leverage": "10X", "DealPrice": 130.0, "Quantity": 1.0, "Realized PNL": 20.0},
+        {"Time(UTC+8)": "2026-01-01 12:00:00", "Pair": "BTC-USDT", "Type": "Close Long",
+         "Leverage": "10X", "DealPrice": 90.0, "Quantity": 1.0, "Realized PNL": -20.0},
+        # ETH: 建玉前クローズ(Openなし・SHORT)= orphan
+        {"Time(UTC+8)": "2026-01-01 09:00:00", "Pair": "ETH-USDT", "Type": "Close Short",
+         "Leverage": "5X", "DealPrice": 50.0, "Quantity": 1.0, "Realized PNL": 5.0},
+        # SOL: Openのみ(未決済)= トレード化されない
+        {"Time(UTC+8)": "2026-01-01 13:00:00", "Pair": "SOL-USDT", "Type": "Open Long",
+         "Leverage": "3X", "DealPrice": 20.0, "Quantity": 2.0, "Realized PNL": 0},
+    ])
+    onorm, oerr = normalize_trades_csv(oh)
+    btc = onorm[onorm["Symbol"] == "BTC"].sort_values("Exit_Time") if onorm is not None else None
+    # BTCは2トレード・建値=平均110・JST=UTC+8+1h(10:00→11:00)・PnL_Percent符号
+    ok57 = (onorm is not None and len(onorm) == 3   # BTC×2 + ETH orphan×1(SOLは未決済で除外)
+            and btc is not None and len(btc) == 2
+            and abs(float(btc.iloc[0]["Entry_Price"]) - 110.0) < 1e-6
+            and btc.iloc[0]["Entry_Time"].hour == 11   # UTC+8 10:00 → JST 11:00
+            and abs(float(btc.iloc[0]["PnL_USD"]) - 20.0) < 1e-6
+            and float(btc.iloc[0]["PnL_Percent"]) > 0   # 130>110でLONG利益=正
+            and any(s == "info" for s, _ in oerr))
+    check("5-8 BingX注文履歴: 平均建値/部分決済2本/UTC8→JST/未決済除外/建玉前クローズ", ok57,
+          f"trades={None if onorm is None else len(onorm)}")
+    # 5-9 検出だけで通常CSVは素通り(既存自作形式が再構築対象にならない)
+    plain = pd.DataFrame({"Entry_Time": ["2026-01-01 10:00"], "Symbol": ["BTC"], "PnL_USD": [5.0]})
+    check("5-9 通常CSVはBingX判定に掛からず素通り",
+          not _is_bingx_order_history(plain.columns) and not _is_bingx_transaction_history(plain.columns))
+    # 5-10 取引履歴(Transaction History)形式: Realized PnL行のみ抽出・Side判定
+    th = pd.DataFrame([
+        {"Time(UTC+8)": "2026-01-01 10:00:00", "type": "Realized PnL", "Details": "Sell to Close",
+         "Amount": 12.0, "newAvailableAmount": 100, "Assets": "USDT", "Futures": "BTC-USDT"},
+        {"Time(UTC+8)": "2026-01-01 10:00:00", "type": "Trading fee", "Details": "closing fee",
+         "Amount": -1.0, "newAvailableAmount": 99, "Assets": "USDT", "Futures": "BTC-USDT"},
+        {"Time(UTC+8)": "2026-01-01 09:00:00", "type": "Transfer", "Details": "to Spot",
+         "Amount": -50, "newAvailableAmount": 0, "Assets": "USDT", "Futures": None},
+    ])
+    tnorm, terr = normalize_trades_csv(th)
+    check("5-10 BingX取引履歴: Realized PnL行のみ1件・Side=LONG・warning付与",
+          tnorm is not None and len(tnorm) == 1 and tnorm.iloc[0]["Side"] == "LONG"
+          and abs(float(tnorm.iloc[0]["PnL_USD"]) - 12.0) < 1e-6
+          and any(s == "warning" for s, _ in terr))
+    # 5-11 Excel/CSV読み分け(拡張子判定・openpyxl未導入でも落ちない)
+    csv_bytes = b"Entry_Time,Symbol,PnL_USD\n2026-01-01 10:00,BTC,5\n"
+    rdf, rerr = _read_uploaded_trade_bytes(csv_bytes, "x.csv")
+    check("5-11 _read_uploaded: CSVは従来通り読める", rdf is not None and len(rdf) == 1 and not rerr)
 
     # -----------------------------------------------------------------
     # 6. クロス表組み立て: 市場統計のみ/トレードのみ/両方 の3ケース
