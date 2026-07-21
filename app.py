@@ -33,6 +33,7 @@ import io
 import json
 import os
 import gc
+import calendar
 import hmac
 import math
 import re
@@ -5239,6 +5240,272 @@ def compute_band_symbol_side(
     return out.sort_values("pnl", ascending=False, kind="stable").reset_index(drop=True)
 
 
+# ---- 📊 トレード総合分析(ForexTester風・Phase1核心4機能・2026-07-21): 純ロジック関数群 -------------
+# st非依存・selftest対象。既存の🔍レコードフィルタ適用後df(_filtered_record_df経由)を入力とする。
+
+RISK_METRIC_KEYS: list[str] = [
+    "n_trades", "n_wins", "n_losses", "win_rate_pct", "pf", "net_pnl", "gross_profit", "gross_loss",
+    "avg_win", "avg_loss", "expectancy", "payoff_ratio", "max_win", "max_loss",
+    "max_consec_wins", "max_consec_losses", "n_trading_days", "avg_trades_per_day",
+    "max_drawdown", "max_drawdown_pct", "recovery_factor",
+    "sharpe_daily", "sortino_daily", "sharpe_monthly", "sortino_monthly",
+]
+_RR_LEVELS: tuple[int, ...] = (2, 3, 4, 5)
+
+EQUITY_CURVE_COLUMNS: list[str] = ["time", "pnl", "equity", "peak", "drawdown", "drawdown_pct"]
+DAILY_CALENDAR_COLUMNS: list[str] = ["n", "pnl", "win_rate"]
+HOURLY_ACTIVITY_COLUMNS: list[str] = ["n_wins", "n_losses", "n_all", "total_pnl", "avg_pnl"]
+
+
+def compute_equity_curve(df: Optional[pd.DataFrame], starting_equity: float = 0.0) -> pd.DataFrame:
+    """トレードDataFrameからエクイティ曲線を計算する純ロジック(st非依存・selftest対象)。
+    時系列の基準はExit_Time(行ごとに欠損ならEntry_Timeで補完)昇順。
+    equity=starting_equity+PnL_USDの累積和、peak=equityの累積最大、drawdown=equity-peak(<=0)、
+    drawdown_pct=drawdown/peak*100(peakが0の行は0)。
+    空df・PnL_USD列欠落・有効な時刻/PnLが1件も無い場合は空DataFrame(columns=EQUITY_CURVE_COLUMNS)を返す。
+    """
+    if df is None or df.empty or "PnL_USD" not in df.columns:
+        return pd.DataFrame(columns=EQUITY_CURVE_COLUMNS)
+    d = df.copy()
+    exit_t = pd.to_datetime(d["Exit_Time"], errors="coerce") if "Exit_Time" in d.columns \
+        else pd.Series(pd.NaT, index=d.index)
+    entry_t = pd.to_datetime(d["Entry_Time"], errors="coerce") if "Entry_Time" in d.columns \
+        else pd.Series(pd.NaT, index=d.index)
+    d["_time"] = exit_t.where(exit_t.notna(), entry_t)
+    d["_pnl"] = pd.to_numeric(d["PnL_USD"], errors="coerce")
+    d = d.loc[d["_time"].notna() & d["_pnl"].notna()]
+    if d.empty:
+        return pd.DataFrame(columns=EQUITY_CURVE_COLUMNS)
+    d = d.sort_values("_time", kind="stable").reset_index(drop=True)
+
+    equity = float(starting_equity) + d["_pnl"].cumsum()
+    peak = equity.cummax()
+    drawdown = equity - peak
+    with np.errstate(divide="ignore", invalid="ignore"):
+        drawdown_pct = np.where(peak.to_numpy() != 0, drawdown.to_numpy() / peak.to_numpy() * 100.0, 0.0)
+
+    return pd.DataFrame({
+        "time": d["_time"].values, "pnl": d["_pnl"].values, "equity": equity.values,
+        "peak": peak.values, "drawdown": drawdown.values, "drawdown_pct": drawdown_pct,
+    })
+
+
+def compute_risk_performance_metrics(
+    df: Optional[pd.DataFrame], starting_equity: Optional[float] = None,
+) -> dict[str, Any]:
+    """リスク&パフォーマンス指標をまとめて計算する純ロジック(st非依存・selftest対象)。
+
+    Sharpe/Sortinoは損益ベース(口座残高非依存): 日次/月次PnL系列(Exit_Timeの日でgroupby sum、
+    Entry_Timeへのフォールバックはしない)の平均/標準偏差(母集団,ddof=0)から
+    sharpe=mean/std*sqrt(365)(日次)・*sqrt(12)(月次)、sortino=mean/downside_std(負値のみのstd)*sqrt(同)。
+    系列が2点未満、またはstd(downside含む)が0の場合はnp.nan。
+    max_drawdown/max_drawdown_pctはcompute_equity_curve(starting_equity未指定時は0.0)から算出する
+    (starting_equityはmax_drawdown_pctにのみ影響し、max_drawdown(USD)自体はオフセット不変)。
+    rr_ge: 勝ちトレードのうち利益額が平均損失絶対値のk倍(k=2,3,4,5)以上だった割合(%)。
+      平均損失が算出できない(負けトレード0件・平均損失0)場合は空dictを返す。
+    空df・PnL_USD/Win_Loss列欠損でも例外を出さず全キーを返す(件数系は0、比率系はnp.nan)。
+    """
+    empty: dict[str, Any] = {k: np.nan for k in RISK_METRIC_KEYS}
+    empty.update({
+        "n_trades": 0, "n_wins": 0, "n_losses": 0,
+        "max_consec_wins": 0, "max_consec_losses": 0, "n_trading_days": 0,
+        "gross_profit": 0.0, "gross_loss": 0.0,
+    })
+    empty["rr_ge"] = {}
+    if df is None or df.empty or "PnL_USD" not in df.columns or "Win_Loss" not in df.columns:
+        return empty
+
+    d = df.copy()
+    d["PnL_USD"] = pd.to_numeric(d["PnL_USD"], errors="coerce")
+    d = d.loc[d["PnL_USD"].notna()].reset_index(drop=True)
+    if d.empty:
+        return empty
+
+    n_trades = int(len(d))
+    win_mask = d["Win_Loss"] == "win"
+    loss_mask = d["Win_Loss"] == "loss"
+    n_wins = int(win_mask.sum())
+    n_losses = int(loss_mask.sum())
+    win_rate_pct = (100.0 * n_wins / (n_wins + n_losses)) if (n_wins + n_losses) > 0 else np.nan
+
+    gross_profit = float(d.loc[win_mask, "PnL_USD"].sum()) if n_wins > 0 else 0.0
+    gross_loss = float(d.loc[loss_mask, "PnL_USD"].sum()) if n_losses > 0 else 0.0  # 0以下(符号は元のまま)
+    net_pnl = float(d["PnL_USD"].sum())
+    if gross_loss != 0:
+        pf = gross_profit / abs(gross_loss)
+    else:
+        pf = float("inf") if gross_profit > 0 else np.nan
+
+    avg_win = float(d.loc[win_mask, "PnL_USD"].mean()) if n_wins > 0 else np.nan
+    avg_loss = float(d.loc[loss_mask, "PnL_USD"].mean()) if n_losses > 0 else np.nan
+    expectancy = net_pnl / n_trades if n_trades > 0 else np.nan
+    payoff_ratio = (avg_win / abs(avg_loss)) if (n_wins > 0 and n_losses > 0 and avg_loss != 0) else np.nan
+    max_win = float(d["PnL_USD"].max())
+    max_loss = float(d["PnL_USD"].min())
+
+    # 連勝/連敗: 時系列順(Exit_Time優先・全欠損ならEntry_Time)。draw(引き分け)はどちらの
+    # ストリークも変化させない(compute_trade_statsの連敗仕様を踏襲)。
+    sort_col = "Exit_Time" if ("Exit_Time" in d.columns and pd.to_datetime(
+        d["Exit_Time"], errors="coerce").notna().any()) else "Entry_Time"
+    d_sorted = d.sort_values(sort_col, kind="stable") if sort_col in d.columns else d
+    max_consec_wins = max_consec_losses = 0
+    cur_w = cur_l = 0
+    for wl in d_sorted["Win_Loss"]:
+        if wl == "win":
+            cur_w += 1
+            max_consec_wins = max(max_consec_wins, cur_w)
+            cur_l = 0
+        elif wl == "loss":
+            cur_l += 1
+            max_consec_losses = max(max_consec_losses, cur_l)
+            cur_w = 0
+
+    if "Exit_Time" in d.columns:
+        exit_dt = pd.to_datetime(d["Exit_Time"], errors="coerce")
+    else:
+        exit_dt = pd.Series(pd.NaT, index=d.index)
+    exit_dates = exit_dt.dropna().dt.date
+    n_trading_days = int(pd.Series(exit_dates).nunique()) if len(exit_dates) > 0 else 0
+    avg_trades_per_day = (n_trades / n_trading_days) if n_trading_days > 0 else np.nan
+
+    dd_starting_equity = float(starting_equity) if starting_equity is not None else 0.0
+    eq_df = compute_equity_curve(d, starting_equity=dd_starting_equity)
+    if not eq_df.empty:
+        max_drawdown = abs(float(eq_df["drawdown"].min()))
+        max_drawdown_pct = abs(float(eq_df["drawdown_pct"].min()))
+    else:
+        max_drawdown = np.nan
+        max_drawdown_pct = np.nan
+    if pd.isna(max_drawdown):
+        recovery_factor = np.nan
+    elif max_drawdown == 0:
+        recovery_factor = float("inf")
+    else:
+        recovery_factor = net_pnl / max_drawdown
+
+    def _sharpe_sortino(series: pd.Series, ann_factor: float) -> tuple[float, float]:
+        """損益ベースSharpe/Sortino。系列2点未満・std=0はNaN(掟7: 全てPythonで計算)。"""
+        if series is None or len(series) < 2:
+            return np.nan, np.nan
+        mean = float(series.mean())
+        std = float(series.std(ddof=0))
+        sharpe = (mean / std * math.sqrt(ann_factor)) if std > 0 else np.nan
+        downside = series[series < 0]
+        if len(downside) == 0:
+            sortino = np.nan
+        else:
+            dstd = float(downside.std(ddof=0))
+            sortino = (mean / dstd * math.sqrt(ann_factor)) if dstd > 0 else np.nan
+        return sharpe, sortino
+
+    if "Exit_Time" in d.columns:
+        daily_dates = pd.to_datetime(d["Exit_Time"], errors="coerce").dt.date
+        daily_valid = daily_dates.notna()
+        daily_pnl = d.loc[daily_valid, "PnL_USD"].groupby(daily_dates[daily_valid]).sum().sort_index()
+    else:
+        daily_pnl = pd.Series(dtype=float)
+    sharpe_daily, sortino_daily = _sharpe_sortino(daily_pnl, 365.0)
+
+    if len(daily_pnl) > 0:
+        monthly_periods = pd.DatetimeIndex(daily_pnl.index).to_period("M")
+        monthly_pnl = daily_pnl.groupby(monthly_periods).sum().sort_index()
+    else:
+        monthly_pnl = pd.Series(dtype=float)
+    sharpe_monthly, sortino_monthly = _sharpe_sortino(monthly_pnl, 12.0)
+
+    rr_ge: dict[int, float] = {}
+    if n_wins > 0 and n_losses > 0 and avg_loss != 0 and not pd.isna(avg_loss):
+        avg_loss_abs = abs(avg_loss)
+        win_pnls = d.loc[win_mask, "PnL_USD"]
+        for k in _RR_LEVELS:
+            rr_ge[k] = float(100.0 * (win_pnls >= k * avg_loss_abs).sum() / n_wins)
+
+    return {
+        "n_trades": n_trades, "n_wins": n_wins, "n_losses": n_losses, "win_rate_pct": win_rate_pct,
+        "pf": pf, "net_pnl": net_pnl, "gross_profit": gross_profit, "gross_loss": gross_loss,
+        "avg_win": avg_win, "avg_loss": avg_loss, "expectancy": expectancy, "payoff_ratio": payoff_ratio,
+        "max_win": max_win, "max_loss": max_loss,
+        "max_consec_wins": max_consec_wins, "max_consec_losses": max_consec_losses,
+        "n_trading_days": n_trading_days, "avg_trades_per_day": avg_trades_per_day,
+        "max_drawdown": max_drawdown, "max_drawdown_pct": max_drawdown_pct, "recovery_factor": recovery_factor,
+        "sharpe_daily": sharpe_daily, "sortino_daily": sortino_daily,
+        "sharpe_monthly": sharpe_monthly, "sortino_monthly": sortino_monthly,
+        "rr_ge": rr_ge,
+    }
+
+
+def compute_daily_trade_calendar(df: Optional[pd.DataFrame], year: int, month: int) -> pd.DataFrame:
+    """指定年月のEntry_Timeを日(1〜31)ごとに集計する純ロジック(st非依存・selftest対象)。
+
+    戻り値: DataFrame(index=日(int)、columns=DAILY_CALENDAR_COLUMNS=[n,pnl,win_rate])。
+      n=件数、pnl=PnL_USD合計、win_rate=勝率%(draw除外・分母0はnp.nan)。
+    空df・Entry_Time列欠落・該当年月のトレードが1件も無い場合は空DataFrameを返す。
+    """
+    if df is None or df.empty or "Entry_Time" not in df.columns:
+        return pd.DataFrame(columns=DAILY_CALENDAR_COLUMNS)
+    d = df.copy()
+    entry = pd.to_datetime(d["Entry_Time"], errors="coerce")
+    mask = entry.notna() & (entry.dt.year == int(year)) & (entry.dt.month == int(month))
+    d = d.loc[mask].copy()
+    if d.empty:
+        return pd.DataFrame(columns=DAILY_CALENDAR_COLUMNS)
+    day = entry.loc[mask].dt.day
+    win_loss = d["Win_Loss"] if "Win_Loss" in d.columns else pd.Series(np.nan, index=d.index)
+    pnl = pd.to_numeric(d["PnL_USD"], errors="coerce") if "PnL_USD" in d.columns \
+        else pd.Series(np.nan, index=d.index)
+    work = pd.DataFrame({"day": day.values, "win_loss": win_loss.values, "pnl": pnl.values})
+
+    rows: list[dict[str, Any]] = []
+    for d_, g in work.groupby("day"):
+        n_wins = int((g["win_loss"] == "win").sum())
+        n_losses = int((g["win_loss"] == "loss").sum())
+        win_rate = (100.0 * n_wins / (n_wins + n_losses)) if (n_wins + n_losses) > 0 else np.nan
+        rows.append({"day": int(d_), "n": int(len(g)), "pnl": float(g["pnl"].sum(skipna=True)),
+                     "win_rate": win_rate})
+    out = pd.DataFrame(rows).set_index("day").sort_index()
+    out.index.name = "day"
+    return out[DAILY_CALENDAR_COLUMNS]
+
+
+def compute_hourly_activity(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Entry_TimeのJST時(0-23)ごとの取引活動を集計する純ロジック(st非依存・selftest対象)。
+
+    戻り値: DataFrame(index=hour(0-23の24行を必ず0埋めで含む)、columns=HOURLY_ACTIVITY_COLUMNS=
+      [n_wins,n_losses,n_all,total_pnl,avg_pnl])。空df・Entry_Time列欠落でも例外を出さず
+      全時間帯0埋め(avg_pnlのみnp.nan)の24行を返す。
+    """
+    base = pd.DataFrame(
+        {"n_wins": 0, "n_losses": 0, "n_all": 0, "total_pnl": 0.0, "avg_pnl": np.nan},
+        index=pd.Index(range(24), name="hour"),
+    )
+    if df is None or df.empty or "Entry_Time" not in df.columns:
+        return base
+    d = df.copy()
+    entry = pd.to_datetime(d["Entry_Time"], errors="coerce")
+    valid = entry.notna()
+    d = d.loc[valid].copy()
+    entry = entry.loc[valid]
+    if d.empty:
+        return base
+    hour = entry.dt.hour
+    win_loss = d["Win_Loss"] if "Win_Loss" in d.columns else pd.Series(np.nan, index=d.index)
+    pnl = pd.to_numeric(d["PnL_USD"], errors="coerce") if "PnL_USD" in d.columns \
+        else pd.Series(np.nan, index=d.index)
+    work = pd.DataFrame({"hour": hour.values, "win_loss": win_loss.values, "pnl": pnl.values})
+
+    out = base.copy()
+    for h, g in work.groupby("hour"):
+        n_wins = int((g["win_loss"] == "win").sum())
+        n_losses = int((g["win_loss"] == "loss").sum())
+        n_all = int(len(g))
+        total_pnl = float(g["pnl"].sum(skipna=True))
+        avg_pnl = float(g["pnl"].mean(skipna=True)) if g["pnl"].notna().any() else np.nan
+        out.loc[int(h), ["n_wins", "n_losses", "n_all", "total_pnl", "avg_pnl"]] = [
+            n_wins, n_losses, n_all, total_pnl, avg_pnl,
+        ]
+    return out
+
+
 def _filtered_record_df(record: Optional[dict[str, Any]]) -> Optional[pd.DataFrame]:
     """共通ヘルパ: record["df"]へ現在のst.session_state["trade_filters"]を適用したDataFrameを返す。
     トレード一覧/累積損益/詳細帯別損益/多重クロス表/曜日・月別の全ビューはrecord["df"]を直接読まず
@@ -5925,6 +6192,202 @@ def _render_trader_comparison_view(records: list[dict[str, Any]]) -> None:
     wd_b = compute_trade_weekday_stats(assigned_b)
     wd_cmp = compare_trade_stats({"overall": {}, "by_band": wd_a}, {"overall": {}, "by_band": wd_b})["by_band"]
     st.dataframe(style_compare_band_table(wd_cmp, label_a, label_b), width="stretch")
+
+
+# =====================================================================================
+# 📊 トレード総合分析(ForexTester風・Phase1核心4機能・2026-07-21): UI層(selftest対象外)
+# =====================================================================================
+
+
+def render_trade_analytics_tab() -> None:
+    """既存🔍レコードフィルタ適用後の全データセット合算dfに対し、リスク&パフォーマンス指標・
+    エクイティ曲線(+アンダーウォーター)・取引活動カレンダー・時間帯別活動の4ビューを表示する。
+    """
+    records: list[dict[str, Any]] = st.session_state.get("trade_dataset_records", [])
+    dfs: list[pd.DataFrame] = []
+    for rec in records:
+        ndf = _filtered_record_df(rec)
+        if ndf is not None and not ndf.empty:
+            dfs.append(ndf)
+    if not dfs:
+        st.info("トレードデータがありません。「📒 トレード履歴」タブでCSV/Excelを読み込んでください。")
+        return
+    df = pd.concat(dfs, ignore_index=True)
+    if "Entry_Time" not in df.columns or df["Entry_Time"].dropna().empty:
+        st.warning("Entry_Time列が無い、または全て解析不能のため集計できません。")
+        return
+
+    period_start = df["Entry_Time"].min()
+    period_end = df["Entry_Time"].max()
+    st.caption(
+        f"集計期間: {period_start:%Y-%m-%d} 〜 {period_end:%Y-%m-%d} / 取引数(合算・フィルタ適用後): {len(df)}件"
+    )
+
+    # ---- A. リスク&パフォーマンス指標 ---------------------------------------------
+    st.subheader("A. リスク&パフォーマンス指標")
+    metrics = compute_risk_performance_metrics(df)
+
+    a1 = st.columns(4)
+    a1[0].metric("取引数", f"{metrics['n_trades']}")
+    a1[1].metric("勝率", f"{metrics['win_rate_pct']:.1f}%" if pd.notna(metrics["win_rate_pct"]) else "—")
+    a1[2].metric("プロフィットファクター", _fmt_stat(metrics["pf"], ".2f"))
+    a1[3].metric("純利益(USD)", _fmt_stat(metrics["net_pnl"]))
+
+    a2 = st.columns(4)
+    a2[0].metric("期待値/トレード(USD)", _fmt_stat(metrics["expectancy"]))
+    a2[1].metric("ペイオフレシオ", _fmt_stat(metrics["payoff_ratio"], ".2f"))
+    a2[2].metric("平均利益(USD)", _fmt_stat(metrics["avg_win"]))
+    a2[3].metric("平均損失(USD)", _fmt_stat(metrics["avg_loss"]))
+
+    a3 = st.columns(4)
+    a3[0].metric("最大ドローダウン(USD)", _fmt_stat(metrics["max_drawdown"]))
+    a3[1].metric(
+        "最大ドローダウン(%)",
+        f"{metrics['max_drawdown_pct']:.1f}%" if pd.notna(metrics["max_drawdown_pct"]) else "—",
+    )
+    a3[2].metric("リカバリーファクター", _fmt_stat(metrics["recovery_factor"], ".2f"))
+    a3[3].metric("最大勝ち/最大負け(USD)", f"{_fmt_stat(metrics['max_win'])} / {_fmt_stat(metrics['max_loss'])}")
+
+    a4 = st.columns(4)
+    a4[0].metric("最大連勝", f"{metrics['max_consec_wins']}回")
+    a4[1].metric("最大連敗", f"{metrics['max_consec_losses']}回")
+    a4[2].metric("取引日数", f"{metrics['n_trading_days']}日")
+    a4[3].metric("1日あたり平均取引数", _fmt_stat(metrics["avg_trades_per_day"], ".2f"))
+
+    a5 = st.columns(4)
+    a5[0].metric("日次シャープ", _fmt_stat(metrics["sharpe_daily"], ".2f"))
+    a5[1].metric("日次ソルティノ", _fmt_stat(metrics["sortino_daily"], ".2f"))
+    a5[2].metric("月次シャープ", _fmt_stat(metrics["sharpe_monthly"], ".2f"))
+    a5[3].metric("月次ソルティノ", _fmt_stat(metrics["sortino_monthly"], ".2f"))
+    st.caption(
+        "Sharpe/Sortinoは損益ベース(口座残高非依存)。日次/月次PnL系列の平均÷標準偏差×√365(月次は√12)で算出。"
+    )
+
+    rr = metrics.get("rr_ge") or {}
+    if rr:
+        rr_df = pd.DataFrame({
+            "RR倍率(勝ち利益÷平均損失絶対値)": [f"1 : {k}" for k in sorted(rr)],
+            "達成率(%)": [round(rr[k], 1) for k in sorted(rr)],
+        })
+        st.markdown("**RR分布**(勝ちトレードのうち、利益が平均損失の何倍以上だったか)")
+        st.dataframe(rr_df, width="stretch", hide_index=True)
+
+    # ---- B. 時系列パフォーマンス(エクイティ曲線+アンダーウォーター) --------------
+    st.subheader("B. 時系列パフォーマンス")
+    starting_equity = st.number_input(
+        "開始資本(USD)", min_value=0.0, value=10000.0, step=1000.0, key="ta_starting_equity",
+    )
+    eq_df = compute_equity_curve(df, starting_equity=starting_equity)
+    if eq_df.empty:
+        st.info("エクイティ曲線を計算できるトレードがありません(時刻/PnLが解析できません)。")
+    else:
+        final_equity = float(eq_df["equity"].iloc[-1])
+        net_pnl_b = float(eq_df["pnl"].sum())
+        max_dd_b = abs(float(eq_df["drawdown"].min()))
+
+        b1, b2, b3 = st.columns(3)
+        b1.metric("合計損益(USD)", _fmt_stat(net_pnl_b))
+        b2.metric("最大ドローダウン(USD)", _fmt_stat(max_dd_b))
+        b3.metric("純資産(最終エクイティ・USD)", _fmt_stat(final_equity))
+
+        fig_eq = make_subplots(
+            rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.7, 0.3],
+            subplot_titles=["エクイティ曲線", "アンダーウォーター(ドローダウン)"],
+        )
+        fig_eq.add_trace(
+            go.Scatter(
+                x=eq_df["time"], y=eq_df["equity"], mode="lines", name="エクイティ(USD)",
+                line=dict(color="#2ECC71", width=2),
+            ),
+            row=1, col=1,
+        )
+        fig_eq.add_trace(
+            go.Scatter(
+                x=eq_df["time"], y=eq_df["drawdown"], mode="lines", name="ドローダウン(USD)",
+                line=dict(color="#E74C3C", width=1), fill="tozeroy", fillcolor="rgba(231,76,60,0.30)",
+            ),
+            row=2, col=1,
+        )
+        fig_eq.update_layout(
+            template="plotly_dark", height=520, margin=dict(l=40, r=20, t=50, b=20), showlegend=False,
+        )
+        fig_eq.update_yaxes(title_text="エクイティ(USD)", row=1, col=1)
+        fig_eq.update_yaxes(title_text="DD(USD)", row=2, col=1)
+        st.plotly_chart(fig_eq, width="stretch", key="ta_equity_chart")
+
+    # ---- C. 取引活動カレンダー -------------------------------------------------------
+    st.subheader("C. 取引活動カレンダー")
+    entry_valid = pd.to_datetime(df["Entry_Time"], errors="coerce").dropna()
+    ym_options = sorted({(int(ts.year), int(ts.month)) for ts in entry_valid}, reverse=True)
+    if not ym_options:
+        st.info("カレンダー表示できる有効なEntry_Timeがありません。")
+    else:
+        ym_labels = [f"{y}年{m:02d}月" for y, m in ym_options]
+        sel_label = st.selectbox("表示する年月", ym_labels, index=0, key="ta_calendar_ym")
+        sel_year, sel_month = ym_options[ym_labels.index(sel_label)]
+
+        cal_df = compute_daily_trade_calendar(df, sel_year, sel_month)
+        weeks = calendar.Calendar(firstweekday=6).monthdayscalendar(sel_year, sel_month)
+        weekday_hdr = ["日", "月", "火", "水", "木", "金", "土"]
+
+        hdr_cols = st.columns(7)
+        for hc, wd in zip(hdr_cols, weekday_hdr):
+            hc.markdown(f"<div style='text-align:center;font-weight:600;opacity:0.75'>{wd}</div>",
+                        unsafe_allow_html=True)
+
+        for week in weeks:
+            week_cols = st.columns(7)
+            for wc, day in zip(week_cols, week):
+                if day == 0:
+                    wc.markdown("<div style='min-height:66px'></div>", unsafe_allow_html=True)
+                    continue
+                if day in cal_df.index:
+                    n_ = int(cal_df.loc[day, "n"])
+                    pnl_ = float(cal_df.loc[day, "pnl"])
+                    wr_ = cal_df.loc[day, "win_rate"]
+                    wr_txt = f"{wr_:.0f}%" if pd.notna(wr_) else "—"
+                    if pnl_ > 0:
+                        bg, border = "rgba(46,204,113,0.22)", "rgba(46,204,113,0.65)"
+                    elif pnl_ < 0:
+                        bg, border = "rgba(231,76,60,0.22)", "rgba(231,76,60,0.65)"
+                    else:
+                        bg, border = "rgba(255,255,255,0.06)", "rgba(255,255,255,0.20)"
+                    cell = (
+                        f"<div style='background:{bg};border:1px solid {border};border-radius:6px;"
+                        f"padding:4px 6px;min-height:66px'>"
+                        f"<div style='font-size:0.75em;opacity:0.7'>{day}</div>"
+                        f"<div style='font-size:0.85em;font-weight:600'>${pnl_:,.0f}</div>"
+                        f"<div style='font-size:0.7em;opacity:0.8'>勝率{wr_txt}・{n_}件</div></div>"
+                    )
+                else:
+                    cell = (
+                        "<div style='background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.05);"
+                        f"border-radius:6px;padding:4px 6px;min-height:66px'>"
+                        f"<div style='font-size:0.75em;opacity:0.35'>{day}</div></div>"
+                    )
+                wc.markdown(cell, unsafe_allow_html=True)
+
+    # ---- D. 時間ごとの取引活動 --------------------------------------------------------
+    st.subheader("D. 時間ごとの取引活動(JST)")
+    hourly = compute_hourly_activity(df)
+    custom = np.stack([hourly["n_wins"], hourly["n_losses"], hourly["total_pnl"], hourly["avg_pnl"]], axis=-1)
+    fig_hr = go.Figure()
+    fig_hr.add_trace(go.Bar(
+        x=hourly.index, y=hourly["n_wins"], name="勝ち", marker_color="#2ECC71", customdata=custom,
+        hovertemplate="%{x}時<br>勝ち=%{customdata[0]}件・負け=%{customdata[1]}件"
+                      "<br>合計PnL=%{customdata[2]:,.1f}・平均PnL=%{customdata[3]:,.2f}<extra></extra>",
+    ))
+    fig_hr.add_trace(go.Bar(
+        x=hourly.index, y=hourly["n_losses"], name="負け", marker_color="#E74C3C", customdata=custom,
+        hovertemplate="%{x}時<br>勝ち=%{customdata[0]}件・負け=%{customdata[1]}件"
+                      "<br>合計PnL=%{customdata[2]:,.1f}・平均PnL=%{customdata[3]:,.2f}<extra></extra>",
+    ))
+    fig_hr.update_layout(
+        template="plotly_dark", barmode="stack", height=380,
+        margin=dict(l=40, r=20, t=40, b=20), xaxis_title="時刻(JST)", yaxis_title="トレード件数",
+        xaxis=dict(tickmode="linear", dtick=1),
+    )
+    st.plotly_chart(fig_hr, width="stretch", key="ta_hourly_chart")
 
 
 # =====================================================================================
@@ -8570,7 +9033,7 @@ def main() -> None:
     # 注: セクション切替でセクション内ウィジェット(足種等)は既定値に戻る(既知の代償)。
     # ------------------------------------------------------------------
     _SECTIONS = ["📊 多重クロス表", "🕯️ チャート", "📈 セッション分析", "📅 曜日・月別", "📒 トレード履歴",
-                 "⚡ 確率スキャナー"]
+                 "📊 トレード総合分析", "⚡ 確率スキャナー"]
     section = st.segmented_control(
         "表示セクション", _SECTIONS, default=_SECTIONS[0], key="main_section_v6",
         label_visibility="collapsed",
@@ -8632,6 +9095,9 @@ def main() -> None:
             selected_labels, trade_datasets,
             today, meta_a, meta_b,
         )
+
+    elif section == "📊 トレード総合分析":
+        render_trade_analytics_tab()
 
     elif section == "⚡ 確率スキャナー":
         render_scan_tab()
@@ -11406,6 +11872,191 @@ def run_selftest() -> bool:
     # 26-9: 該当帯なし(帯にトレードが1件も無い)ドリルダウンは空DataFrame
     drill26_empty = compute_band_symbol_side(df26, "薄商い (6-7)", weekday=0)
     check("26-9 該当帯なしは空DataFrame", drill26_empty.empty, f"len={len(drill26_empty)}")
+
+    # -----------------------------------------------------------------
+    # 27. 📊 トレード総合分析(ForexTester風・Phase1核心4機能・2026-07-21):
+    #     compute_risk_performance_metrics / compute_daily_trade_calendar /
+    #     compute_hourly_activity / compute_equity_curve の純ロジック検証
+    # -----------------------------------------------------------------
+    print("\n--- 27. トレード総合分析(ForexTester風) ---")
+
+    def _ts27(s: str) -> pd.Timestamp:
+        return pd.Timestamp(s, tz="Asia/Tokyo")
+
+    # 2026-03-02/03(月2件+火5件)+2026-04-01/02(水1件+木1件)の計9件。
+    # win3/loss5/draw1、連敗はdraw非リセットでT4,T5,(T6draw),T7の3連続。
+    # 期待値は全て事前にpythonで実行検証済み(手計算からの転記ではない)。
+    rows27 = [
+        # Entry_Time, Exit_Time, Symbol, PnL_USD, Win_Loss
+        (_ts27("2026-03-02 07:00:00"), _ts27("2026-03-02 07:20:00"), "BTC", 10.0, "win"),
+        (_ts27("2026-03-02 07:05:00"), _ts27("2026-03-02 07:25:00"), "ETH", -5.0, "loss"),
+        (_ts27("2026-03-03 09:00:00"), _ts27("2026-03-03 09:20:00"), "BTC", 30.0, "win"),
+        (_ts27("2026-03-03 10:00:00"), _ts27("2026-03-03 10:20:00"), "BTC", -2.0, "loss"),
+        (_ts27("2026-03-03 10:05:00"), _ts27("2026-03-03 10:25:00"), "SOL", -1.0, "loss"),
+        (_ts27("2026-03-03 10:10:00"), _ts27("2026-03-03 10:30:00"), "ETH", 0.0, "draw"),
+        (_ts27("2026-03-03 10:15:00"), _ts27("2026-03-03 10:35:00"), "SOL", -3.0, "loss"),
+        (_ts27("2026-04-01 07:00:00"), _ts27("2026-04-01 07:20:00"), "BTC", 50.0, "win"),
+        (_ts27("2026-04-02 08:00:00"), _ts27("2026-04-02 08:20:00"), "BTC", -10.0, "loss"),
+    ]
+    df27 = pd.DataFrame(rows27, columns=["Entry_Time", "Exit_Time", "Symbol", "PnL_USD", "Win_Loss"])
+
+    # 27-1: 空df/None/列欠損でも例外を出さず規定キー/規定columnsを返す
+    empty_ok_27 = True
+    try:
+        m1 = compute_risk_performance_metrics(None)
+        m2 = compute_risk_performance_metrics(pd.DataFrame())
+        m3 = compute_risk_performance_metrics(pd.DataFrame({"foo": [1, 2]}))
+        c1 = compute_daily_trade_calendar(None, 2026, 3)
+        c2 = compute_daily_trade_calendar(pd.DataFrame(), 2026, 3)
+        h1 = compute_hourly_activity(None)
+        h2 = compute_hourly_activity(pd.DataFrame())
+        e1 = compute_equity_curve(None)
+        e2 = compute_equity_curve(pd.DataFrame())
+        empty_ok_27 = (
+            set(RISK_METRIC_KEYS) <= set(m1.keys()) and m1["n_trades"] == 0 and m1["rr_ge"] == {}
+            and set(RISK_METRIC_KEYS) <= set(m2.keys()) and set(RISK_METRIC_KEYS) <= set(m3.keys())
+            and c1.empty and list(c1.columns) == DAILY_CALENDAR_COLUMNS
+            and c2.empty
+            and list(h1.columns) == HOURLY_ACTIVITY_COLUMNS and len(h1) == 24 and h1["n_all"].sum() == 0
+            and list(h2.columns) == HOURLY_ACTIVITY_COLUMNS and len(h2) == 24
+            and e1.empty and list(e1.columns) == EQUITY_CURVE_COLUMNS
+            and e2.empty
+        )
+    except Exception as e:  # noqa: BLE001
+        empty_ok_27 = False
+        print(f"    [27-1例外] {e}")
+    check("27-1 空df/None/列欠損でも例外を出さず規定キー/規定columns/24時間ゼロ埋めを返す", empty_ok_27)
+
+    # 27-2: 基本カウント・PF・純利益(手計算をpythonで再検算済み: win3/loss5/draw1)
+    m27 = compute_risk_performance_metrics(df27)
+    check("27-2a n_trades=9,n_wins=3,n_losses=5",
+          m27["n_trades"] == 9 and m27["n_wins"] == 3 and m27["n_losses"] == 5,
+          f"n={m27['n_trades']} w={m27['n_wins']} l={m27['n_losses']}")
+    check("27-2b win_rate_pct=37.5(=3/8*100・draw除外)", math.isclose(m27["win_rate_pct"], 37.5),
+          f"got={m27['win_rate_pct']}")
+    check("27-2c gross_profit=90.0,gross_loss=-21.0,net_pnl=69.0",
+          math.isclose(m27["gross_profit"], 90.0) and math.isclose(m27["gross_loss"], -21.0)
+          and math.isclose(m27["net_pnl"], 69.0),
+          f"gp={m27['gross_profit']} gl={m27['gross_loss']} net={m27['net_pnl']}")
+    check("27-2d pf=90/21=4.285714...", math.isclose(m27["pf"], 90.0 / 21.0, rel_tol=1e-9), f"got={m27['pf']}")
+
+    # 27-3: 平均/期待値/ペイオフレシオ/最大勝ち負け
+    check("27-3a avg_win=30.0,avg_loss=-4.2",
+          math.isclose(m27["avg_win"], 30.0) and math.isclose(m27["avg_loss"], -4.2),
+          f"avg_win={m27['avg_win']} avg_loss={m27['avg_loss']}")
+    check("27-3b expectancy=69/9=7.6666...", math.isclose(m27["expectancy"], 69.0 / 9.0, rel_tol=1e-9),
+          f"got={m27['expectancy']}")
+    check("27-3c payoff_ratio=30/4.2=7.142857...", math.isclose(m27["payoff_ratio"], 30.0 / 4.2, rel_tol=1e-9),
+          f"got={m27['payoff_ratio']}")
+    check("27-3d max_win=50.0,max_loss=-10.0",
+          math.isclose(m27["max_win"], 50.0) and math.isclose(m27["max_loss"], -10.0),
+          f"max_win={m27['max_win']} max_loss={m27['max_loss']}")
+
+    # 27-4: 連勝/連敗ストリーク。drawはリセットしない: T4(loss),T5(loss),T6(draw,スキップ),T7(loss)=3連敗
+    #   連勝はT1(win)単独・T3(win)単独・T8(win)単独でいずれも1が最大
+    check("27-4a max_consec_wins=1", m27["max_consec_wins"] == 1, f"got={m27['max_consec_wins']}")
+    check("27-4b max_consec_losses=3(drawは非リセット)", m27["max_consec_losses"] == 3,
+          f"got={m27['max_consec_losses']}")
+
+    # 27-5: 取引日数(Exit_Timeの日付ユニーク数)=4日(03-02,03-03,04-01,04-02)。1日平均=9/4=2.25
+    check("27-5a n_trading_days=4(Exit_Time基準)", m27["n_trading_days"] == 4, f"got={m27['n_trading_days']}")
+    check("27-5b avg_trades_per_day=9/4=2.25", math.isclose(m27["avg_trades_per_day"], 2.25),
+          f"got={m27['avg_trades_per_day']}")
+
+    # 27-6: DD/リカバリーF。累積損益系列10,5,35,33,32,32,29,79,69→ピーク相対で最大DD=10.0(USD)
+    #   DD%は各時点のピーク比: 最悪は2件目(peak10→5、-50%)でUSD最大DD地点(-12.66%)より深い
+    check("27-6a max_drawdown=10.0(USD)", math.isclose(m27["max_drawdown"], 10.0), f"got={m27['max_drawdown']}")
+    check("27-6b max_drawdown_pct=50.0(%ベースはUSD最大DD地点と別点)", math.isclose(m27["max_drawdown_pct"], 50.0),
+          f"got={m27['max_drawdown_pct']}")
+    check("27-6c recovery_factor=69/10=6.9", math.isclose(m27["recovery_factor"], 6.9), f"got={m27['recovery_factor']}")
+
+    # 27-7: Sharpe/Sortino(損益ベース)。日次PnL=[5,24,50,-10](4日)・月次PnL=[29,40](2ヶ月)
+    #   ダウンサイド標本が1点のみ(日次:-10のみ/月次:負値なし)→Sortinoはnan
+    check("27-7a sharpe_daily(pythonで事前算出した値と一致)",
+          math.isclose(m27["sharpe_daily"], 14.69895595710862, rel_tol=1e-9), f"got={m27['sharpe_daily']}")
+    check("27-7b sortino_daily=nan(ダウンサイド標本1点)", math.isnan(m27["sortino_daily"]),
+          f"got={m27['sortino_daily']}")
+    check("27-7c sharpe_monthly(pythonで事前算出した値と一致)",
+          math.isclose(m27["sharpe_monthly"], 21.729364676773187, rel_tol=1e-9), f"got={m27['sharpe_monthly']}")
+    check("27-7d sortino_monthly=nan(負の月次PnLなし)", math.isnan(m27["sortino_monthly"]),
+          f"got={m27['sortino_monthly']}")
+
+    # 27-8: RR分布。avg_loss絶対値=4.2。win pnls=[10,30,50]
+    #   k=2: 閾値8.4→3/3=100%。k=3,4,5: 閾値12.6/16.8/21.0→10は届かず,30/50は届く→2/3=66.667%
+    check("27-8a rr_ge[2]=100.0", math.isclose(m27["rr_ge"][2], 100.0), f"got={m27['rr_ge'][2]}")
+    check("27-8b rr_ge[3]=rr_ge[4]=rr_ge[5]=66.6667...",
+          math.isclose(m27["rr_ge"][3], 200.0 / 3.0, rel_tol=1e-9)
+          and math.isclose(m27["rr_ge"][4], 200.0 / 3.0, rel_tol=1e-9)
+          and math.isclose(m27["rr_ge"][5], 200.0 / 3.0, rel_tol=1e-9),
+          f"got={m27['rr_ge']}")
+
+    # 27-9: 全勝データでmax_drawdown=+0.0(-0.0の符号バグ回帰防止)・recovery_factor/pfはinf
+    df27w = pd.DataFrame([
+        (_ts27("2026-05-01 07:00:00"), _ts27("2026-05-01 07:20:00"), "BTC", 10.0, "win"),
+        (_ts27("2026-05-02 07:00:00"), _ts27("2026-05-02 07:20:00"), "BTC", 20.0, "win"),
+    ], columns=["Entry_Time", "Exit_Time", "Symbol", "PnL_USD", "Win_Loss"])
+    m27w = compute_risk_performance_metrics(df27w)
+    check("27-9a 全勝: max_drawdown=+0.0(-0.0でない符号回帰防止)",
+          m27w["max_drawdown"] == 0.0 and math.copysign(1.0, m27w["max_drawdown"]) > 0,
+          f"got={m27w['max_drawdown']} sign={math.copysign(1.0, m27w['max_drawdown'])}")
+    check("27-9b 全勝: recovery_factor=inf,pf=inf(gross_loss=0)",
+          m27w["recovery_factor"] == float("inf") and m27w["pf"] == float("inf"),
+          f"recovery={m27w['recovery_factor']} pf={m27w['pf']}")
+
+    # 27-10: 月別カレンダー(compute_daily_trade_calendar)。2026-03は2日分(day2,day3)・2026-05は該当なしで空
+    cal27_3 = compute_daily_trade_calendar(df27, 2026, 3)
+    check("27-10a 2026-03: day2(n=2,pnl=5.0,win_rate=50.0)/day3(n=5,pnl=24.0,win_rate=25.0)",
+          cal27_3.loc[2, "n"] == 2 and math.isclose(cal27_3.loc[2, "pnl"], 5.0)
+          and math.isclose(cal27_3.loc[2, "win_rate"], 50.0)
+          and cal27_3.loc[3, "n"] == 5 and math.isclose(cal27_3.loc[3, "pnl"], 24.0)
+          and math.isclose(cal27_3.loc[3, "win_rate"], 25.0),
+          f"day2={dict(cal27_3.loc[2])} day3={dict(cal27_3.loc[3])}")
+    cal27_4 = compute_daily_trade_calendar(df27, 2026, 4)
+    check("27-10b 2026-04: day1(n=1,pnl=50.0,win_rate=100.0)/day2(n=1,pnl=-10.0,win_rate=0.0)",
+          cal27_4.loc[1, "n"] == 1 and math.isclose(cal27_4.loc[1, "pnl"], 50.0)
+          and math.isclose(cal27_4.loc[1, "win_rate"], 100.0)
+          and cal27_4.loc[2, "n"] == 1 and math.isclose(cal27_4.loc[2, "pnl"], -10.0)
+          and math.isclose(cal27_4.loc[2, "win_rate"], 0.0),
+          f"day1={dict(cal27_4.loc[1])} day2={dict(cal27_4.loc[2])}")
+    cal27_5 = compute_daily_trade_calendar(df27, 2026, 5)
+    check("27-10c 2026-05(該当トレードなし月)は空DataFrame", cal27_5.empty, f"len={len(cal27_5)}")
+
+    # 27-11: 時間帯別活動(compute_hourly_activity)。常に24行(0-23)ゼロ埋め・合計n_all=9件
+    hr27 = compute_hourly_activity(df27)
+    check("27-11a 常に24行(0-23)を返す", len(hr27) == 24 and list(hr27.index) == list(range(24)),
+          f"len={len(hr27)}")
+    check("27-11b 7時: n_wins=2,n_losses=1,n_all=3,total_pnl=55.0",
+          hr27.loc[7, "n_wins"] == 2 and hr27.loc[7, "n_losses"] == 1 and hr27.loc[7, "n_all"] == 3
+          and math.isclose(hr27.loc[7, "total_pnl"], 55.0), f"got={dict(hr27.loc[7])}")
+    check("27-11c 10時: n_wins=0,n_losses=3(drawは非計上),n_all=4,total_pnl=-6.0",
+          hr27.loc[10, "n_wins"] == 0 and hr27.loc[10, "n_losses"] == 3 and hr27.loc[10, "n_all"] == 4
+          and math.isclose(hr27.loc[10, "total_pnl"], -6.0), f"got={dict(hr27.loc[10])}")
+    check("27-11d トレードなし時間帯(例:0時)はn_all=0", hr27.loc[0, "n_all"] == 0, f"got={hr27.loc[0, 'n_all']}")
+    check("27-11e 全24時間のn_all合計=9(取引総数と一致)", int(hr27["n_all"].sum()) == 9,
+          f"got={hr27['n_all'].sum()}")
+
+    # 27-12: エクイティ曲線(compute_equity_curve)。累積損益10,5,35,33,32,32,29,79,69→ピーク相対DD最大10.0
+    eq27 = compute_equity_curve(df27, starting_equity=0.0)
+    check("27-12a 9行・時系列昇順(Exit_Time順)", len(eq27) == 9 and list(eq27["time"]) == sorted(eq27["time"]),
+          f"len={len(eq27)}")
+    check("27-12b 最終equity=69.0(=net_pnl+starting_equity)", math.isclose(eq27["equity"].iloc[-1], 69.0),
+          f"got={eq27['equity'].iloc[-1]}")
+    check("27-12c 最大DD(USD)=|-10.0|=10.0", math.isclose(abs(float(eq27["drawdown"].min())), 10.0),
+          f"got={eq27['drawdown'].min()}")
+
+    # 27-13: Exit_Time欠損行はEntry_Timeへフォールバック(空/None入力は空DataFrame・規定columns)
+    df27_fb = pd.DataFrame([
+        (_ts27("2026-06-01 07:00:00"), pd.NaT, "BTC", 10.0, "win"),
+        (_ts27("2026-06-02 07:00:00"), _ts27("2026-06-02 08:00:00"), "BTC", -5.0, "loss"),
+    ], columns=["Entry_Time", "Exit_Time", "Symbol", "PnL_USD", "Win_Loss"])
+    eq27_fb = compute_equity_curve(df27_fb, starting_equity=100.0)
+    check("27-13a Exit_Time欠損行はEntry_Timeにフォールバックし時系列順を維持",
+          len(eq27_fb) == 2 and eq27_fb["time"].iloc[0] < eq27_fb["time"].iloc[1]
+          and math.isclose(eq27_fb["equity"].iloc[-1], 105.0),
+          f"time={list(eq27_fb['time'])} equity={list(eq27_fb['equity'])}")
+    eq27_empty = compute_equity_curve(pd.DataFrame())
+    check("27-13b 空df入力は空DataFrame(規定columns)", eq27_empty.empty
+          and list(eq27_empty.columns) == EQUITY_CURVE_COLUMNS, f"cols={list(eq27_empty.columns)}")
 
     print("\n" + "=" * 78)
     if all_ok:
