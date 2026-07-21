@@ -181,6 +181,27 @@ SYMBOL_MASTER: dict[str, dict[str, Any]] = {
 }
 DEFAULT_SYMBOL_CHECKED: dict[str, bool] = {label: (label == "BTC") for label in SYMBOL_MASTER}
 
+# 取引履歴の任意銘柄をチャート表示するためのルーティング(2026-07-21)。
+# BingXの合成商品/指数はyfinanceの相当ティッカーへ、その他(暗号)はccxt bingxの無期限へ。
+_BINGX_CHART_SYNTH: dict[str, dict[str, Any]] = {
+    "GOLD": {"source": "yfinance", "ticker": "GC=F"}, "SILVER": {"source": "yfinance", "ticker": "SI=F"},
+    "WTI": {"source": "yfinance", "ticker": "CL=F"}, "BRENT": {"source": "yfinance", "ticker": "BZ=F"},
+    "NASDAQ": {"source": "yfinance", "ticker": "NQ=F"}, "NIKKEI": {"source": "yfinance", "ticker": "NIY=F"},
+    "SP500": {"source": "yfinance", "ticker": "ES=F"},
+}
+# get_symbol_routingが参照するランタイム登録(main実行ごとに再構築・キャッシュ非依存で決定的)。
+_RUNTIME_CUSTOM_ROUTING: dict[str, dict[str, Any]] = {}
+
+
+def bingx_chart_routing(sym: str) -> dict[str, Any]:
+    """取引銘柄名(例 RIVER / XAUT / WTI)→チャート用データソースルーティング。
+    合成商品/指数はyfinance、それ以外はccxt bingxの無期限(SYM/USDT:USDT)。"""
+    s = str(sym).strip().upper()
+    if s in _BINGX_CHART_SYNTH:
+        return dict(_BINGX_CHART_SYNTH[s])
+    base = s.replace("/USDT:USDT", "").replace("/USDT", "").replace("-USDT", "")
+    return {"source": "ccxt", "exchange": "bingx", "ticker": f"{base}/USDT:USDT"}
+
 # ---- 銘柄カラーパレット(チャート重畳表示用。同系色濃淡でincreasing/decreasingを色分け) --
 SYMBOL_COLORS: dict[str, dict[str, str]] = {
     "BTC": {"inc": "#F7931A", "dec": "#8A5209"},
@@ -2296,6 +2317,9 @@ def get_symbol_routing(label: str, custom_map: Optional[dict[str, dict[str, Any]
         return SYMBOL_MASTER[label]
     if custom_map and label in custom_map:
         return custom_map[label]
+    # 取引履歴の銘柄をチャートするためのランタイム登録(BingX/yfinance・2026-07-21)
+    if label in _RUNTIME_CUSTOM_ROUTING:
+        return _RUNTIME_CUSTOM_ROUTING[label]
     # ルーティング規則: '/'を含む -> ccxt(binance)、それ以外 -> yfinance
     if "/" in label:
         return {"source": "ccxt", "exchange": "binance", "ticker": label}
@@ -4822,6 +4846,331 @@ def _dedupe_trade_label(label: str, existing_labels: list[str]) -> str:
     return f"{label}_{n}"
 
 
+# =====================================================================================
+# 追補v9§1: トレード履歴のレコード・フィルタ(外れ値除外)
+# =====================================================================================
+# 目的: 銘柄・損益額・期間・レバレッジ・方向でトレードを絞り込み、外れ値を除外した状態で
+# 全ての分析(トレード一覧/詳細帯別損益/累積損益/多重クロス表/曜日・月別)を再計算できるようにする。
+# apply_trade_filters は st非依存の純関数(selftest対象)。UI層(_render_trade_filter_ui等)は
+# st.session_state["trade_filters"] にフィルタ状態を保持し、_filtered_record_df を経由して
+# 各ビューへ伝播させる(既存ビュー関数のシグネチャは変更しない)。
+
+
+def apply_trade_filters(df: Optional[pd.DataFrame], filters: Optional[dict[str, Any]]) -> Optional[pd.DataFrame]:
+    """トレードDataFrameへフィルタ条件を適用する純関数(st非依存・selftest対象)。
+
+    filters辞書のキー(全て省略可・Noneはフィルタなしとして扱う):
+      - symbols: list[str] | None        銘柄の許可リスト(空リスト[]は「全除外」= 意図的に0件)
+      - date_start / date_end: date | None   Entry_Time(JST)の日付での範囲(両端含む)
+      - pnl_min / pnl_max: float | None      PnL_USD の範囲(両端含む)
+      - leverage_min / leverage_max: float | None  Leverage の範囲(両端含む)。
+            Leverageが欠落(NaN)している行は「データが無い」のであって「レンジ外の外れ値」
+            ではないため、レバレッジフィルタでは除外しない(値が入っている行にのみ適用)。
+      - side: "ALL" | "LONG" | "SHORT" | None   Side列での絞り込み("ALL"/Noneは無条件)
+
+    戻り値: フィルタ適用後の新しいDataFrame。df自体がNone/空ならそのまま返す(クラッシュしない)。
+    """
+    if df is None or df.empty:
+        return df
+    if not filters:
+        return df.copy()
+    out = df.copy()
+
+    symbols = filters.get("symbols")
+    if symbols is not None and "Symbol" in out.columns:
+        out = out[out["Symbol"].isin(symbols)]
+
+    date_start = filters.get("date_start")
+    date_end = filters.get("date_end")
+    if (date_start is not None or date_end is not None) and "Entry_Time" in out.columns and not out.empty:
+        entry_dates = out["Entry_Time"].dt.date
+        if date_start is not None:
+            out = out[entry_dates >= date_start]
+            entry_dates = entry_dates[out.index]
+        if date_end is not None:
+            out = out[entry_dates <= date_end]
+
+    pnl_min = filters.get("pnl_min")
+    pnl_max = filters.get("pnl_max")
+    if pnl_min is not None and "PnL_USD" in out.columns:
+        out = out[out["PnL_USD"] >= pnl_min]
+    if pnl_max is not None and "PnL_USD" in out.columns:
+        out = out[out["PnL_USD"] <= pnl_max]
+
+    lev_min = filters.get("leverage_min")
+    lev_max = filters.get("leverage_max")
+    if lev_min is not None and "Leverage" in out.columns:
+        out = out[out["Leverage"].isna() | (out["Leverage"] >= lev_min)]
+    if lev_max is not None and "Leverage" in out.columns:
+        out = out[out["Leverage"].isna() | (out["Leverage"] <= lev_max)]
+
+    side = filters.get("side")
+    if side and side != "ALL" and "Side" in out.columns:
+        out = out[out["Side"] == side]
+
+    return out.reset_index(drop=True)
+
+
+def _trade_filter_bounds(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """全レコード(フィルタ適用前の生df)を走査し、フィルタUIの既定値(銘柄一覧・期間・
+    損益/レバレッジの全域)を求める(st非依存)。銘柄フィルタは全dataset recordsへ一括適用する
+    ため、対象データ = 読み込み済み全レコードの合算とする。
+    """
+    symbols: set[str] = set()
+    min_date: Optional[date] = None
+    max_date: Optional[date] = None
+    pnl_min: Optional[float] = None
+    pnl_max: Optional[float] = None
+    lev_min: Optional[float] = None
+    lev_max: Optional[float] = None
+    for r in records:
+        d = r.get("df")
+        if d is None or d.empty:
+            continue
+        symbols.update(str(s) for s in d["Symbol"].dropna().unique().tolist())
+        dates = d["Entry_Time"].dropna().dt.date
+        if not dates.empty:
+            dmin, dmax = dates.min(), dates.max()
+            min_date = dmin if min_date is None else min(min_date, dmin)
+            max_date = dmax if max_date is None else max(max_date, dmax)
+        if "PnL_USD" in d.columns:
+            pnl_series = d["PnL_USD"].dropna()
+            if not pnl_series.empty:
+                pmin, pmax = float(pnl_series.min()), float(pnl_series.max())
+                pnl_min = pmin if pnl_min is None else min(pnl_min, pmin)
+                pnl_max = pmax if pnl_max is None else max(pnl_max, pmax)
+        if "Leverage" in d.columns:
+            lev_series = d["Leverage"].dropna()
+            if not lev_series.empty:
+                lmin, lmax = float(lev_series.min()), float(lev_series.max())
+                lev_min = lmin if lev_min is None else min(lev_min, lmin)
+                lev_max = lmax if lev_max is None else max(lev_max, lmax)
+    return {
+        "symbols": sorted(symbols), "min_date": min_date, "max_date": max_date,
+        "pnl_min": pnl_min, "pnl_max": pnl_max, "lev_min": lev_min, "lev_max": lev_max,
+    }
+
+
+_LEV_BUCKETS = [(0, 1, "1x"), (1, 5, "2-5x"), (5, 10, "6-10x"),
+                (10, 20, "11-20x"), (20, 50, "21-50x"), (50, 1e9, "50x超")]
+
+
+def compute_trade_evaluation(df: Optional[pd.DataFrame]) -> dict:
+    """トレードDataFrame(正規化済み・tz-aware JST)から勝ち負けパターンを機械的に診断する
+    純ロジック(st非依存・selftest対象・2026-07-21)。戻り値=概況/各軸内訳/自動コメント。
+    しきい値ベースでデータ駆動にコメント生成(特定ユーザーにハードコードしない)。"""
+    out: dict = {"ok": False, "insights": []}
+    if df is None or len(df) == 0 or "PnL_USD" not in df.columns:
+        return out
+    d = df.dropna(subset=["PnL_USD"]).copy()
+    if d.empty:
+        return out
+    d["PnL_USD"] = pd.to_numeric(d["PnL_USD"], errors="coerce")
+    d = d.dropna(subset=["PnL_USD"])
+    if d.empty:
+        return out
+    n = len(d)
+    total = float(d["PnL_USD"].sum())
+    wins = d[d["PnL_USD"] > 0]
+    losses = d[d["PnL_USD"] <= 0]
+    gp = float(wins["PnL_USD"].sum())
+    gl = float(-losses["PnL_USD"].sum())
+    out["ok"] = True
+    out["overall"] = {
+        "n": n, "total": total, "win_rate": 100.0 * len(wins) / n,
+        "avg_win": float(wins["PnL_USD"].mean()) if len(wins) else 0.0,
+        "avg_loss": float(losses["PnL_USD"].mean()) if len(losses) else 0.0,
+        "pf": (gp / gl) if gl > 0 else float("inf"),
+    }
+
+    def _agg(series_key_func):
+        rows = {}
+        for _, r in d.iterrows():
+            k = series_key_func(r)
+            if k is None:
+                continue
+            g = rows.setdefault(k, [0, 0.0, 0])  # n, pnl, wins
+            g[0] += 1
+            g[1] += float(r["PnL_USD"])
+            if r["PnL_USD"] > 0:
+                g[2] += 1
+        return {k: {"n": v[0], "pnl": v[1], "wr": 100.0 * v[2] / v[0]} for k, v in rows.items()}
+
+    has_time = "Entry_Time" in d.columns and pd.api.types.is_datetime64_any_dtype(d["Entry_Time"])
+    by_hour = _agg(lambda r: int(r["Entry_Time"].hour)) if has_time else {}
+    WD = ["月", "火", "水", "木", "金", "土", "日"]
+    by_wd = _agg(lambda r: WD[int(r["Entry_Time"].weekday())]) if has_time else {}
+    by_band = _agg(lambda r: hour_to_zone(int(r["Entry_Time"].hour))) if has_time else {}
+    by_sym = _agg(lambda r: str(r.get("Symbol")) if pd.notna(r.get("Symbol")) else None)
+    by_side = _agg(lambda r: str(r.get("Side")) if pd.notna(r.get("Side")) else None)
+
+    def _lev_bucket(v):
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            return None
+        for lo, hi, lab in _LEV_BUCKETS:
+            if lo < x <= hi:
+                return lab
+        return None
+    by_lev = _agg(lambda r: _lev_bucket(r.get("Leverage")))
+    out["by_hour"], out["by_weekday"], out["by_band"] = by_hour, by_wd, by_band
+    out["by_symbol"], out["by_side"], out["by_leverage"] = by_sym, by_side, by_lev
+
+    ins: list = out["insights"]
+    # 1) 利益集中(上位3時間帯が総利益に占める割合)
+    if total > 0 and by_hour:
+        top = sorted(by_hour.items(), key=lambda kv: -kv[1]["pnl"])[:3]
+        top_sum = sum(v["pnl"] for _, v in top if v["pnl"] > 0)
+        if top_sum >= total * 0.8:
+            hrs = "・".join("%d時" % h for h, _ in top)
+            ins.append(("warn", "利益集中", f"総利益の大半が上位3時間帯({hrs})に依存しています"
+                        f"(この帯だけで+{top_sum:,.0f}/総+{total:,.0f} USDT)。少数の当たりトレードが"
+                        "全体を支える=再現性・分散リスクに注意。"))
+    # 2) net負けのSide
+    for sd, v in by_side.items():
+        if v["n"] >= 10 and v["pnl"] < 0:
+            ins.append(("bad", f"{sd}が負け", f"{sd}は{v['n']}件・勝率{v['wr']:.0f}%で"
+                        f"合計{v['pnl']:,.0f} USDT。この方向は機能していません。"))
+    # 3) 数打ちで負け(件数多いのにマイナスの銘柄)
+    for sym, v in sorted(by_sym.items(), key=lambda kv: kv[1]["pnl"]):
+        if v["n"] >= 20 and v["pnl"] < 0:
+            ins.append(("bad", f"{sym}の数打ち", f"{sym}は{v['n']}件と多いのに勝率{v['wr']:.0f}%・"
+                        f"{v['pnl']:,.0f} USDT。回数を絞るか手法見直しを。"))
+            break
+    # 4) 負け時間帯(件数十分で勝率<45%かつマイナス)
+    bad_h = [(h, v) for h, v in by_hour.items() if v["n"] >= 10 and v["pnl"] < 0 and v["wr"] < 45]
+    if bad_h:
+        bad_h.sort(key=lambda kv: kv[1]["pnl"])
+        hh = "・".join("%d時(%+.0f)" % (h, v["pnl"]) for h, v in bad_h[:4])
+        ins.append(("bad", "負け時間帯", f"次の時間帯は負け越しです: {hh}。この帯はロット縮小か見送り検討。"))
+    # 5) 高レバの毀損
+    for lab in ("50x超",):
+        v = by_lev.get(lab)
+        if v and v["pnl"] < 0:
+            ins.append(("bad", "高レバの毀損", f"{lab}は{v['n']}件で{v['pnl']:,.0f} USDT。"
+                        "レバを上げすぎると手数料・滑り・振れで削られます。"))
+    # 6) 問題銘柄(全敗)
+    zeros = [(s, v) for s, v in by_sym.items() if v["n"] >= 3 and v["wr"] == 0]
+    if zeros:
+        names = "・".join("%s(%d戦全敗)" % (s, v["n"]) for s, v in zeros[:4])
+        ins.append(("bad", "全敗銘柄", f"{names}。相性が悪い可能性=一旦停止して検証を。"))
+    # 7) 良い点(net勝ちの帯・銘柄の最大)
+    if by_band:
+        best_band = max(by_band.items(), key=lambda kv: kv[1]["pnl"])
+        if best_band[1]["pnl"] > 0:
+            ins.append(("good", "効いている帯", f"{best_band[0]}が最も稼いでいます"
+                        f"(+{best_band[1]['pnl']:,.0f} USDT・勝率{best_band[1]['wr']:.0f}%)。ここは強み。"))
+    return out
+
+
+def _filtered_record_df(record: Optional[dict[str, Any]]) -> Optional[pd.DataFrame]:
+    """共通ヘルパ: record["df"]へ現在のst.session_state["trade_filters"]を適用したDataFrameを返す。
+    トレード一覧/累積損益/詳細帯別損益/多重クロス表/曜日・月別の全ビューはrecord["df"]を直接読まず
+    これを経由する(UI層。apply_trade_filters自体はst非依存でselftest対象)。
+    """
+    df = record.get("df") if record else None
+    filters = st.session_state.get("trade_filters")
+    return apply_trade_filters(df, filters)
+
+
+_TRADE_FILTER_SIDE_OPTIONS: list[str] = ["すべて", "LONGのみ", "SHORTのみ"]
+_TRADE_FILTER_SIDE_MAP: dict[str, str] = {"すべて": "ALL", "LONGのみ": "LONG", "SHORTのみ": "SHORT"}
+
+
+def _render_trade_filter_ui(records: list[dict[str, Any]]) -> None:
+    """追補v9§1: 🔍 レコードのフィルタ(外れ値除外)UI。
+    銘柄・期間・損益額・レバレッジ・方向でトレードを絞り込む。結果は st.session_state["trade_filters"]
+    に保持し、以降の全分析ビューへ _filtered_record_df 経由で伝播する。
+    """
+    bounds = _trade_filter_bounds(records)
+    total_n = sum(0 if r.get("df") is None else len(r["df"]) for r in records)
+
+    with st.expander("🔍 レコードのフィルタ(外れ値除外)", expanded=False):
+        if not bounds["symbols"] or bounds["min_date"] is None:
+            st.caption("フィルタ対象の有効なトレードデータがありません。")
+            st.session_state["trade_filters"] = {}
+            return
+
+        if st.button("フィルタを解除", key="trade_filter_reset_btn"):
+            for k in (
+                "trade_filter_symbols", "trade_filter_date_start", "trade_filter_date_end",
+                "trade_filter_pnl_range", "trade_filter_lev_range", "trade_filter_side",
+            ):
+                st.session_state.pop(k, None)
+            st.rerun()
+
+        # 既存の選択がbounds再計算(レコード削除等)で範囲外になっていたら安全にクランプする
+        # (st.multiselect/st.sliderはkey経由の現在値がoptions/min~maxを外れると例外になるため)。
+        if "trade_filter_symbols" in st.session_state:
+            st.session_state["trade_filter_symbols"] = [
+                s for s in st.session_state["trade_filter_symbols"] if s in bounds["symbols"]
+            ]
+        symbols_sel = st.multiselect(
+            "銘柄(除外したい銘柄を外してください)", bounds["symbols"],
+            default=bounds["symbols"], key="trade_filter_symbols",
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            date_start_sel = st.date_input(
+                "開始日", value=bounds["min_date"], key="trade_filter_date_start",
+            )
+        with c2:
+            date_end_sel = st.date_input(
+                "終了日", value=bounds["max_date"], key="trade_filter_date_end",
+            )
+
+        pnl_lo, pnl_hi = bounds["pnl_min"], bounds["pnl_max"]
+        if pnl_lo is None:
+            pnl_lo, pnl_hi = 0.0, 0.0
+        pnl_lo, pnl_hi = float(math.floor(pnl_lo)), float(math.ceil(pnl_hi))
+        if pnl_lo == pnl_hi:
+            pnl_hi = pnl_lo + 1.0
+        if "trade_filter_pnl_range" in st.session_state:
+            slo, shi = st.session_state["trade_filter_pnl_range"]
+            st.session_state["trade_filter_pnl_range"] = (max(slo, pnl_lo), min(max(shi, slo), pnl_hi))
+        pnl_range_sel = st.slider(
+            "損益額レンジ(USD)・「±N以内だけ」等で外れ値カット", min_value=pnl_lo, max_value=pnl_hi,
+            value=(pnl_lo, pnl_hi), key="trade_filter_pnl_range",
+        )
+
+        lev_lo, lev_hi = bounds["lev_min"], bounds["lev_max"]
+        if lev_lo is not None:
+            lev_lo, lev_hi = float(math.floor(lev_lo)), float(math.ceil(lev_hi))
+            if lev_lo == lev_hi:
+                lev_hi = lev_lo + 1.0
+            if "trade_filter_lev_range" in st.session_state:
+                slo, shi = st.session_state["trade_filter_lev_range"]
+                st.session_state["trade_filter_lev_range"] = (max(slo, lev_lo), min(max(shi, slo), lev_hi))
+            lev_range_sel = st.slider(
+                "レバレッジ・レンジ(倍)", min_value=lev_lo, max_value=lev_hi,
+                value=(lev_lo, lev_hi), key="trade_filter_lev_range",
+            )
+        else:
+            lev_range_sel = None
+            st.caption("レバレッジ情報を含むトレードがないため、レバレッジフィルタは無効です。")
+
+        side_label_sel = st.radio(
+            "方向", _TRADE_FILTER_SIDE_OPTIONS, key="trade_filter_side", horizontal=True,
+        )
+
+        filters: dict[str, Any] = {
+            "symbols": list(symbols_sel),
+            "date_start": date_start_sel, "date_end": date_end_sel,
+            "pnl_min": pnl_range_sel[0], "pnl_max": pnl_range_sel[1],
+            "leverage_min": lev_range_sel[0] if lev_range_sel else None,
+            "leverage_max": lev_range_sel[1] if lev_range_sel else None,
+            "side": _TRADE_FILTER_SIDE_MAP.get(side_label_sel, "ALL"),
+        }
+        st.session_state["trade_filters"] = filters
+
+        filtered_n = sum(
+            0 if r.get("df") is None else len(apply_trade_filters(r["df"], filters)) for r in records
+        )
+        st.caption(f"元{total_n}件 → 残{filtered_n}件(除外{total_n - filtered_n}件)")
+
+
 def _decode_trade_csv_bytes(content: bytes) -> tuple[Optional[pd.DataFrame], list[str]]:
     """utf-8-sig→cp932の順でCSVバイト列をデコードする(単一ファイル時代からの既存作法を踏襲)。"""
     decode_errs: list[str] = []
@@ -4867,6 +5216,59 @@ def _load_sample_trade_datasets(records: list[dict[str, Any]]) -> None:
     """追補v4§1.1: 「サンプル(弟子+師匠)を読み込む」。既存レコードは壊さず2件を追記する。"""
     _add_trade_dataset_record(records, "弟子", generate_sample_trades(), "サンプルデータ(弟子・アプリ内生成)")
     _add_trade_dataset_record(records, "師匠", generate_sample_trades_mentor(), "サンプルデータ(師匠・アプリ内生成)")
+
+
+def render_trade_evaluation(records: list[dict[str, Any]]) -> None:
+    """🩺 自動評価(勝ち負けパターン診断・2026-07-21)。現在のフィルタ適用後の全トレードを
+    compute_trade_evaluationで機械診断し、概況・自動コメント・軸別内訳を表示する。"""
+    frames = [_filtered_record_df(r) for r in records]
+    frames = [f for f in frames if f is not None and len(f)]
+    if not frames:
+        return
+    df = pd.concat(frames, ignore_index=True)
+    ev = compute_trade_evaluation(df)
+    if not ev.get("ok"):
+        return
+    with st.expander("🩺 自動評価(いつ・なぜ勝ち負けしているか診断)", expanded=True):
+        o = ev["overall"]
+        st.caption("フィルタ適用後の全トレードを機械診断します(外れ値を除外したい場合は上の🔍フィルタで調整)。")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("トレード数", f"{o['n']:,}")
+        c2.metric("合計損益(USD)", f"{o['total']:,.0f}")
+        c3.metric("勝率", f"{o['win_rate']:.1f}%")
+        pf = o["pf"]
+        c4.metric("プロフィットファクター", "∞" if pf == float("inf") else f"{pf:.2f}")
+        st.caption(f"平均勝ち +{o['avg_win']:.1f} / 平均負け {o['avg_loss']:.1f} USD")
+        ICON = {"good": "✅", "warn": "⚠️", "bad": "🔻"}
+        if ev["insights"]:
+            st.markdown("**診断コメント**")
+            for sev, title, msg in ev["insights"]:
+                st.markdown(f"{ICON.get(sev, '・')} **{title}** — {msg}")
+        else:
+            st.info("目立った偏りは検出されませんでした。")
+
+        def _tbl(title, agg, key_order=None, ascending=True):
+            if not agg:
+                return
+            items = sorted(agg.items(), key=lambda kv: kv[1]["pnl"], reverse=not ascending)
+            if key_order:
+                items = sorted(agg.items(), key=lambda kv: key_order.index(kv[0])
+                               if kv[0] in key_order else 999)
+            tdf = pd.DataFrame([{"区分": k, "件数": v["n"], "損益USD": round(v["pnl"], 1),
+                                 "勝率%": round(v["wr"], 0)} for k, v in items])
+            st.markdown(f"**{title}**")
+            st.dataframe(tdf, use_container_width=True, hide_index=True)
+
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            _tbl("セッション帯別", ev["by_band"], key_order=BAND_ORDER)
+            _tbl("方向別", ev["by_side"])
+            _tbl("レバレッジ別", ev["by_leverage"],
+                 key_order=[lab for _, _, lab in _LEV_BUCKETS])
+        with cc2:
+            _tbl("銘柄別(損益昇順)", dict(sorted(ev["by_symbol"].items(),
+                 key=lambda kv: kv[1]["pnl"])[:12]))
+            _tbl("曜日別", ev["by_weekday"], key_order=["月", "火", "水", "木", "金", "土", "日"])
 
 
 def render_trade_history_tab() -> None:
@@ -4927,6 +5329,10 @@ def render_trade_history_tab() -> None:
         st.info("トレード履歴CSVをアップロードするか、「サンプル(弟子+師匠)を読み込む」をクリックしてください。")
         return
 
+    # 追補v9§1: 銘柄・期間・損益・レバレッジ・方向でのレコードフィルタ(外れ値除外)。
+    # アップロード直後・下の一覧/分析より上に配置し、以降の全ビューへ一括で伝播させる。
+    _render_trade_filter_ui(records)
+
     # 追補v4§1.1: データセットごとのラベル編集/削除UI(同名は自動連番。1件時も同じUIを出すが
     # 既存単一ファイル運用と体感を変えないよう選択selectboxは2件以上でのみ表示)。
     st.markdown("**読み込み済みデータセット**")
@@ -4974,25 +5380,43 @@ def render_trade_history_tab() -> None:
     if combined_stats:
         parts: list[pd.DataFrame] = []
         srcs: list[str] = []
+        had_any_unfiltered = False
         for r in records:
             if r["df"] is None or r["df"].empty:
                 continue
-            p = r["df"].copy()
+            had_any_unfiltered = True
+            fdf = _filtered_record_df(r)
+            if fdf is None or fdf.empty:
+                continue
+            p = fdf.copy()
             p.insert(0, "データセット", r["label"])
             parts.append(p)
             srcs.append(f"{r['label']}({len(p)}件)")
         if not parts:
-            st.info("有効なトレードデータがありません。")
+            if had_any_unfiltered:
+                st.warning("🔍 フィルタ条件に合うトレードがありません。上の「レコードのフィルタ」を調整してください。")
+            else:
+                st.info("有効なトレードデータがありません。")
             return
         trades_df = pd.concat(parts, ignore_index=True)
         source_name = " + ".join(srcs)
         st.caption(f"📊 データ元(合算): {source_name} | 指標は全データセットを1つの成績として時系列合算で計算")
     else:
         active_rec = next(r for r in records if r["label"] == active_label)
-        trades_df = active_rec["df"]
+        raw_active_df = active_rec["df"]
         source_name = active_rec["source_name"]
-        if trades_df is None or trades_df.empty:
+        if raw_active_df is None or raw_active_df.empty:
             st.info(f"「{active_label}」に有効なトレードデータがありません。")
+            if len(records) >= 2:
+                st.divider()
+                _render_trader_comparison_view(records)
+            return
+        trades_df = _filtered_record_df(active_rec)
+        if trades_df is None or trades_df.empty:
+            st.warning(
+                f"🔍 「{active_label}」はフィルタ条件に合うトレードがありません。"
+                "上の「レコードのフィルタ」を調整してください。"
+            )
             if len(records) >= 2:
                 st.divider()
                 _render_trader_comparison_view(records)
@@ -5029,6 +5453,9 @@ def render_trade_history_tab() -> None:
     m8.metric("最大ドローダウン(USD)", _fmt_stat(overall["max_dd_usd"]))
 
     st.metric("最大連敗数", f"{overall['max_consec_losses']}回")
+
+    # 🩺 自動評価(いつ・なぜ勝ち負けしているか診断・2026-07-21)。フィルタ適用後の全トレードが対象。
+    render_trade_evaluation(records)
 
     st.markdown("**トレード一覧**" + ("(全データセット・時系列)" if combined_stats else ""))
     disp = df.copy().sort_values("Entry_Time")
@@ -5115,7 +5542,7 @@ def _render_trader_comparison_view(records: list[dict[str, Any]]) -> None:
     rec_b = next(r for r in records if r["label"] == label_b)
 
     def _stats_of(rec: dict[str, Any]) -> Optional[tuple[pd.DataFrame, dict[str, Any]]]:
-        d = rec.get("df")
+        d = _filtered_record_df(rec)
         if d is None or d.empty:
             return None
         assigned = assign_trade_sessions(d)
@@ -5124,7 +5551,7 @@ def _render_trader_comparison_view(records: list[dict[str, Any]]) -> None:
     res_a = _stats_of(rec_a)
     res_b = _stats_of(rec_b)
     if res_a is None or res_b is None:
-        st.info("両方のデータセットに有効なトレードが必要です。")
+        st.info("🔍 両方のデータセットに(フィルタ後も)有効なトレードが必要です。上の「レコードのフィルタ」を確認してください。")
         return
     assigned_a, stats_a = res_a
     assigned_b, stats_b = res_b
@@ -7737,6 +8164,29 @@ def main() -> None:
         st.session_state["custom_tickers"].remove(remove_target)
         st.rerun()
 
+    # 取引履歴の銘柄をチャート表示(BingX・2026-07-21)。アップロード済みトレードの銘柄のうち
+    # プリセット外のものを選ぶと、ccxt bingx(暗号)/ yfinance(合成商品)から価格を取得してチャート化する。
+    _RUNTIME_CUSTOM_ROUTING.clear()
+    _trade_recs = st.session_state.get("trade_dataset_records", [])
+    _traded_syms: list[str] = []
+    for _rec in _trade_recs:
+        _rdf = _rec.get("df")
+        if _rdf is not None and "Symbol" in _rdf.columns:
+            for _s in _rdf["Symbol"].dropna().astype(str).unique():
+                if _s and _s not in SYMBOL_MASTER and _s not in _traded_syms:
+                    _traded_syms.append(_s)
+    if _traded_syms:
+        st.sidebar.markdown("**取引履歴の銘柄をチャート(BingX)**")
+        _picked = st.sidebar.multiselect(
+            "アップロードした取引の銘柄", sorted(_traded_syms), default=[],
+            key="traded_symbol_chart_pick",
+            help="選ぶとBingX(暗号)またはyfinance(金/原油/指数)から価格を取得してチャート表示します。",
+        )
+        for _s in _picked:
+            _RUNTIME_CUSTOM_ROUTING[_s] = bingx_chart_routing(_s)
+            if _s not in selected_labels:
+                selected_labels.append(_s)
+
     # ------------------------------------------------------------------
     # ①の続き: yfinance 730日クランプは銘柄選択が確定した後にのみ適用する
     #   (ccxt(binance/bybit)専用選択時はyfinanceの制約と無関係なため、不要なクランプ・警告を
@@ -7791,10 +8241,13 @@ def main() -> None:
         st.sidebar.info("期間が120日を超えるためセッション背景帯を自動OFFにしました。")
 
     # 追補v4§2.2: トレードマーカー表示トグル(既定ON)。トレード読込時のみ実際に描画される。
-    trade_ds_labels_for_ui = [
-        rec["label"] for rec in st.session_state.get("trade_dataset_records", [])
-        if rec.get("df") is not None and not rec["df"].empty
-    ]
+    # 追補v9§1: レコードフィルタ適用後(_filtered_record_df)に0件化したデータセットは
+    # マーカー選択肢からも除く(フィルタが全ビューへ一貫して伝播するため)。
+    trade_ds_labels_for_ui = []
+    for _rec in st.session_state.get("trade_dataset_records", []):
+        _fdf = _filtered_record_df(_rec)
+        if _fdf is not None and not _fdf.empty:
+            trade_ds_labels_for_ui.append(_rec["label"])
     show_trade_markers = st.sidebar.toggle(
         "トレードマーカー表示", value=True, key="show_trade_markers",
         help="チャートにエントリー▲/決済✕マーカーを重ねる(トレードCSV読込時のみ有効)。",
@@ -7856,9 +8309,11 @@ def main() -> None:
 
     # 追補v4§1.2: 複数トレードデータセット(rid付きレコードのリスト)を集計し、
     # ラベル→{trades_assigned, stats}のdictとして各セクションへ伝播する。
+    # 追補v9§1: record["df"]を直接読まず_filtered_record_df経由にすることで、🔍レコードの
+    # フィルタが多重クロス表/チャートのトレードマーカー/曜日・月別タブ全てへ一括反映される。
     trade_datasets: dict[str, dict[str, Any]] = {}
     for rec in st.session_state.get("trade_dataset_records", []):
-        norm_df = rec.get("df")
+        norm_df = _filtered_record_df(rec)
         if norm_df is None or norm_df.empty:
             continue
         try:
@@ -8252,6 +8707,121 @@ def run_selftest() -> bool:
     csv_bytes = b"Entry_Time,Symbol,PnL_USD\n2026-01-01 10:00,BTC,5\n"
     rdf, rerr = _read_uploaded_trade_bytes(csv_bytes, "x.csv")
     check("5-11 _read_uploaded: CSVは従来通り読める", rdf is not None and len(rdf) == 1 and not rerr)
+
+    # 5-11c bingx_chart_routing + _RUNTIME_CUSTOM_ROUTING(取引銘柄チャート・2026-07-21)
+    r_river = bingx_chart_routing("RIVER")
+    r_wti = bingx_chart_routing("WTI")
+    _RUNTIME_CUSTOM_ROUTING.clear()
+    _RUNTIME_CUSTOM_ROUTING["RIVER"] = bingx_chart_routing("RIVER")
+    rr = get_symbol_routing("RIVER")
+    _RUNTIME_CUSTOM_ROUTING.clear()
+    check("5-11c bingx_chart_routing: 暗号=bingx / 合成商品=yfinance / get_symbol_routing連携",
+          r_river == {"source": "ccxt", "exchange": "bingx", "ticker": "RIVER/USDT:USDT"}
+          and r_wti == {"source": "yfinance", "ticker": "CL=F"}
+          and rr["exchange"] == "bingx"
+          and get_symbol_routing("BTC")["exchange"] == "binance")  # プリセットは不変
+
+    # 5-11b compute_trade_evaluation: 診断ロジック(net負けSide検出n>=10/概況/空入力)
+    _pnls = [-10.0, -12.0, -8.0, 5.0, -15.0, -6.0, 4.0, -9.0, -11.0, -7.0, -5.0]  # 11件・合計-74
+    ev_df = pd.DataFrame({
+        "Entry_Time": pd.to_datetime([f"2026-01-{d:02d} 21:00" for d in range(1, 12)]).tz_localize("Asia/Tokyo"),
+        "Exit_Time": pd.to_datetime([f"2026-01-{d:02d} 22:00" for d in range(1, 12)]).tz_localize("Asia/Tokyo"),
+        "Symbol": ["BTC"] * 11, "Side": ["SHORT"] * 11, "Leverage": [10] * 11,
+        "PnL_USD": _pnls, "PnL_Percent": [None] * 11,
+        "Win_Loss": ["win" if p > 0 else "loss" for p in _pnls],
+    })
+    ev = compute_trade_evaluation(ev_df)
+    ev_side_bad = any(t == "SHORTが負け" for _, t, _ in ev.get("insights", []))
+    check("5-11b compute_trade_evaluation: 概況+net負けSide検出(n>=10)+空入力安全",
+          ev["ok"] and ev["overall"]["n"] == 11 and abs(ev["overall"]["total"] - sum(_pnls)) < 1e-6
+          and ev_side_bad and compute_trade_evaluation(None)["ok"] is False
+          and compute_trade_evaluation(pd.DataFrame())["ok"] is False)
+
+    # -----------------------------------------------------------------
+    # 5b. apply_trade_filters: トレード履歴のレコード・フィルタ(外れ値除外・純ロジック)
+    # -----------------------------------------------------------------
+    print("\n--- 5b. apply_trade_filters ---")
+    filt_rows = [
+        # (Entry_Time, Symbol, PnL_USD, Side, Leverage)
+        ("2026-06-01 07:00:00", "BTC", 100.0, "LONG", 10.0),
+        ("2026-06-02 08:00:00", "ETH", -50.0, "SHORT", 5.0),
+        ("2026-06-03 09:00:00", "WTI", -300.0, "LONG", 20.0),
+        ("2026-06-04 10:00:00", "GOLD", 40.0, "SHORT", np.nan),
+        ("2026-06-05 11:00:00", "BTC", 15.0, "LONG", 3.0),
+    ]
+    filt_df = pd.DataFrame({
+        "Entry_Time": [pd.Timestamp(t, tz="Asia/Tokyo") for t, *_ in filt_rows],
+        "Exit_Time": [pd.NaT] * len(filt_rows),
+        "Symbol": [s for _, s, _, _, _ in filt_rows],
+        "PnL_USD": [p for _, _, p, _, _ in filt_rows],
+        "PnL_Percent": [np.nan] * len(filt_rows),
+        "Win_Loss": ["win" if p > 0 else "loss" for _, _, p, _, _ in filt_rows],
+        "Side": [sd for _, _, _, sd, _ in filt_rows],
+        "Leverage": [lv for _, _, _, _, lv in filt_rows],
+        "Entry_Price": [np.nan] * len(filt_rows),
+        "Exit_Price": [np.nan] * len(filt_rows),
+    })
+
+    no_filter = apply_trade_filters(filt_df, {})
+    check("5-12 apply_trade_filters: 空フィルタ({})は全件通過", no_filter is not None and len(no_filter) == len(filt_rows))
+    check("5-12b apply_trade_filters: filters=Noneも全件通過(dfはコピー)",
+          apply_trade_filters(filt_df, None) is not filt_df and len(apply_trade_filters(filt_df, None)) == len(filt_rows))
+
+    sym_filtered = apply_trade_filters(filt_df, {"symbols": ["BTC", "ETH"]})
+    check("5-13 apply_trade_filters: 銘柄フィルタ(WTI/GOLD除外)",
+          sym_filtered is not None and set(sym_filtered["Symbol"].unique()) == {"BTC", "ETH"} and len(sym_filtered) == 3,
+          f"got={None if sym_filtered is None else sorted(sym_filtered['Symbol'].unique())}")
+
+    pnl_filtered = apply_trade_filters(filt_df, {"pnl_min": -100.0, "pnl_max": 100.0})
+    check("5-14 apply_trade_filters: 損益額レンジ(-300のWTIのみ除外)",
+          pnl_filtered is not None and len(pnl_filtered) == 4 and "WTI" not in set(pnl_filtered["Symbol"]),
+          f"len={None if pnl_filtered is None else len(pnl_filtered)}")
+
+    date_filtered = apply_trade_filters(filt_df, {"date_start": date(2026, 6, 2), "date_end": date(2026, 6, 4)})
+    check("5-15 apply_trade_filters: 期間フィルタ(6/2〜6/4の3件のみ)",
+          date_filtered is not None and len(date_filtered) == 3
+          and set(date_filtered["Symbol"]) == {"ETH", "WTI", "GOLD"},
+          f"got={None if date_filtered is None else sorted(date_filtered['Symbol'])}")
+
+    lev_filtered = apply_trade_filters(filt_df, {"leverage_min": 5.0, "leverage_max": 15.0})
+    # Leverage=NaN行(GOLD)は「データ欠落」であり「レンジ外の外れ値」ではないため保持する方針。
+    # 20xのWTI(レンジ超過)・3xのBTC(2026-06-05・レンジ未満)の2件がレンジ外として除外され、
+    # 10xのBTC・5xのETH・NaNのGOLDの3件が残る。
+    lev_ok = (
+        lev_filtered is not None and len(lev_filtered) == 3
+        and set(lev_filtered["Symbol"]) == {"BTC", "ETH", "GOLD"}
+        and lev_filtered[lev_filtered["Entry_Time"] == filt_df["Entry_Time"].iloc[4]].empty
+    )
+    check("5-16 apply_trade_filters: レバレッジレンジ(20x/3x行を除外・欠落Leverageは保持)", lev_ok,
+          f"len={None if lev_filtered is None else len(lev_filtered)} "
+          f"symbols={None if lev_filtered is None else sorted(lev_filtered['Symbol'])}")
+
+    side_filtered = apply_trade_filters(filt_df, {"side": "SHORT"})
+    check("5-17 apply_trade_filters: 方向フィルタ(SHORTのみ2件)",
+          side_filtered is not None and len(side_filtered) == 2 and set(side_filtered["Side"]) == {"SHORT"},
+          f"len={None if side_filtered is None else len(side_filtered)}")
+
+    combo_filtered = apply_trade_filters(filt_df, {"symbols": ["BTC"], "side": "LONG", "pnl_min": 0.0})
+    check("5-18 apply_trade_filters: 複合フィルタ(銘柄+方向+損益下限でBTC2件)",
+          combo_filtered is not None and len(combo_filtered) == 2 and set(combo_filtered["Symbol"]) == {"BTC"},
+          f"len={None if combo_filtered is None else len(combo_filtered)}")
+
+    empty_filtered = apply_trade_filters(filt_df, {"symbols": []})
+    check("5-19 apply_trade_filters: 銘柄0選択(全除外)は空dfを返しクラッシュしない",
+          empty_filtered is not None and len(empty_filtered) == 0 and list(empty_filtered.columns) == list(filt_df.columns))
+
+    check("5-20 apply_trade_filters: 空df入力は空dfのまま(クラッシュしない)",
+          apply_trade_filters(pd.DataFrame(), {"symbols": ["BTC"]}).empty)
+    check("5-21 apply_trade_filters: None入力はNoneのまま(クラッシュしない)",
+          apply_trade_filters(None, {"symbols": ["BTC"]}) is None)
+
+    bounds5 = _trade_filter_bounds([{"df": filt_df}, {"df": None}, {"df": pd.DataFrame()}])
+    check("5-22 _trade_filter_bounds: 銘柄一覧/期間/損益/レバレッジの全域が正しく求まる",
+          bounds5["symbols"] == ["BTC", "ETH", "GOLD", "WTI"]
+          and bounds5["min_date"] == date(2026, 6, 1) and bounds5["max_date"] == date(2026, 6, 5)
+          and abs(bounds5["pnl_min"] - (-300.0)) < 1e-9 and abs(bounds5["pnl_max"] - 100.0) < 1e-9
+          and abs(bounds5["lev_min"] - 3.0) < 1e-9 and abs(bounds5["lev_max"] - 20.0) < 1e-9,
+          f"got={bounds5}")
 
     # -----------------------------------------------------------------
     # 6. クロス表組み立て: 市場統計のみ/トレードのみ/両方 の3ケース
