@@ -34,6 +34,7 @@ import json
 import os
 import gc
 import calendar
+import hashlib
 import hmac
 import math
 import re
@@ -44,7 +45,7 @@ import inspect
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -392,6 +393,9 @@ _ALIASES_RAW: dict[str, list[str]] = {
     "Leverage": ["leverage", "レバレッジ", "レバ", "lev", "倍率"],
     "Entry_Price": ["entry_price", "entryprice", "entry price", "エントリー価格", "建値", "購入価格"],
     "Exit_Price": ["exit_price", "exitprice", "exit price", "決済価格", "エグジット価格", "売却価格"],
+    # 追補v9.1: レビュー反映 — 実数量列(任意)。ポジションサイズをPnL_Percentからの逆算(レバ倍
+    # 過大評価バグの原因)ではなく実数量から直接復元するために追加(reconstruct_trades_for_exit_sim参照)。
+    "Quantity": ["quantity", "qty", "数量", "約定数量", "成交数量"],
 }
 
 WIN_TOKENS = {"win", "w", "win", "勝ち", "勝", "勝利", "true", "yes"}
@@ -666,7 +670,12 @@ def reconstruct_bingx_order_history(df: pd.DataFrame) -> tuple[pd.DataFrame, lis
     ポジション会計: Openで数量・加重平均建値・建玉時刻を集約、CloseでRealized PNLを確定損益とし、
     エントリー=集約平均建値/建玉時刻、エグジット=当該Closeの約定価格/時刻で1トレードを発行する
     (部分決済は複数トレードになる=各実現イベントが1トレード)。ヘッジ(Long/Short)は別建玉。
-    時刻はUTC+8→JST(+1h)。損益はRealized PNL列(手数料別)。"""
+    時刻はUTC+8→JST(+1h)。損益はRealized PNL列(手数料別)。
+    Quantity列(追補v9.1: レビュー反映)=当該決済(Close)の実約定数量(cq=min(決済数量,残玉数量))。
+    建玉前クローズ(orphan)行はエントリー情報が無くQuantityも算出不能なためNoneを入れる。
+    この列は下流のreconstruct_trades_for_exit_simがポジションサイズを実数量から直接復元する
+    ために使う(PnL_Percentは価格変動%でありレバレッジを含まないため、それだけからサイズを
+    逆算するとレバレッジ倍に過大評価するバグがあった。詳細は同関数のdocstring参照)。"""
     cmap = {str(c).strip().lower(): c for c in df.columns}
 
     def col(*names):
@@ -729,7 +738,8 @@ def reconstruct_bingx_order_history(df: pd.DataFrame) -> tuple[pd.DataFrame, lis
                     "Symbol": _bingx_symbol(pair), "PnL_USD": rpnl,
                     "PnL_Percent": (px / avg - 1.0) * 100.0 * sgn if avg else None,
                     "Win_Loss": "win" if rpnl > 0 else "loss", "Side": side.upper(),
-                    "Leverage": st_["lev"], "Entry_Price": avg, "Exit_Price": px})
+                    "Leverage": st_["lev"], "Entry_Price": avg, "Exit_Price": px,
+                    "Quantity": cq})
                 st_["qty"] -= cq
                 st_["cost"] -= cq * avg
                 if st_["qty"] <= 1e-12:
@@ -741,7 +751,8 @@ def reconstruct_bingx_order_history(df: pd.DataFrame) -> tuple[pd.DataFrame, lis
                     "Entry_Time": t, "Exit_Time": t, "Symbol": _bingx_symbol(pair),
                     "PnL_USD": rpnl, "PnL_Percent": None,
                     "Win_Loss": "win" if rpnl > 0 else "loss", "Side": side.upper(),
-                    "Leverage": lev, "Entry_Price": None, "Exit_Price": px if px > 0 else None})
+                    "Leverage": lev, "Entry_Price": None, "Exit_Price": px if px > 0 else None,
+                    "Quantity": None})
     out = pd.DataFrame(trades)
     open_left = sum(1 for s in pos.values() if s["qty"] > 1e-9)
     if not out.empty:
@@ -909,6 +920,11 @@ def normalize_trades_csv(raw_df: pd.DataFrame) -> tuple[Optional[pd.DataFrame], 
         df["Exit_Price"] = _clean_numeric_series(df["Exit_Price"])
     else:
         df["Exit_Price"] = np.nan
+    # 追補v9.1: レビュー反映 — Quantity(実数量。任意列)もLeverage等と同様に数値化して通す。
+    if "Quantity" in df.columns:
+        df["Quantity"] = _clean_numeric_series(df["Quantity"])
+    else:
+        df["Quantity"] = np.nan
 
     # Win_Loss未確定(欠落 or 認識不能)はPnL_USDの符号から導出。0は引き分け。
     def _derive(row):
@@ -962,7 +978,7 @@ def normalize_trades_csv(raw_df: pd.DataFrame) -> tuple[Optional[pd.DataFrame], 
 
     keep_cols = [
         "Entry_Time", "Exit_Time", "Symbol", "PnL_USD", "PnL_Percent", "Win_Loss",
-        "Side", "Leverage", "Entry_Price", "Exit_Price",
+        "Side", "Leverage", "Entry_Price", "Exit_Price", "Quantity",
     ]
     df = df[keep_cols]
     if errors:
@@ -6195,6 +6211,722 @@ def _render_trader_comparison_view(records: list[dict[str, Any]]) -> None:
 
 
 # =====================================================================================
+# 追補v9: エグジット最適化(What-if再シミュレーション) — 純ロジック関数群
+# =====================================================================================
+# st非依存・selftest対象。「SL/TP/最大保有時間が違っていたら?」をローソク足first-touch判定で
+# 再シミュレーションする(ForexTester「Exit Optimization」相当)。
+#
+# 仕様の要点(実装judgment call込み):
+#  - SL/TPはレバレッジ考慮ROE%(証拠金に対する損益%)で指定する。価格換算は
+#    move_frac=(pct/100)/Leverage、LONG: sl=entry*(1-frac)/tp=entry*(1+frac)、SHORTは鏡像。
+#  - サイズ復元(追補v9.1: レビュー反映で全面訂正): 主経路は実数量列Quantityから
+#    notional=qty*Entry_Price/margin=notional/Leverageを直接算出する。Quantity欠損時のみ
+#    フォールバックとしてnotional=PnL_USD/(PnL_Percent/100)(PnL_Percentは価格変動%であり
+#    レバレッジ非考慮のため、旧実装はこれを「margin」と誤解釈しさらに×Leverageしてqtyが
+#    レバレッジ倍に過大化するバグがあった。詳細はreconstruct_trades_for_exit_sim参照)。
+#    手数料は実績・シミュ両方に同じfee_est(=実績gross-実績net。ファンディング込みの実効
+#    コスト近似)を適用するため比率で相殺する。
+#  - first-touch判定はバーごと時系列順(エントリーを含むバーも判定対象=近似。バー内の
+#    エントリー前の値動きが混入し得る)。同一バーで両方の閾値に触れた場合はSL優先
+#    (保守的近似)。約定価格は閾値価格そのもの(スリッページなし=近似)。
+#  - 保有時間トグルOFF時はExit_Timeまでを窓とする。窓内のどちらの閾値にも触れず終端に達したら
+#    実績の決済価格/時刻をそのまま採用する(「実績決済(触れず)」。追補v9.1: 実績決済価格が
+#    判明しているためバーcloseで近似する必要がないと判断)。保有時間トグルON時のみ、最後の
+#    バーのcloseで決済し「時間切れ」(データが目標時刻近くまで届いた)/「データ端」(それより
+#    手前で尽きた)を区別する(閾値はbar_interval、選択足種のバー幅そのもの)。
+#  - Side欠損行はLONG扱いとする(実データでは全件Side判明が前提だが、念のための既定値)。
+
+
+EXIT_SIM_SL_TP_GRID: list[float] = [2, 3, 5, 7.5, 10, 15, 20, 30, 50, 75, 100, 150, 200, 300, 500]
+EXIT_SIM_HOLD_HOUR_CHOICES: list[int] = [1, 2, 4, 8, 12, 24, 48, 72, 168, 336, 720, 1440, 2880, 5100]
+EXIT_SIM_RECON_COLS: list[str] = [
+    "Entry_Time", "Exit_Time", "Symbol", "PnL_USD", "PnL_Percent", "Side", "Leverage",
+    "Entry_Price", "Exit_Price", "Quantity",
+]
+
+# ZOOM_INTERVAL_MAP(1分足(暗号のみ)->"1m"等)の実足種文字列->名目バー幅。時間切れ/データ端の
+# 判定しきい値、およびグリッド探索では使わない(グリッドはバー配列のみで完結するため不要)。
+_EXIT_SIM_TF_TO_TIMEDELTA: dict[str, pd.Timedelta] = {
+    "1m": pd.Timedelta(minutes=1), "5m": pd.Timedelta(minutes=5),
+    "15m": pd.Timedelta(minutes=15), "1h": pd.Timedelta(hours=1),
+}
+
+
+def bar_interval_for_choice(choice: str) -> pd.Timedelta:
+    """ZOOM_TIMEFRAME_CHOICES表記("1分足(暗号のみ)"等)から名目バー幅を引く。未知choiceは1時間扱い。"""
+    tf = ZOOM_INTERVAL_MAP.get(choice, "1h")
+    return _EXIT_SIM_TF_TO_TIMEDELTA.get(tf, pd.Timedelta(hours=1))
+
+
+def resolve_exit_sim_timeframe(routing: dict[str, Any], window_hours: float) -> str:
+    """データソース別・実測済み制約に基づく足種選択(PM実証: 2026-07-21)。
+    - yfinance(GOLD/SILVER/WTI/BRENT/NASDAQ/NIKKEI/SP500合成商品): 15分足は直近60日しか
+      遡及取得できず古いトレードに使えないため、1時間足に固定する(既存resolve_zoom_timeframeの
+      yfinance分岐は使わない=5分/15分を選んでしまうため不適)。
+    - ccxt bingx(無期限SYM/USDT:USDT): 1分足は12ヶ月遡及できるが5分/15分足は古い日付で0本
+      返却(実測)。窓<=72hなら1分足、それ以外は1時間足の2段。
+    - ccxt binance/bybit(BTC/ETH/SOL/HYPE): 既存resolve_zoom_timeframeの梯子をそのまま使う。
+    戻り値はZOOM_TIMEFRAME_CHOICESのいずれか(fetch_zoom_window_ohlcvのtimeframe_choice引数へ渡す)。
+    """
+    source = routing.get("source")
+    if source == "yfinance":
+        return "1時間足"
+    if source == "ccxt" and routing.get("exchange") == "bingx":
+        return "1分足(暗号のみ)" if window_hours <= 72.0 else "1時間足"
+    tf, _fallback_note = resolve_zoom_timeframe("ccxt", window_hours, 0.0)
+    return tf
+
+
+def ensure_exit_sim_routing(symbols: list[str]) -> None:
+    """取引履歴の銘柄をfetch_zoom_window_ohlcv経由で取得できるよう_RUNTIME_CUSTOM_ROUTINGへ
+    自己登録する(副作用あり・selftest対象外)。
+
+    get_symbol_routing()はSYMBOL_MASTER→custom_map→_RUNTIME_CUSTOM_ROUTING→'/'含有ならccxt
+    binance→それ以外yfinanceの順に解決するが、_RUNTIME_CUSTOM_ROUTINGへの登録は本来
+    サイドバーの「チャート表示銘柄」multiselect(traded_symbol_chart_pick)選択時にしか
+    行われない。本関数はエグジット最適化が対象トレードの全銘柄について、そのmultiselectの
+    選択有無に関わらず正しいBingXルーティング(bingx_chart_routing)を持てるようにする
+    (既存関数のシグネチャ変更を避けるためのワークアラウンド)。既にSYMBOL_MASTER/
+    _RUNTIME_CUSTOM_ROUTINGに存在する銘柄は上書きしない。
+    """
+    for sym in symbols:
+        if not sym:
+            continue
+        if sym in SYMBOL_MASTER or sym in _RUNTIME_CUSTOM_ROUTING:
+            continue
+        _RUNTIME_CUSTOM_ROUTING[sym] = bingx_chart_routing(sym)
+
+
+def compute_exit_price_thresholds(
+    entry_price: float, leverage: float, side: str,
+    sl_pct: Optional[float], tp_pct: Optional[float],
+) -> tuple[Optional[float], Optional[float]]:
+    """レバレッジ考慮ROE%のSL/TPを価格閾値へ換算する。move_frac=(pct/100)/leverage。
+    LONG: sl=entry*(1-frac)/tp=entry*(1+frac)。SHORTはentry*(1+frac)/entry*(1-frac)(鏡像)。
+    sl_pct/tp_pctがNoneならその閾値はNone(=トグルOFF、判定で使わない)を返す。
+    """
+    is_long = str(side).strip().upper() != "SHORT"
+    sl_price: Optional[float] = None
+    tp_price: Optional[float] = None
+    if sl_pct is not None:
+        frac = (float(sl_pct) / 100.0) / float(leverage)
+        sl_price = entry_price * (1.0 - frac) if is_long else entry_price * (1.0 + frac)
+    if tp_pct is not None:
+        frac = (float(tp_pct) / 100.0) / float(leverage)
+        tp_price = entry_price * (1.0 + frac) if is_long else entry_price * (1.0 - frac)
+    return sl_price, tp_price
+
+
+def compute_window_end(
+    entry_time: pd.Timestamp, exit_time: Any, hold_hours: Optional[float], now_ts: pd.Timestamp,
+) -> Optional[pd.Timestamp]:
+    """シミュレーション窓の終端を決める。保有時間トグルON(hold_hoursが数値)ならentry_time+H、
+    OFF(hold_hoursがNone)なら実績Exit_Time(欠損ならNoneを返す=呼び出し側で「決済時刻欠損」扱い)。
+    いずれも現在時刻(now_ts)でクリップする(未来のデータは無い)。
+    """
+    if hold_hours is not None:
+        end = entry_time + pd.Timedelta(hours=float(hold_hours))
+    else:
+        if exit_time is None or pd.isna(exit_time):
+            return None
+        end = exit_time
+    if end > now_ts:
+        end = now_ts
+    return end
+
+
+def simulate_trade_exit_path(
+    bars: pd.DataFrame, entry_time: pd.Timestamp, window_end: pd.Timestamp,
+    side: str, sl_price: Optional[float], tp_price: Optional[float],
+    bar_interval: pd.Timedelta = pd.Timedelta(hours=1),
+) -> dict[str, Any]:
+    """1トレード分のfirst-touch判定(バーごと時系列順・エントリーを含むバーも判定対象=近似)。
+    LONG: low<=sl_price→SL、high>=tp_price→TP。SHORT: high>=sl_price→SL、low<=tp_price→TP。
+    同一バーで両方に触れたらSL優先(保守的近似)。約定価格は閾値価格そのもの(スリッページなし=近似)。
+    どちらにも触れず終端に達したら窓内最後のバーのcloseで決済。event:
+      'SL'/'TP'/'時間切れ'(最後のバーがwindow_endからbar_interval以内=データが目標時刻近くまで届いた)/
+      'データ端'(それより手前でデータが尽きた)。
+
+    追補v9.1(レビュー反映): バーindexはバー"開始"時刻であるため、旧実装の`index >= entry_time`
+    というトリムはエントリーがバー途中(ミッドバー)で発生した場合にそのバー自体を窓から除外して
+    しまい、1バーより短いスキャルプトレード(1時間足なら最大59分の盲点)を経路0本=判定不能に
+    していた(実データで82件確認)。`index > entry_time - bar_interval`へ変更し、エントリー
+    時刻を含む足の開始時刻がこの条件を満たすようにする(=エントリー含みバーを含める)。
+    ただし引き換えに、そのバー内のエントリー"前"の値動きもSL/TP判定に混入し得る近似となる
+    (実際の約定順序・エントリー前後のバー内価格経路は分からないため)。
+    bars(low/high/close列・DatetimeIndex)が窓内に1本も無い場合はValueErrorを送出する
+    (呼び出し側で「経路取得失敗」として扱う)。
+    """
+    if bars is None or bars.empty:
+        raise ValueError("窓内にバーがありません")
+    b = bars.sort_index()
+    b = b.loc[(b.index > entry_time - bar_interval) & (b.index <= window_end)]
+    if b.empty:
+        raise ValueError("窓内にバーがありません")
+    is_long = str(side).strip().upper() != "SHORT"
+
+    last_ts: Optional[pd.Timestamp] = None
+    last_close: Optional[float] = None
+    for ts, row in b.iterrows():
+        last_ts = ts
+        last_close = float(row["close"])
+        hit_sl = False
+        hit_tp = False
+        if sl_price is not None:
+            hit_sl = (float(row["low"]) <= sl_price) if is_long else (float(row["high"]) >= sl_price)
+        if tp_price is not None:
+            hit_tp = (float(row["high"]) >= tp_price) if is_long else (float(row["low"]) <= tp_price)
+        if hit_sl:  # 同一バーで両方ヒットしてもSL優先(保守的近似)
+            return {"exit_price": float(sl_price), "exit_time": ts, "event": "SL"}
+        if hit_tp:
+            return {"exit_price": float(tp_price), "exit_time": ts, "event": "TP"}
+
+    gap = window_end - last_ts
+    event = "時間切れ" if gap <= bar_interval else "データ端"
+    return {"exit_price": last_close, "exit_time": last_ts, "event": event}
+
+
+def reconstruct_trades_for_exit_sim(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
+    """トレードDataFrameからシミュレーション用のポジションサイズを復元する。
+
+    追補v9.1(レビュー反映): 初版は全行を「margin法」(margin=PnL_USD/(PnL_Percent/100)、
+    notional=margin*Leverage)で復元していたが、reconstruct_bingx_order_historyが出す
+    PnL_Percentは「価格変動%」(レバレッジ非考慮)であり、実際にはPnL_USD/(PnL_Percent/100)
+    はそのまま**notional**(建玉サイズ)を表す。これを「margin」と誤解釈しさらに×Leverageして
+    いたため、復元qtyが実際のレバレッジ倍に過大化するバグがあった(生CSV実数量との照合で
+    qty_sim/qty_true 中央値=レバレッジに完全一致することを実証済み)。
+
+    2経路で復元する(行ごとに"_size_method"列に'quantity'/'notional_fallback'を記録):
+      - 主経路(Quantity列が有限かつ>0の場合): qty=Quantityそのもの、notional=qty*Entry_Price、
+        margin=notional/Leverage。この経路ではPnL_Percentは不要(要求しない)。必須は
+        PnL_USD/Entry_Price/Exit_Price/Leverageの有効性のみ。
+      - フォールバック(Quantity欠損/無効な場合): notional=PnL_USD/(PnL_Percent/100)
+        (PnL_Percent=価格変動%という正しい解釈)、qty=notional/Entry_Price、
+        margin=notional/Leverage。
+
+    fee_est=実績gross(qty*(Exit_Price-Entry_Price)*dir)-実績PnL_USD
+    (価格グロス−Realized PNLの残差=ファンディング・会計差込みの実効コスト近似。負になり得るが
+    そのまま使う。復元式のスケールが訂正されたことでfee_estのスケールも正しくなる)。
+
+    スキップ条件(いずれか1つでも該当したらその行は復元不可としてskip_countsに計上・出力から除外):
+      - core_fields_missing: PnL_USD/Entry_Price/Exit_Price/Leverageのいずれかが欠損・非有限・
+        Leverage<=0・Entry_Price<=0(両経路共通の必須条件)
+      - pnl_percent_invalid: Quantityが無効(フォールバック経路)かつ、PnL_PercentがNaN・
+        非有限・abs(PnL_Percent)<1e-9のいずれか
+      - notional_invalid: フォールバック経路で算出したnotionalが非有限またはnotional<=0
+        (符号反転など。従来の「margin_invalid」に相当)
+
+    Side欠損行はLONG扱い(実データはSide全件判明が前提。念のための既定値・要注意点として
+    最終報告に明記する)。
+    戻り値: (復元済み列(_margin/_notional/_qty/_dir/_gross_actual/_fee_est/_size_method)を
+    追加したDataFrame(元のindexを保持・復元不可行は除外済み), skip_counts)。
+    """
+    skip_counts = {"core_fields_missing": 0, "pnl_percent_invalid": 0, "notional_invalid": 0}
+    extra_cols = ["_margin", "_notional", "_qty", "_dir", "_gross_actual", "_fee_est", "_size_method"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=EXIT_SIM_RECON_COLS + extra_cols), skip_counts
+
+    d = df.copy()
+    for c in EXIT_SIM_RECON_COLS:
+        if c not in d.columns:
+            d[c] = np.nan
+
+    margins = pd.Series(np.nan, index=d.index, dtype=float)
+    notionals = pd.Series(np.nan, index=d.index, dtype=float)
+    qtys = pd.Series(np.nan, index=d.index, dtype=float)
+    dirs = pd.Series(np.nan, index=d.index, dtype=float)
+    gross_actuals = pd.Series(np.nan, index=d.index, dtype=float)
+    fee_ests = pd.Series(np.nan, index=d.index, dtype=float)
+    size_methods = pd.Series(None, index=d.index, dtype=object)
+    keep = pd.Series(False, index=d.index)
+
+    for idx in d.index:
+        pnl_usd = d.at[idx, "PnL_USD"]
+        pnl_pct = d.at[idx, "PnL_Percent"]
+        lev = d.at[idx, "Leverage"]
+        entry_p = d.at[idx, "Entry_Price"]
+        exit_p = d.at[idx, "Exit_Price"]
+        side = d.at[idx, "Side"]
+        qty_raw = d.at[idx, "Quantity"]
+
+        if (pd.isna(pnl_usd) or not np.isfinite(float(pnl_usd))
+                or pd.isna(lev) or pd.isna(entry_p) or pd.isna(exit_p)
+                or not np.isfinite(float(lev)) or not np.isfinite(float(entry_p)) or not np.isfinite(float(exit_p))
+                or float(lev) <= 0 or float(entry_p) <= 0):
+            skip_counts["core_fields_missing"] += 1
+            continue
+
+        qty_valid = pd.notna(qty_raw) and np.isfinite(float(qty_raw)) and float(qty_raw) > 0
+        if qty_valid:
+            qty = float(qty_raw)
+            notional = qty * float(entry_p)
+            size_method = "quantity"
+        else:
+            if pd.isna(pnl_pct) or not np.isfinite(float(pnl_pct)) or abs(float(pnl_pct)) < 1e-9:
+                skip_counts["pnl_percent_invalid"] += 1
+                continue
+            notional = float(pnl_usd) / (float(pnl_pct) / 100.0)
+            if not np.isfinite(notional) or notional <= 0:
+                skip_counts["notional_invalid"] += 1
+                continue
+            qty = notional / float(entry_p)
+            size_method = "notional_fallback"
+
+        margin = notional / float(lev)
+        side_u = str(side).strip().upper() if pd.notna(side) else "LONG"
+        direction = -1.0 if side_u == "SHORT" else 1.0
+        gross_actual = qty * (float(exit_p) - float(entry_p)) * direction
+        fee_est = gross_actual - float(pnl_usd)
+
+        margins.at[idx] = margin
+        notionals.at[idx] = notional
+        qtys.at[idx] = qty
+        dirs.at[idx] = direction
+        gross_actuals.at[idx] = gross_actual
+        fee_ests.at[idx] = fee_est
+        size_methods.at[idx] = size_method
+        keep.at[idx] = True
+
+    d["_margin"] = margins
+    d["_notional"] = notionals
+    d["_qty"] = qtys
+    d["_dir"] = dirs
+    d["_gross_actual"] = gross_actuals
+    d["_fee_est"] = fee_ests
+    d["_size_method"] = size_methods
+    out = d.loc[keep].copy()
+    return out, skip_counts
+
+
+def compute_trade_whatif_outcome(
+    trade: dict[str, Any], bars: Optional[pd.DataFrame],
+    sl_pct: Optional[float], tp_pct: Optional[float], hold_hours: Optional[float],
+    now_ts: pd.Timestamp, bar_interval: pd.Timedelta = pd.Timedelta(hours=1),
+) -> dict[str, Any]:
+    """1トレード分のwhat-if結果を計算する(サイズ復元済みtrade dict+当該窓のOHLCVを入力)。
+    trade必須キー: entry_time/exit_time/entry_price/exit_price/side/qty/dir/fee_est/leverage。
+
+    SL/TP/保有時間の3トグルが全てOFF(sl_pct・tp_pct・hold_hoursが全てNone)の場合は
+    シミュレーションを行わず実績をそのまま返す(恒等性: sim_net==実績PnL_USD)。
+    それ以外の場合、決済時刻欠損(hold_hours=NoneでExit_Time欠損)や経路データ欠落(barsが
+    None/空、または窓内に1本も無い)は {"ok": False, "reason": ...} を返す(呼び出し側で
+    「シミュ対象外」として除外集計する)。
+
+    追補v9.1(レビュー反映): 保有時間トグルOFF(hold_hours is None)の場合、窓の終端は実績の
+    Exit_Timeであり、そこで市場価格がSL/TPに未到達("時間切れ"/"データ端")のまま終わったなら
+    実際の決済価格は既に分かっている(=trade["exit_price"])。窓端バーのclose近似で代用する
+    必要が無いため、この場合はシミュ結果を実績の決済価格・時刻へ置き換え、event=
+    "実績決済(触れず)"とする(窓端バーの終値近似より正確・かつ実績との無用な乖離を防ぐ)。
+    """
+    entry_time = trade["entry_time"]
+    entry_price = float(trade["entry_price"])
+    side = trade["side"]
+    qty = float(trade["qty"])
+    direction = float(trade["dir"])
+    fee_est = float(trade["fee_est"])
+    leverage = float(trade["leverage"])
+
+    if sl_pct is None and tp_pct is None and hold_hours is None:
+        sim_exit_price = float(trade["exit_price"])
+        sim_exit_time = trade.get("exit_time")
+        event = "実績(全トグルOFF)"
+    else:
+        window_end = compute_window_end(entry_time, trade.get("exit_time"), hold_hours, now_ts)
+        if window_end is None:
+            return {"ok": False, "reason": "決済時刻欠損(保有時間トグルOFF時はExit_Time必須)"}
+        sl_price, tp_price = compute_exit_price_thresholds(entry_price, leverage, side, sl_pct, tp_pct)
+        if bars is None or bars.empty:
+            return {"ok": False, "reason": "経路取得失敗"}
+        try:
+            path = simulate_trade_exit_path(bars, entry_time, window_end, side, sl_price, tp_price, bar_interval)
+        except ValueError:
+            return {"ok": False, "reason": "経路取得失敗"}
+        sim_exit_price = path["exit_price"]
+        sim_exit_time = path["exit_time"]
+        event = path["event"]
+        # 追補v9.1: 保有時間トグルOFF・かつSL/TP不到達のまま窓終端(=実績Exit_Time)に達した
+        # 場合は、窓端バーのclose近似を使わず実績決済価格へ置き換える(Fix3a)。
+        if hold_hours is None and event in ("時間切れ", "データ端"):
+            sim_exit_price = float(trade["exit_price"])
+            sim_exit_time = trade.get("exit_time")
+            event = "実績決済(触れず)"
+
+    sim_gross = qty * (sim_exit_price - entry_price) * direction
+    sim_net = sim_gross - fee_est
+    return {
+        "ok": True, "sim_exit_price": sim_exit_price, "sim_exit_time": sim_exit_time,
+        "event": event, "sim_gross": sim_gross, "sim_net": sim_net,
+    }
+
+
+def aggregate_exit_sim_outcomes(
+    outcomes: list[dict[str, Any]], actual_pnls: list[float],
+) -> dict[str, Any]:
+    """シミュ可能だったN件(outcomes・actual_pnlsは同じ並び・同じN=apples-to-apples)の集計。
+    win/PF/平均トレードはシミュ側・実績側の双方について同じ定義(net>0を勝ち)で算出する。
+    diff = シミュ純利益合計 - 実績純利益合計(同じN件同士)。
+    """
+    n = len(outcomes)
+    result: dict[str, Any] = {
+        "n": n, "sim_net_total": 0.0, "actual_net_total": 0.0, "diff": 0.0,
+        "sim_win_rate_pct": np.nan, "sim_pf": np.nan, "sim_avg_trade": np.nan,
+        "actual_win_rate_pct": np.nan, "actual_pf": np.nan, "actual_avg_trade": np.nan,
+        "event_counts": {}, "n_wins_sim": 0, "n_losses_sim": 0,
+    }
+    if n == 0:
+        return result
+
+    sim_nets = np.array([o["sim_net"] for o in outcomes], dtype=float)
+    actual = np.array(actual_pnls, dtype=float)
+    event_counts: dict[str, int] = {}
+    for o in outcomes:
+        e = o.get("event", "")
+        event_counts[e] = event_counts.get(e, 0) + 1
+
+    def _stats(arr: np.ndarray) -> tuple[float, float, float, float]:
+        total = float(arr.sum())
+        wins = arr[arr > 0]
+        losses = arr[arr < 0]
+        win_rate = 100.0 * len(wins) / n
+        gp = float(wins.sum()) if len(wins) else 0.0
+        gl = float(losses.sum()) if len(losses) else 0.0
+        pf = (gp / abs(gl)) if gl != 0 else (float("inf") if gp > 0 else np.nan)
+        avg = total / n
+        return total, win_rate, pf, avg
+
+    sim_total, sim_wr, sim_pf, sim_avg = _stats(sim_nets)
+    act_total, act_wr, act_pf, act_avg = _stats(actual)
+    result.update({
+        "sim_net_total": sim_total, "actual_net_total": act_total, "diff": sim_total - act_total,
+        "sim_win_rate_pct": sim_wr, "sim_pf": sim_pf, "sim_avg_trade": sim_avg,
+        "actual_win_rate_pct": act_wr, "actual_pf": act_pf, "actual_avg_trade": act_avg,
+        "event_counts": event_counts, "n_wins_sim": int((sim_nets > 0).sum()),
+        "n_losses_sim": int((sim_nets < 0).sum()),
+    })
+    return result
+
+
+def grid_search_exit_optimization(
+    trade_paths: list[dict[str, Any]],
+    sl_grid: Optional[list[float]] = None, tp_grid: Optional[list[float]] = None,
+) -> pd.DataFrame:
+    """SL%×TP%の全組合せをnumpyで一括評価する(既に取得済みの経路=trade_pathsを再利用し
+    再フェッチは一切行わない)。
+
+    trade_paths各要素は以下キーを持つdict(1本もバーが無いトレードは呼び出し側で除外しておく):
+      entry_price, leverage, is_long(bool), qty, dir(+1/-1), fee_est,
+      lows/highs/closes(対象窓のバー時系列昇順のnp.ndarray。エントリーバー含む)、
+      fallback_exit_price(追補v9.1: 保有時間トグルOFF時の実績Exit_Price。ON時はNone)。
+
+    グリッド探索は常にSL・TP両方を有効として評価する(現在のSL/TPトグルON/OFF状態とは独立。
+    ホライズンはtrade_paths構築時=現在の保有時間設定で既に確定している)。同一バーでSL/TPの
+    両方に触れた場合はSL優先(simulate_trade_exit_pathと同じ規則)。
+
+    追補v9.1(レビュー反映): SL/TP不到達(no_hit)セルの決済価格は、fallback_exit_priceが
+    設定されていれば(保有時間トグルOFF=実績決済価格が既知)それを使い、Noneなら従来通り
+    窓内最後のバーのcloseを使う(compute_trade_whatif_outcomeのFix3aと単一トレードシミュ/
+    グリッド探索間で整合させるため)。
+
+    戻り値: columns=[sl_pct, tp_pct, net_profit, win_rate_pct, pf, avg_trade, n] を
+      net_profit降順でソートしたDataFrame(len(sl_grid)*len(tp_grid)行)。
+    """
+    sl_arr = np.asarray(sl_grid if sl_grid is not None else EXIT_SIM_SL_TP_GRID, dtype=float)
+    tp_arr = np.asarray(tp_grid if tp_grid is not None else EXIT_SIM_SL_TP_GRID, dtype=float)
+    n_sl, n_tp = len(sl_arr), len(tp_arr)
+    n_trades = len(trade_paths)
+
+    total_net = np.zeros((n_sl, n_tp), dtype=float)
+    win_count = np.zeros((n_sl, n_tp), dtype=int)
+    gross_profit = np.zeros((n_sl, n_tp), dtype=float)
+    gross_loss = np.zeros((n_sl, n_tp), dtype=float)
+
+    for tdata in trade_paths:
+        entry_price = float(tdata["entry_price"])
+        leverage = float(tdata["leverage"])
+        is_long = bool(tdata["is_long"])
+        qty = float(tdata["qty"])
+        direction = float(tdata["dir"])
+        fee_est = float(tdata["fee_est"])
+        lows = np.asarray(tdata["lows"], dtype=float)
+        highs = np.asarray(tdata["highs"], dtype=float)
+        closes = np.asarray(tdata["closes"], dtype=float)
+        n_bars = len(lows)
+        if n_bars == 0:
+            continue
+
+        sl_frac = (sl_arr / 100.0) / leverage
+        tp_frac = (tp_arr / 100.0) / leverage
+        if is_long:
+            sl_price_arr = entry_price * (1.0 - sl_frac)
+            tp_price_arr = entry_price * (1.0 + tp_frac)
+            hit_sl = lows[:, None] <= sl_price_arr[None, :]
+            hit_tp = highs[:, None] >= tp_price_arr[None, :]
+        else:
+            sl_price_arr = entry_price * (1.0 + sl_frac)
+            tp_price_arr = entry_price * (1.0 - tp_frac)
+            hit_sl = highs[:, None] >= sl_price_arr[None, :]
+            hit_tp = lows[:, None] <= tp_price_arr[None, :]
+
+        any_sl = hit_sl.any(axis=0)
+        any_tp = hit_tp.any(axis=0)
+        idx_sl = np.where(any_sl, np.argmax(hit_sl, axis=0), n_bars)  # (n_sl,)
+        idx_tp = np.where(any_tp, np.argmax(hit_tp, axis=0), n_bars)  # (n_tp,)
+
+        idx_sl_grid = idx_sl[:, None]  # (n_sl,1)->broadcast(n_sl,n_tp)
+        idx_tp_grid = idx_tp[None, :]  # (1,n_tp)->broadcast(n_sl,n_tp)
+        no_hit = (idx_sl_grid >= n_bars) & (idx_tp_grid >= n_bars)
+        sl_wins = idx_sl_grid <= idx_tp_grid  # 同着(同一バー)はSL優先
+
+        last_close = float(closes[-1])
+        fallback_exit_price = tdata.get("fallback_exit_price")
+        no_hit_price = float(fallback_exit_price) if fallback_exit_price is not None else last_close
+        exit_price_grid = np.where(
+            no_hit, no_hit_price,
+            np.where(sl_wins, np.broadcast_to(sl_price_arr[:, None], (n_sl, n_tp)),
+                     np.broadcast_to(tp_price_arr[None, :], (n_sl, n_tp))),
+        )
+        sim_gross_grid = qty * (exit_price_grid - entry_price) * direction
+        sim_net_grid = sim_gross_grid - fee_est
+
+        total_net += sim_net_grid
+        win_count += (sim_net_grid > 0).astype(int)
+        gross_profit += np.where(sim_net_grid > 0, sim_net_grid, 0.0)
+        gross_loss += np.where(sim_net_grid < 0, sim_net_grid, 0.0)
+
+    if n_trades == 0:
+        win_rate_pct = np.full((n_sl, n_tp), np.nan)
+        pf = np.full((n_sl, n_tp), np.nan)
+        avg_trade = np.full((n_sl, n_tp), np.nan)
+    else:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            win_rate_pct = 100.0 * win_count / n_trades
+            pf = np.where(gross_loss != 0, gross_profit / np.abs(gross_loss),
+                          np.where(gross_profit > 0, np.inf, np.nan))
+            avg_trade = total_net / n_trades
+
+    rows = [
+        {
+            "sl_pct": float(sl_arr[i]), "tp_pct": float(tp_arr[j]),
+            "net_profit": float(total_net[i, j]), "win_rate_pct": float(win_rate_pct[i, j]),
+            "pf": float(pf[i, j]), "avg_trade": float(avg_trade[i, j]), "n": n_trades,
+        }
+        for i in range(n_sl) for j in range(n_tp)
+    ]
+    return pd.DataFrame(rows).sort_values("net_profit", ascending=False).reset_index(drop=True)
+
+
+def compute_exit_sim_cache_key(
+    target_df: pd.DataFrame, hold_enabled: bool, hold_hours: Optional[float],
+) -> str:
+    """フェッチ結果キャッシュ用のキー(対象トレード内容のハッシュ+ホライズン設定)。
+    SL%/TP%は含めない(その変更は再フェッチ不要=同キーのまま再計算できる設計にするため)。
+    """
+    cols = [c for c in EXIT_SIM_RECON_COLS if c in target_df.columns]
+    sub = target_df[cols].copy() if cols else target_df.copy()
+    for c in sub.columns:
+        if pd.api.types.is_datetime64_any_dtype(sub[c]):
+            sub[c] = sub[c].astype("int64", errors="ignore")
+    try:
+        h = int(pd.util.hash_pandas_object(sub, index=True).sum())
+    except (TypeError, ValueError):
+        h = hash(tuple(map(str, sub.to_numpy().ravel())))
+    horizon_key = f"hold={hold_enabled}:{hold_hours if hold_enabled else 'actual'}"
+    raw = f"{h}|{horizon_key}|{len(target_df)}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def exit_sim_cache_is_valid(cache: Optional[dict], cache_key: str, need_fetch_now: bool) -> bool:
+    """追補v9.1(レビュー反映・Fix4): キャッシュ有効性の純ロジック判定。
+
+    従来はcache_keyの一致だけで「有効」としていたが、compute_exit_sim_cache_keyは意図的に
+    SL/TPを含まない(SL/TP%だけの変更では再フェッチ不要にする設計・そこは変えない)。
+    このため「3トグル全OFF(恒等モード。need_fetch=False)で実行→その後SL/TPだけONにする」
+    という操作をすると、cache_keyは一致するのに実際には経路取得(bars_by_idx)が一度も
+    行われていないキャッシュが「有効」と誤判定され、SL/TP判定に必要な経路が無いのに
+    N=0の結果を「有効な比較結果」であるかのように表示してしまう不整合があった。
+
+    対策: フェッチ実行時にキャッシュへ`was_fetch_run=bool(need_fetch)`を保存しておき、
+    「need_fetch_nowがTrueなのに前回はwas_fetch_run=Falseだった(=恒等モードでしか
+    実行していない)」場合は無効とする。
+
+    有効条件(AND): cacheが非空 かつ cache_keyが一致 かつ
+      (need_fetch_nowがFalse、または前回のwas_fetch_runがTrue)。
+    target_dfが空かどうかは呼び出し側で別途ANDすること(本関数の引数にtarget_dfを含めない
+    設計のため)。
+    """
+    if not cache:
+        return False
+    if cache.get("cache_key") != cache_key:
+        return False
+    if need_fetch_now and not cache.get("was_fetch_run", False):
+        return False
+    return True
+
+
+def run_exit_simulation_for_trades(
+    valid_df: pd.DataFrame,
+    sl_pct: Optional[float], tp_pct: Optional[float], hold_hours: Optional[float],
+    now_ts: pd.Timestamp,
+    progress_cb: Optional[Callable[[int, int, str], None]] = None,
+) -> dict[str, Any]:
+    """valid_df(reconstruct_trades_for_exit_simの出力=サイズ復元済み・元index維持)の各行に
+    ついて経路取得→first-touch判定を行い、集計に必要な一式を返す(ネットワークを伴うため
+    selftest対象外。実運用ではUI層から「▶ 再シミュレーション実行」ボタン押下時のみ呼ぶ)。
+
+    progress_cb(done, total, symbol)が指定されていればトレード処理ごとに呼ばれる(UIの
+    進捗バー更新用。st依存はUI層に留めるためコールバック経由にしている)。
+
+    戻り値のキー: outcomes(idx->outcome dict), bars_by_idx(idx->窓トリム済みOHLCV。
+    グリッド探索での再利用/SL・TPのみ変更時の再計算用), timeframe_by_idx(idx->実際に使った
+    足種choice文字列), timeframe_counts, n_target, n_fetch_fail, n_exit_time_missing,
+    fail_symbols。
+    """
+    need_fetch = not (sl_pct is None and tp_pct is None and hold_hours is None)
+    ensure_exit_sim_routing(list(valid_df["Symbol"].dropna().astype(str).unique()))
+
+    outcomes: dict[Any, dict[str, Any]] = {}
+    bars_by_idx: dict[Any, pd.DataFrame] = {}
+    timeframe_by_idx: dict[Any, str] = {}
+    timeframe_counts: dict[str, int] = {}
+    n_fetch_fail = 0
+    n_exit_time_missing = 0
+    fail_symbols: list[str] = []
+    total = len(valid_df)
+
+    for done, (idx, row) in enumerate(valid_df.iterrows(), start=1):
+        symbol = str(row["Symbol"])
+        trade = {
+            "entry_time": row["Entry_Time"], "exit_time": row["Exit_Time"],
+            "entry_price": float(row["Entry_Price"]), "exit_price": float(row["Exit_Price"]),
+            "side": row["Side"], "qty": float(row["_qty"]), "dir": float(row["_dir"]),
+            "fee_est": float(row["_fee_est"]), "leverage": float(row["Leverage"]),
+        }
+        if progress_cb is not None:
+            progress_cb(done, total, symbol)
+
+        if not need_fetch:
+            outcomes[idx] = compute_trade_whatif_outcome(trade, None, sl_pct, tp_pct, hold_hours, now_ts)
+            continue
+
+        window_end = compute_window_end(trade["entry_time"], trade["exit_time"], hold_hours, now_ts)
+        if window_end is None:
+            n_exit_time_missing += 1
+            continue
+
+        routing = get_symbol_routing(symbol)
+        # window_hours(足種選択用)はentry_time基準のまま据え置く(Fix2bはフェッチ範囲のみを
+        # 広げる。粒度選択のホライズン計算を変えると別の選択ロジックに影響するため触らない)。
+        window_hours = max((window_end - trade["entry_time"]).total_seconds() / 3600.0, 0.0)
+        tf_choice = resolve_exit_sim_timeframe(routing, window_hours)
+        # 追補v9.1(レビュー反映・Fix2b): entry_timeそのものを取得窓の開始にすると、
+        # エントリーを含む足(バーindex=バー開始時刻)がentry_timeより前の開始時刻を持つ場合に
+        # 取得漏れする(最粗の1時間足で最大59分)。1時間分手前から取得しfetch側で余裕を持たせ、
+        # simulate_trade_exit_path側のトリム(index > entry_time - bar_interval)で正しく
+        # エントリー含みバーを拾えるようにする。
+        try:
+            ohlcv_df, _meta, _note, _ttl, used_choice = fetch_zoom_window_ohlcv(
+                symbol, trade["entry_time"] - pd.Timedelta(hours=1), window_end, tf_choice,
+            )
+        except Exception:  # noqa: BLE001 — 個別トレードの取得失敗は全体を止めずカウントする
+            ohlcv_df = None
+            used_choice = None
+        if ohlcv_df is None or ohlcv_df.empty:
+            n_fetch_fail += 1
+            if symbol not in fail_symbols:
+                fail_symbols.append(symbol)
+            continue
+
+        bars_by_idx[idx] = ohlcv_df
+        timeframe_by_idx[idx] = used_choice
+        timeframe_counts[used_choice] = timeframe_counts.get(used_choice, 0) + 1
+        bar_interval = bar_interval_for_choice(used_choice)
+        outcomes[idx] = compute_trade_whatif_outcome(
+            trade, ohlcv_df, sl_pct, tp_pct, hold_hours, now_ts, bar_interval,
+        )
+
+    return {
+        "outcomes": outcomes, "bars_by_idx": bars_by_idx, "timeframe_by_idx": timeframe_by_idx,
+        "timeframe_counts": timeframe_counts, "n_target": total, "n_fetch_fail": n_fetch_fail,
+        "n_exit_time_missing": n_exit_time_missing, "fail_symbols": fail_symbols,
+    }
+
+
+def recompute_exit_outcomes_cached(
+    valid_df: pd.DataFrame, bars_by_idx: dict[Any, pd.DataFrame], timeframe_by_idx: dict[Any, str],
+    sl_pct: Optional[float], tp_pct: Optional[float], hold_hours: Optional[float], now_ts: pd.Timestamp,
+) -> dict[Any, dict[str, Any]]:
+    """キャッシュ済み経路(bars_by_idx、run_exit_simulation_for_trades実行時に取得済み)を
+    再利用してSL/TP%だけ変えた再計算を行う(ネットワーク・fetch_zoom_window_ohlcv呼び出しは
+    一切行わない)。ホライズン設定(hold_hours)がキャッシュ取得時と変わっている場合は
+    呼び出し側でrun_exit_simulation_for_trades(再フェッチ)を使うこと(本関数はホライズン
+    不変が前提)。bars_by_idxに無いidx(=前回取得失敗した経路)は今回も除外する。
+    """
+    outcomes: dict[Any, dict[str, Any]] = {}
+    need_fetch = not (sl_pct is None and tp_pct is None and hold_hours is None)
+    for idx, row in valid_df.iterrows():
+        trade = {
+            "entry_time": row["Entry_Time"], "exit_time": row["Exit_Time"],
+            "entry_price": float(row["Entry_Price"]), "exit_price": float(row["Exit_Price"]),
+            "side": row["Side"], "qty": float(row["_qty"]), "dir": float(row["_dir"]),
+            "fee_est": float(row["_fee_est"]), "leverage": float(row["Leverage"]),
+        }
+        if not need_fetch:
+            outcomes[idx] = compute_trade_whatif_outcome(trade, None, sl_pct, tp_pct, hold_hours, now_ts)
+            continue
+        bars = bars_by_idx.get(idx)
+        if bars is None:
+            continue
+        bar_interval = bar_interval_for_choice(timeframe_by_idx.get(idx, "1時間足"))
+        outcomes[idx] = compute_trade_whatif_outcome(trade, bars, sl_pct, tp_pct, hold_hours, now_ts, bar_interval)
+    return outcomes
+
+
+def build_grid_search_trade_paths(
+    valid_df: pd.DataFrame, bars_by_idx: dict[Any, pd.DataFrame], timeframe_by_idx: dict[Any, str],
+    hold_hours: Optional[float], now_ts: pd.Timestamp,
+) -> list[dict[str, Any]]:
+    """grid_search_exit_optimization用のtrade_pathsを、既に取得済みのbars_by_idxから構築する
+    (再フェッチなし)。各トレードの窓([entry_time, window_end])内バーからlows/highs/closes配列を
+    作る。窓内にバーが無いトレードはスキップする(グリッド探索の対象外=シミュ側と同じ扱い)。
+
+    追補v9.1(レビュー反映):
+      - Fix2c: 引数にtimeframe_by_idx(idx->実際に使った足種choice文字列)を追加し、
+        トレードごとにbar_interval_for_choiceで実際のバー幅を求めて、
+        simulate_trade_exit_pathと同一の判定(index > entry_time - bar_interval)でトリムする
+        (旧`index >= entry_time`はエントリーを含むバーを取りこぼす同種のバグ)。
+      - Fix3b: hold_hoursがNone(保有時間トグルOFF)の場合は各パスに"fallback_exit_price"
+        (実績Exit_Price)を持たせ、grid_search_exit_optimization側のno_hitセルで
+        窓端バーclose近似の代わりに使えるようにする(単一トレードシミュとの整合。Fix3a参照)。
+        ON時はNone。
+    """
+    paths: list[dict[str, Any]] = []
+    for idx, row in valid_df.iterrows():
+        bars = bars_by_idx.get(idx)
+        if bars is None or bars.empty:
+            continue
+        entry_time = row["Entry_Time"]
+        window_end = compute_window_end(entry_time, row["Exit_Time"], hold_hours, now_ts)
+        if window_end is None:
+            continue
+        bar_interval = bar_interval_for_choice(timeframe_by_idx.get(idx, "1時間足"))
+        b = bars.sort_index()
+        b = b.loc[(b.index > entry_time - bar_interval) & (b.index <= window_end)]
+        if b.empty:
+            continue
+        side_u = str(row["Side"]).strip().upper() if pd.notna(row["Side"]) else "LONG"
+        fallback_exit_price = float(row["Exit_Price"]) if hold_hours is None else None
+        paths.append({
+            "entry_price": float(row["Entry_Price"]), "leverage": float(row["Leverage"]),
+            "is_long": side_u != "SHORT", "qty": float(row["_qty"]), "dir": float(row["_dir"]),
+            "fee_est": float(row["_fee_est"]),
+            "lows": b["low"].to_numpy(dtype=float), "highs": b["high"].to_numpy(dtype=float),
+            "closes": b["close"].to_numpy(dtype=float),
+            "fallback_exit_price": fallback_exit_price,
+        })
+    return paths
+
+
+# =====================================================================================
 # 📊 トレード総合分析(ForexTester風・Phase1核心4機能・2026-07-21): UI層(selftest対象外)
 # =====================================================================================
 
@@ -6416,6 +7148,331 @@ def render_trade_analytics_tab() -> None:
     st.caption("背景色=大枠セッション(青=アジア/緑=ロンドン/赤=NY/灰=薄商い)、上部ラベル=詳細帯。"
                "バーにカーソルを当てると詳細帯名と勝敗内訳が出ます。")
     st.plotly_chart(fig_hr, width="stretch", key="ta_hourly_chart")
+
+    # ---- E. エグジット最適化(What-if再シミュレーション) 追補v9 -----------------------------
+    st.subheader("E. エグジット最適化(What-if再シミュレーション)")
+    st.caption(
+        "「SL/TP/最大保有時間が違っていたら結果はどうなっていたか」をローソク足のfirst-touch"
+        "(高値・安値が先に閾値に触れたか)判定で再シミュレーションします(ForexTesterの"
+        "「Exit Optimization」相当)。SL/TP%は**レバレッジ考慮ROE%**(証拠金に対する損益%。"
+        "価格換算=(%/100)/レバレッジ)で指定します。"
+    )
+    with st.expander("⚠️ 保守的近似・前提の明記(必読)", expanded=False):
+        st.markdown(
+            "- **同一バーで両方の閾値に触れた場合はSLが勝つと判定**します(保守的近似。"
+            "実際にどちらが先だったかはバー内では分かりません)。\n"
+            "- **エントリーを含むバーも判定対象**(バー内のエントリー前の値動きがSL/TP判定に"
+            "混入し得る近似。実際の約定順序は不明)。\n"
+            "- **窓端のバーはバー全体で判定する**ため、最大1バー分の窓外"
+            "(hold ONでは期限後、エントリー側では約定前)の値動きが判定に混入し得ます"
+            "(1分足で最大59秒・1時間足で最大59分)。**保有時間OFFでSL/TPに触れなかった"
+            "トレードは実績決済価格をそのまま使います**(窓端バーのclose近似は使いません)。\n"
+            "- 約定価格は**閾値価格そのもの**とし、スリッページは考慮しません(近似)。\n"
+            "- コストは各トレードの実績から`fee_est=実績グロス損益-実績純損益`"
+            "(価格グロス−Realized PNLの残差=ファンディング・会計差込みの実効コスト近似)を"
+            "算出し、シミュ後の決済にも同じ額を適用します。\n"
+            "- 経路データの取得に失敗したトレードは「シミュ対象外」として比較から除外し、"
+            "**実績側も同じN件だけで集計**します(見かけ上の改善/悪化を防ぐapples-to-apples比較)。\n"
+            "- ポジションサイズは実数量(Quantity)列があればそれを優先して復元し、無い場合のみ"
+            "PnL_Percent(価格変動%)からの逆算にフォールバックします(旧版はこの逆算値を誤って"
+            "レバレッジ倍過大評価するバグがありました。詳細は下の内訳表示参照)。\n"
+            "- ※グリッド最適は同一データ上の事後選択(in-sample)です。将来の成績を保証しません"
+            "(掟2: 反証プロトコル未通過の数字を「エッジ」と呼ばない)。"
+        )
+
+    es_recon_df, es_skip_counts = reconstruct_trades_for_exit_sim(df)
+    es_n_skip_total = sum(es_skip_counts.values())
+    if es_recon_df.empty:
+        st.warning(
+            "サイズ復元(Quantity、またはPnL_USD/PnL_Percent/Leverage/Entry_Price/Exit_Price)が"
+            "可能なトレードがありません。エグジット最適化は表示できません。"
+        )
+    else:
+        if es_n_skip_total > 0:
+            st.caption(
+                f"サイズ復元不可でシミュ対象外: {es_n_skip_total}件 "
+                f"(必須項目欠損(PnL_USD/価格/レバ)={es_skip_counts['core_fields_missing']}・"
+                f"PnL_Percent欠損/ゼロ(実数量なし時のみ該当)={es_skip_counts['pnl_percent_invalid']}・"
+                f"建玉サイズ算出不可={es_skip_counts['notional_invalid']})。"
+                f"復元成功={len(es_recon_df)}件。"
+            )
+        # 追補v9.1(レビュー反映・Fix1d): 復元方法の内訳(実数量列を使えたか、旧来の
+        # PnL_Percent逆算フォールバックに回ったか)を常に明示する(レバ過大評価バグの再発検知用)。
+        _es_sm_counts = es_recon_df["_size_method"].value_counts()
+        st.caption(
+            f"サイズ復元方法の内訳: 実数量(Quantity)列から復元="
+            f"{int(_es_sm_counts.get('quantity', 0))}件・"
+            f"PnL_Percentからの逆算(フォールバック)="
+            f"{int(_es_sm_counts.get('notional_fallback', 0))}件。"
+        )
+        es_symbol_options = sorted(es_recon_df["Symbol"].dropna().astype(str).unique().tolist())
+        c_es1, c_es2 = st.columns([2, 1])
+        with c_es1:
+            es_symbols_sel = st.multiselect(
+                "対象銘柄(既定=全体)", options=es_symbol_options, default=es_symbol_options,
+                key="ta_exitsim_symbols",
+            )
+        with c_es2:
+            st.caption(f"復元済みトレード{len(es_recon_df)}件のうち銘柄選択で絞り込みます。")
+
+        cc1, cc2, cc3 = st.columns(3)
+        with cc1:
+            es_sl_enabled = st.toggle("SLを有効にする", value=True, key="ta_exitsim_sl_enabled")
+            es_sl_pct = st.slider(
+                "SL (レバレッジ考慮ROE%)", min_value=1, max_value=500, value=50,
+                key="ta_exitsim_sl_pct", disabled=not es_sl_enabled,
+            )
+        with cc2:
+            es_tp_enabled = st.toggle("TPを有効にする", value=True, key="ta_exitsim_tp_enabled")
+            es_tp_pct = st.slider(
+                "TP (レバレッジ考慮ROE%)", min_value=1, max_value=500, value=100,
+                key="ta_exitsim_tp_pct", disabled=not es_tp_enabled,
+            )
+        with cc3:
+            es_hold_enabled = st.toggle("最大保有時間を有効にする", value=True, key="ta_exitsim_hold_enabled")
+            es_hold_hours = st.select_slider(
+                "最大保有時間(h)", options=EXIT_SIM_HOLD_HOUR_CHOICES, value=72,
+                key="ta_exitsim_hold_hours", disabled=not es_hold_enabled,
+            )
+
+        if not es_sl_enabled and not es_tp_enabled and not es_hold_enabled:
+            st.info("3トグルが全てOFFのため、シミュレーションは実績と完全に一致します(恒等性の確認用)。")
+
+        es_sl_eff = float(es_sl_pct) if es_sl_enabled else None
+        es_tp_eff = float(es_tp_pct) if es_tp_enabled else None
+        es_hold_eff = float(es_hold_hours) if es_hold_enabled else None
+
+        es_target_df = es_recon_df[es_recon_df["Symbol"].astype(str).isin(es_symbols_sel)]
+        # es_now_tsはこの回のリランで「▶ 再シミュレーション実行」が押された場合の実フェッチ用
+        # (フレッシュな現在時刻)。キャッシュ済み経路を再利用する各所(SL/TP%のみの再計算・
+        # グリッド探索)ではes_cache["now_ts"](フェッチ実行時に固定保存した値)を使う
+        # (Fix6: 毎リランでpd.Timestamp.now()を取り直すと「時間切れ」/「データ端」の分類や
+        # 窓終端クリップがリランのたびに微妙に変わり不安定になるため)。
+        es_now_ts = pd.Timestamp.now(tz="Asia/Tokyo")
+        es_need_fetch_now = not (es_sl_eff is None and es_tp_eff is None and es_hold_eff is None)
+        es_cache_key = compute_exit_sim_cache_key(es_target_df, es_hold_enabled, es_hold_eff)
+        es_cache = st.session_state.get("ta_exitsim_cache")
+        es_cache_valid = (
+            exit_sim_cache_is_valid(es_cache, es_cache_key, es_need_fetch_now) and not es_target_df.empty
+        )
+
+        es_run_clicked = st.button("▶ 再シミュレーション実行", key="ta_exitsim_run_btn")
+        if es_run_clicked and not es_target_df.empty:
+            es_progress = st.progress(0, text="準備中...")
+
+            def _es_progress_cb(done: int, total: int, symbol: str) -> None:
+                frac = done / total if total > 0 else 1.0
+                es_progress.progress(min(frac, 1.0), text=f"経路取得中... {symbol} ({done}/{total})")
+
+            es_result = run_exit_simulation_for_trades(
+                es_target_df, es_sl_eff, es_tp_eff, es_hold_eff, es_now_ts, progress_cb=_es_progress_cb,
+            )
+            es_progress.progress(1.0, text="完了")
+            st.session_state["ta_exitsim_cache"] = {
+                "cache_key": es_cache_key, "valid_df": es_target_df,
+                "bars_by_idx": es_result["bars_by_idx"], "timeframe_by_idx": es_result["timeframe_by_idx"],
+                "timeframe_counts": es_result["timeframe_counts"], "n_target": es_result["n_target"],
+                "n_fetch_fail": es_result["n_fetch_fail"], "n_exit_time_missing": es_result["n_exit_time_missing"],
+                "fail_symbols": es_result["fail_symbols"], "hold_enabled": es_hold_enabled,
+                "hold_hours": es_hold_eff, "outcomes": es_result["outcomes"],
+                # 追補v9.1(レビュー反映): Fix4=このキャッシュが実際にフェッチを伴って作られたか
+                # (need_fetch=Falseの恒等モード実行だとbars_by_idxが空のまま保存されるため、
+                # 後でSL/TPをONにした際にそれを「有効なシミュ結果」と誤判定しない材料にする)。
+                # Fix6=このフェッチを実行した瞬間の現在時刻を固定保存し、以後のリランでの
+                # 「時間切れ」/「データ端」判定・窓終端クリップの不安定化を防ぐ。
+                "was_fetch_run": bool(es_need_fetch_now), "now_ts": es_now_ts,
+            }
+            st.session_state.pop("ta_exitsim_grid_result", None)
+            es_cache = st.session_state["ta_exitsim_cache"]
+            es_cache_valid = True
+        elif es_run_clicked and es_target_df.empty:
+            st.warning("対象銘柄が選択されていません。")
+
+        # 追補v9.1(レビュー反映・Fix4): 「cache_keyは一致するが前回は恒等モードでフェッチ
+        # 未実行だった」という無効理由を、「設定が変わった」という無効理由と切り分けて案内する。
+        es_cache_key_matches = bool(es_cache) and es_cache.get("cache_key") == es_cache_key
+        if not es_cache_valid:
+            if es_cache is not None and es_cache_key_matches and es_need_fetch_now and not es_cache.get(
+                "was_fetch_run", False,
+            ):
+                st.info(
+                    "前回は3トグル全てOFF(恒等モード)で実行したため経路取得を行っていません。"
+                    "SL/TP/最大保有時間のいずれかを有効にした状態で「▶ 再シミュレーション実行」を"
+                    "押すと経路を取得します。"
+                )
+            elif es_cache is not None:
+                st.info(
+                    "銘柄選択または最大保有時間の設定が前回シミュレーション実行時から変更されています。"
+                    "「▶ 再シミュレーション実行」を押して経路を再取得してください"
+                    "(SL/TP%だけの変更は再フェッチ不要で自動的に再計算されます)。"
+                )
+            else:
+                st.info("「▶ 再シミュレーション実行」を押すとシミュレーションを開始します(経路取得を伴います)。")
+        else:
+            # SL/TP%だけの変更は再フェッチ不要で自動再計算する(キャッシュ済み経路を再利用)。
+            # 追補v9.1(Fix6): now_tsはキャッシュ保存済みの値(フェッチ実行時刻)を使い、毎リランで
+            # 新規発行しない(「時間切れ」/「データ端」分類・窓終端クリップの不安定化を防ぐ)。
+            if es_run_clicked:
+                es_outcomes = es_cache["outcomes"]
+            else:
+                es_outcomes = recompute_exit_outcomes_cached(
+                    es_target_df, es_cache["bars_by_idx"], es_cache["timeframe_by_idx"],
+                    es_sl_eff, es_tp_eff, es_hold_eff, es_cache["now_ts"],
+                )
+
+            es_ok_outcomes: list[dict[str, Any]] = []
+            es_actual_pnls: list[float] = []
+            es_rows_for_curve: list[dict[str, Any]] = []
+            for idx, row in es_target_df.iterrows():
+                o = es_outcomes.get(idx)
+                if o is not None and o.get("ok"):
+                    es_ok_outcomes.append(o)
+                    es_actual_pnls.append(float(row["PnL_USD"]))
+                    es_rows_for_curve.append({
+                        "entry_time": row["Entry_Time"], "actual_pnl": float(row["PnL_USD"]),
+                        "sim_pnl": float(o["sim_net"]),
+                    })
+            es_agg = aggregate_exit_sim_outcomes(es_ok_outcomes, es_actual_pnls)
+
+            # 追補v9.1(レビュー反映・Fix5): 表示件数の自己矛盾を解消する。
+            # (1) 3トグル全OFF(恒等モード)は経路取得を一切行わず全件がそのまま実績表示になる
+            #     ため、フェッチ失敗件数・失敗銘柄・足種内訳といった「フェッチ関連」の表示を
+            #     一切出さない専用文言にする(そもそも取得していないものを「0件失敗」と
+            #     表示すると誤解を招くため)。
+            # (2) フェッチを伴う場合は、除外合計を「n_target - N」から導出する(内訳カウンタの
+            #     独立集計を単純合算するのではなく逆算する)ことで、除外理由が増えても
+            #     N+除外=対象件数の不変条件を必ず満たす。既知理由(経路取得失敗/決済時刻欠損)の
+            #     合計より導出済み除外合計の方が大きい場合は、その差分を「判定不能」として
+            #     残差表示する(simulate_trade_exit_pathが窓内バー0本でValueErrorになるなど、
+            #     フェッチ自体は成功したが個別に判定できなかったケースを捕捉するため)。
+            if not es_cache["was_fetch_run"]:
+                st.caption(
+                    f"全トグルOFF(恒等モード): 対象{es_agg['n']}件を実績どおり表示"
+                    "(経路不要・除外なし)。"
+                )
+            else:
+                n_excluded = es_cache["n_target"] - es_agg["n"]
+                n_known = es_cache["n_fetch_fail"] + es_cache["n_exit_time_missing"]
+                n_residual = n_excluded - n_known
+                _residual_part = f"・判定不能={n_residual}件" if n_residual > 0 else ""
+                st.caption(
+                    f"対象{es_cache['n_target']}件のうちシミュ比較可能=N={es_agg['n']}件"
+                    f"(除外合計={n_excluded}件: 経路取得失敗={es_cache['n_fetch_fail']}件・"
+                    f"決済時刻欠損={es_cache['n_exit_time_missing']}件{_residual_part})。"
+                    + (f" 取得失敗銘柄: {', '.join(es_cache['fail_symbols'])}。" if es_cache["fail_symbols"] else "")
+                )
+
+            if es_agg["n"] == 0:
+                st.warning("シミュ比較可能なトレードが0件のため結果を表示できません。")
+            else:
+                m1, m2, m3, m4, m5, m6 = st.columns(6)
+                m1.metric("潜在純利益(シミュ)", f"{es_agg['sim_net_total']:,.1f}")
+                m2.metric("実績純利益(同N件)", f"{es_agg['actual_net_total']:,.1f}")
+                m3.metric("差分(シミュ-実績)", f"{es_agg['diff']:+,.1f}")
+                m4.metric(
+                    "勝率(シミュ/実績)",
+                    f"{es_agg['sim_win_rate_pct']:.1f}% / {es_agg['actual_win_rate_pct']:.1f}%",
+                )
+                m5.metric("PF(シミュ/実績)", f"{_fmt_stat(es_agg['sim_pf'])} / {_fmt_stat(es_agg['actual_pf'])}")
+                m6.metric(
+                    "平均トレード(シミュ/実績)",
+                    f"{es_agg['sim_avg_trade']:,.2f} / {es_agg['actual_avg_trade']:,.2f}",
+                )
+
+                ev_df = pd.DataFrame(
+                    sorted(es_agg["event_counts"].items(), key=lambda kv: -kv[1]), columns=["イベント", "件数"],
+                )
+                tf_df = pd.DataFrame(
+                    sorted(es_cache["timeframe_counts"].items(), key=lambda kv: -kv[1]), columns=["足種", "件数"],
+                ) if es_cache["timeframe_counts"] else pd.DataFrame(columns=["足種", "件数"])
+                ev_col, tf_col = st.columns(2)
+                with ev_col:
+                    st.markdown("**決済イベント内訳**")
+                    st.dataframe(ev_df, width="stretch", hide_index=True)
+                with tf_col:
+                    st.markdown("**使用足種内訳(経路取得分)**")
+                    if not tf_df.empty:
+                        st.dataframe(tf_df, width="stretch", hide_index=True)
+                    else:
+                        st.caption("(全トグルOFFのため経路取得なし)")
+
+                curve_df = pd.DataFrame(es_rows_for_curve).sort_values("entry_time")
+                curve_df["actual_cum"] = curve_df["actual_pnl"].cumsum()
+                curve_df["sim_cum"] = curve_df["sim_pnl"].cumsum()
+                period_start = curve_df["entry_time"].min()
+                period_end = curve_df["entry_time"].max()
+                st.caption(
+                    f"集計期間: {period_start:%Y-%m-%d %H:%M} 〜 {period_end:%Y-%m-%d %H:%M}(JST)・"
+                    f"N={len(curve_df)}件(トレード単位の累積、時間集計なし)"
+                )
+                fig_es = go.Figure()
+                fig_es.add_trace(go.Scatter(
+                    x=curve_df["entry_time"], y=curve_df["actual_cum"], mode="lines", name="実績(同N件)",
+                    line=dict(color="#5DA9FF"),
+                ))
+                fig_es.add_trace(go.Scatter(
+                    x=curve_df["entry_time"], y=curve_df["sim_cum"], mode="lines", name="シミュ(What-if)",
+                    line=dict(color="#FFB020"),
+                ))
+                fig_es.update_layout(
+                    template="plotly_dark", height=360, margin=dict(l=40, r=20, t=30, b=20),
+                    xaxis_title="エントリー時刻(JST)", yaxis_title="累積PnL(USD)",
+                )
+                st.plotly_chart(fig_es, width="stretch", key="ta_exitsim_equity_chart")
+
+            st.markdown("---")
+            st.markdown("**🔎 自動最適化(グリッド探索)**")
+            _es_grid_n_combos = len(EXIT_SIM_SL_TP_GRID) ** 2
+            st.caption(
+                f"SL%×TP%の候補各{len(EXIT_SIM_SL_TP_GRID)}通り(計{_es_grid_n_combos}組)を、"
+                "既に取得済みの経路を再利用して(再フェッチなし)一括評価します。"
+                "ホライズンは現在の最大保有時間設定を使用します。"
+            )
+            # 追補v9.1(レビュー反映・Fix7): グリッド探索は同一データ上の事後選択(in-sample)で
+            # あり、将来の成績を保証しない(掟2: 反証プロトコル未通過の数字を「エッジ」と
+            # 呼ばない)。組数はEXIT_SIM_SL_TP_GRIDの実長から都度算出し固定値を書かない。
+            st.caption(
+                f"※グリッド最適は同一データ上の事後選択(in-sample・{_es_grid_n_combos}組)です。"
+                "将来の成績を保証しません。"
+            )
+            es_grid_enabled = bool(es_cache.get("bars_by_idx"))
+            es_grid_clicked = st.button(
+                "🔎 自動最適化(グリッド探索)", key="ta_exitsim_grid_btn", disabled=not es_grid_enabled,
+            )
+            if not es_grid_enabled:
+                st.caption("(経路キャッシュが無いため無効。全トグルOFFの状態ではグリッド探索できません)")
+            if es_grid_clicked:
+                # 追補v9.1(Fix2c/Fix6): timeframe_by_idxを渡してトレードごとの実バー幅で
+                # トリムし、now_tsはキャッシュ保存済みの値を使う(フェッチ実行時刻に固定)。
+                es_paths = build_grid_search_trade_paths(
+                    es_target_df, es_cache["bars_by_idx"], es_cache["timeframe_by_idx"],
+                    es_cache["hold_hours"] if es_cache["hold_enabled"] else None,
+                    es_cache["now_ts"],
+                )
+                st.session_state["ta_exitsim_grid_result"] = grid_search_exit_optimization(es_paths)
+            es_grid_df = st.session_state.get("ta_exitsim_grid_result")
+            if es_grid_df is not None and not es_grid_df.empty:
+                best = es_grid_df.iloc[0]
+                gcol1, gcol2 = st.columns(2)
+                with gcol1:
+                    st.markdown("**現在の設定**")
+                    st.write(
+                        f"SL={_fmt_stat(es_sl_pct, ',.0f') if es_sl_enabled else 'OFF'}% / "
+                        f"TP={_fmt_stat(es_tp_pct, ',.0f') if es_tp_enabled else 'OFF'}% "
+                        f"→ 純利益={es_agg['sim_net_total']:,.1f} / PF={_fmt_stat(es_agg['sim_pf'])} / "
+                        f"勝率={es_agg['sim_win_rate_pct']:.1f}%"
+                    )
+                with gcol2:
+                    st.markdown("**グリッド最適**")
+                    st.write(
+                        f"SL={best['sl_pct']:.1f}% / TP={best['tp_pct']:.1f}% → "
+                        f"純利益={best['net_profit']:,.1f} / PF={_fmt_stat(best['pf'])} / "
+                        f"勝率={best['win_rate_pct']:.1f}%(n={int(best['n'])})"
+                    )
+                st.markdown("**上位10**")
+                st.dataframe(es_grid_df.head(10), width="stretch", hide_index=True)
+                st.markdown("**ワースト3**")
+                st.dataframe(es_grid_df.nsmallest(3, "net_profit"), width="stretch", hide_index=True)
 
 
 # =====================================================================================
@@ -9443,6 +10500,7 @@ def run_selftest() -> bool:
     ])
     onorm, oerr = normalize_trades_csv(oh)
     btc = onorm[onorm["Symbol"] == "BTC"].sort_values("Exit_Time") if onorm is not None else None
+    eth = onorm[onorm["Symbol"] == "ETH"] if onorm is not None else None
     # BTCは2トレード・建値=平均110・JST=UTC+8+1h(10:00→11:00)・PnL_Percent符号
     ok57 = (onorm is not None and len(onorm) == 3   # BTC×2 + ETH orphan×1(SOLは未決済で除外)
             and btc is not None and len(btc) == 2
@@ -9453,6 +10511,17 @@ def run_selftest() -> bool:
             and any(s == "info" for s, _ in oerr))
     check("5-8 BingX注文履歴: 平均建値/部分決済2本/UTC8→JST/未決済除外/建玉前クローズ", ok57,
           f"trades={None if onorm is None else len(onorm)}")
+    # 追補v9.1(レビュー反映・Fix1a/1b): reconstruct_bingx_order_historyが出す実数量Quantity列が
+    # normalize_trades_csvを素通りしてくることを確認する(サイズ復元の主経路として使うため)。
+    # BTCは各Closeともq=1・残数量>=1なのでcq=min(q, st_["qty"])=1.0が2トレードとも入るはず。
+    # ETH(orphan=Openなし)はQuantityがNoneのまま(建玉数量が不明なため)。
+    ok58q = (btc is not None and "Quantity" in btc.columns
+             and abs(float(btc.iloc[0]["Quantity"]) - 1.0) < 1e-9
+             and abs(float(btc.iloc[1]["Quantity"]) - 1.0) < 1e-9
+             and eth is not None and len(eth) == 1 and pd.isna(eth.iloc[0]["Quantity"]))
+    check("5-8b Quantity列がBTC=1.0/1.0・ETH(orphan)=NaNで通る", ok58q,
+          f"btc_qty={None if btc is None else btc['Quantity'].tolist()}・"
+          f"eth_qty={None if eth is None else eth['Quantity'].tolist()}")
     # 5-9 検出だけで通常CSVは素通り(既存自作形式が再構築対象にならない)
     plain = pd.DataFrame({"Entry_Time": ["2026-01-01 10:00"], "Symbol": ["BTC"], "PnL_USD": [5.0]})
     check("5-9 通常CSVはBingX判定に掛からず素通り",
@@ -12085,6 +13154,570 @@ def run_selftest() -> bool:
     eq27_empty = compute_equity_curve(pd.DataFrame())
     check("27-13b 空df入力は空DataFrame(規定columns)", eq27_empty.empty
           and list(eq27_empty.columns) == EQUITY_CURVE_COLUMNS, f"cols={list(eq27_empty.columns)}")
+
+    # -----------------------------------------------------------------
+    # 28. 追補v9 エグジット最適化(What-if再シミュレーション):
+    #     compute_exit_price_thresholds / simulate_trade_exit_path /
+    #     reconstruct_trades_for_exit_sim / compute_trade_whatif_outcome /
+    #     aggregate_exit_sim_outcomes / grid_search_exit_optimization ほかの
+    #     純ロジック関数群の検証(ネットワーク不使用・合成バーデータのみ)。
+    #     SHORT側は全項目でLONG側と対称に検証する。
+    #     追補v9.1(レビュー反映): 28-5はFix1(Quantity優先復元)後のskip_counts/数値へ更新。
+    #     28-11以降でFix2(エントリーミッドバー)・Fix1(Quantity優先経路)・Fix3(保有OFF実績決済+
+    #     グリッドfallback_exit_price)・Fix4(exit_sim_cache_is_valid)を新規カバーする。
+    # -----------------------------------------------------------------
+    print("\n--- 28. 追補v9 エグジット最適化 ---")
+
+    def _ts28(s: str) -> pd.Timestamp:
+        return pd.Timestamp(s, tz="Asia/Tokyo")
+
+    def _es28_close(a: Any, b: Any) -> bool:
+        # pf(inf/nanを取り得る)を含む数値比較。両方nan/両方同符号infなら一致とみなす。
+        try:
+            fa, fb = float(a), float(b)
+        except (TypeError, ValueError):
+            return a == b
+        if math.isnan(fa) and math.isnan(fb):
+            return True
+        if math.isinf(fa) and math.isinf(fb) and (fa > 0) == (fb > 0):
+            return True
+        return math.isclose(fa, fb, rel_tol=1e-9, abs_tol=1e-9)
+
+    # --- 28-1(a): 閾値換算(レバレッジ考慮ROE%->価格。25x, SL50%->-2%/TP100%->+4%。SHORTは鏡像) ---
+    sl28a, tp28a = compute_exit_price_thresholds(100.0, 25.0, "LONG", 50.0, 100.0)
+    check("28-1a LONG SL50%(25x)->-2%", math.isclose(sl28a, 98.0), f"sl_price={sl28a}")
+    check("28-1b LONG TP100%(25x)->+4%", math.isclose(tp28a, 104.0), f"tp_price={tp28a}")
+    sl28b, tp28b = compute_exit_price_thresholds(100.0, 25.0, "SHORT", 50.0, 100.0)
+    check("28-1c SHORT SL50%(25x)->+2%(鏡像)", math.isclose(sl28b, 102.0), f"sl_price={sl28b}")
+    check("28-1d SHORT TP100%(25x)->-4%(鏡像)", math.isclose(tp28b, 96.0), f"tp_price={tp28b}")
+    sl28c, tp28c = compute_exit_price_thresholds(100.0, 25.0, "LONG", None, None)
+    check("28-1e トグルOFF(None)はNoneのまま", sl28c is None and tp28c is None, f"{(sl28c, tp28c)}")
+
+    # --- 28-2(b): first-touch順序(時系列上、後のバーでSLが起き得ても先に触れたTPが優先) ---
+    bars28_long = pd.DataFrame(
+        {"low": [98.0, 96.0, 80.0], "high": [99.0, 106.0, 80.0], "close": [98.0, 105.0, 80.0]},
+        index=pd.DatetimeIndex([_ts28("2026-05-01 00:00:00"), _ts28("2026-05-01 01:00:00"),
+                                 _ts28("2026-05-01 02:00:00")]),
+    )
+    r28_2a = simulate_trade_exit_path(
+        bars28_long, _ts28("2026-05-01 00:00:00"), _ts28("2026-05-01 02:00:00"),
+        "LONG", sl_price=90.0, tp_price=105.0, bar_interval=pd.Timedelta(hours=1),
+    )
+    check("28-2a LONG: 先に触れたTPで確定(後続バーのSLは無視)",
+          r28_2a["event"] == "TP" and math.isclose(r28_2a["exit_price"], 105.0)
+          and r28_2a["exit_time"] == _ts28("2026-05-01 01:00:00"), f"{r28_2a}")
+
+    bars28_short = pd.DataFrame(
+        {"low": [99.0, 94.0, 119.0], "high": [101.0, 95.0, 120.0], "close": [100.0, 94.0, 119.0]},
+        index=pd.DatetimeIndex([_ts28("2026-05-01 00:00:00"), _ts28("2026-05-01 01:00:00"),
+                                 _ts28("2026-05-01 02:00:00")]),
+    )
+    r28_2b = simulate_trade_exit_path(
+        bars28_short, _ts28("2026-05-01 00:00:00"), _ts28("2026-05-01 02:00:00"),
+        "SHORT", sl_price=110.0, tp_price=95.0, bar_interval=pd.Timedelta(hours=1),
+    )
+    check("28-2b SHORT: 先に触れたTPで確定(後続バーのSLは無視、対称)",
+          r28_2b["event"] == "TP" and math.isclose(r28_2b["exit_price"], 95.0)
+          and r28_2b["exit_time"] == _ts28("2026-05-01 01:00:00"), f"{r28_2b}")
+
+    # --- 28-3(c): 同一バーでSL/TP両方に触れたらSL優先(保守的近似) ---
+    bars28_tie = pd.DataFrame(
+        {"low": [90.0], "high": [110.0], "close": [100.0]},
+        index=pd.DatetimeIndex([_ts28("2026-05-01 00:00:00")]),
+    )
+    r28_3a = simulate_trade_exit_path(
+        bars28_tie, _ts28("2026-05-01 00:00:00"), _ts28("2026-05-01 00:00:00"),
+        "LONG", sl_price=95.0, tp_price=105.0, bar_interval=pd.Timedelta(hours=1),
+    )
+    check("28-3a LONG同一バー両触れ->SL優先", r28_3a["event"] == "SL" and math.isclose(r28_3a["exit_price"], 95.0),
+          f"{r28_3a}")
+    r28_3b = simulate_trade_exit_path(
+        bars28_tie, _ts28("2026-05-01 00:00:00"), _ts28("2026-05-01 00:00:00"),
+        "SHORT", sl_price=105.0, tp_price=95.0, bar_interval=pd.Timedelta(hours=1),
+    )
+    check("28-3b SHORT同一バー両触れ->SL優先(対称)",
+          r28_3b["event"] == "SL" and math.isclose(r28_3b["exit_price"], 105.0), f"{r28_3b}")
+
+    # --- 28-4(d): タイムアウト決済(時間切れ=データが窓終端近くまで到達/データ端=手前で途切れ) ---
+    bars28_full = pd.DataFrame(
+        {"low": [98.0, 97.0, 96.0], "high": [99.0, 98.0, 97.0], "close": [98.5, 97.5, 96.5]},
+        index=pd.DatetimeIndex([_ts28("2026-05-01 00:00:00"), _ts28("2026-05-01 01:00:00"),
+                                 _ts28("2026-05-01 02:00:00")]),
+    )
+    r28_4a = simulate_trade_exit_path(
+        bars28_full, _ts28("2026-05-01 00:00:00"), _ts28("2026-05-01 02:00:00"),
+        "LONG", sl_price=None, tp_price=None, bar_interval=pd.Timedelta(hours=1),
+    )
+    check("28-4a 閾値未到達+最終バーが窓終端(差<=bar_interval)->時間切れ",
+          r28_4a["event"] == "時間切れ" and math.isclose(r28_4a["exit_price"], 96.5), f"{r28_4a}")
+
+    bars28_thin = pd.DataFrame(
+        {"low": [98.0, 97.0], "high": [99.0, 98.0], "close": [98.5, 97.5]},
+        index=pd.DatetimeIndex([_ts28("2026-05-01 00:00:00"), _ts28("2026-05-01 01:00:00")]),
+    )
+    r28_4b = simulate_trade_exit_path(
+        bars28_thin, _ts28("2026-05-01 00:00:00"), _ts28("2026-05-01 06:00:00"),
+        "LONG", sl_price=None, tp_price=None, bar_interval=pd.Timedelta(hours=1),
+    )
+    check("28-4b データが窓終端の手前(差>bar_interval)で尽きた->データ端",
+          r28_4b["event"] == "データ端" and math.isclose(r28_4b["exit_price"], 97.5), f"{r28_4b}")
+
+    # --- 28-5(e): サイズ復元(notional_fallback法。Fix1後)+3スキップ条件+SHORT対称+
+    #     Side欠損->LONG既定 ---
+    rows28_recon = [
+        # label, Entry_Time, Exit_Time, Symbol, PnL_USD, PnL_Percent, Side, Leverage, Entry_Price, Exit_Price
+        ("vL", _ts28("2026-05-01 00:00:00"), _ts28("2026-05-01 01:00:00"), "BTC", 50.0, 10.0, "LONG", 5.0, 100.0, 105.0),
+        ("vS", _ts28("2026-05-02 00:00:00"), _ts28("2026-05-02 01:00:00"), "ETH", 20.0, 8.0, "SHORT", 10.0, 200.0, 190.0),
+        ("vNaNSide", _ts28("2026-05-03 00:00:00"), _ts28("2026-05-03 01:00:00"), "SOL", 50.0, 10.0, np.nan, 5.0, 100.0, 105.0),
+        ("sPctNaN", _ts28("2026-05-04 00:00:00"), _ts28("2026-05-04 01:00:00"), "BTC", 10.0, np.nan, "LONG", 5.0, 100.0, 101.0),
+        ("sPctZero", _ts28("2026-05-05 00:00:00"), _ts28("2026-05-05 01:00:00"), "BTC", 10.0, 1e-12, "LONG", 5.0, 100.0, 101.0),
+        ("sPnlNaN", _ts28("2026-05-06 00:00:00"), _ts28("2026-05-06 01:00:00"), "BTC", np.nan, 10.0, "LONG", 5.0, 100.0, 101.0),
+        ("sLevNaN", _ts28("2026-05-07 00:00:00"), _ts28("2026-05-07 01:00:00"), "BTC", 10.0, 10.0, "LONG", np.nan, 100.0, 101.0),
+        ("sEntry0", _ts28("2026-05-08 00:00:00"), _ts28("2026-05-08 01:00:00"), "BTC", 10.0, 10.0, "LONG", 5.0, 0.0, 101.0),
+        ("sLevNeg", _ts28("2026-05-09 00:00:00"), _ts28("2026-05-09 01:00:00"), "BTC", 10.0, 10.0, "LONG", -5.0, 100.0, 101.0),
+        ("sMarginNeg", _ts28("2026-05-10 00:00:00"), _ts28("2026-05-10 01:00:00"), "BTC", -50.0, 10.0, "LONG", 5.0, 100.0, 95.0),
+    ]
+    df28_recon_in = pd.DataFrame(
+        [r[1:] for r in rows28_recon],
+        index=[r[0] for r in rows28_recon],
+        columns=["Entry_Time", "Exit_Time", "Symbol", "PnL_USD", "PnL_Percent", "Side", "Leverage",
+                 "Entry_Price", "Exit_Price"],
+    )
+    recon28, skip28 = reconstruct_trades_for_exit_sim(df28_recon_in)
+    check("28-5a スキップ内訳: core_fields_missing=4(sPnlNaN/sLevNaN/sEntry0/sLevNeg。"
+          "PnL_USD NaN・Lev NaN・Entry<=0・Lev<=0は経路共通の必須条件でPnL_Percent判定より先に弾く)",
+          skip28["core_fields_missing"] == 4, f"skip28={skip28}")
+    check("28-5b スキップ内訳: pnl_percent_invalid=2(sPctNaN/sPctZero。Quantity無効行のみ"
+          "PnL_Percentを見るため、この2件だけがここに残る)",
+          skip28["pnl_percent_invalid"] == 2, f"skip28={skip28}")
+    check("28-5c スキップ内訳: notional_invalid=1(sMarginNeg。notional=PnL_USD/(PnL_Percent/100)<=0)",
+          skip28["notional_invalid"] == 1, f"skip28={skip28}")
+    check("28-5d 生存行=3件(vL/vS/vNaNSide)のみ・元の並び順を保持",
+          list(recon28.index) == ["vL", "vS", "vNaNSide"], f"index={list(recon28.index)}")
+    vL28 = recon28.loc["vL"]
+    check("28-5e LONG notional_fallback法(Fix1: notional=PnL_USD/(PnL_Percent/100)=500/"
+          "margin=notional/Leverage=100/qty=notional/Entry=5/dir=+1、旧margin法の500/25から訂正)",
+          math.isclose(vL28["_margin"], 100.0) and math.isclose(vL28["_notional"], 500.0)
+          and math.isclose(vL28["_qty"], 5.0) and math.isclose(vL28["_dir"], 1.0)
+          and vL28["_size_method"] == "notional_fallback",
+          f"margin={vL28['_margin']} notional={vL28['_notional']} qty={vL28['_qty']} dir={vL28['_dir']} "
+          f"method={vL28['_size_method']}")
+    check("28-5f LONG gross_actual=qty*(Exit-Entry)*dir=25/fee_est=gross-PnL_USD=-25",
+          math.isclose(vL28["_gross_actual"], 25.0)
+          and math.isclose(vL28["_fee_est"], -25.0), f"gross={vL28['_gross_actual']} fee={vL28['_fee_est']}")
+    vS28 = recon28.loc["vS"]
+    check("28-5g SHORT notional_fallback法(対称): margin=25/notional=250/qty=1.25/dir=-1",
+          math.isclose(vS28["_margin"], 25.0) and math.isclose(vS28["_notional"], 250.0)
+          and math.isclose(vS28["_qty"], 1.25) and math.isclose(vS28["_dir"], -1.0),
+          f"margin={vS28['_margin']} notional={vS28['_notional']} qty={vS28['_qty']} dir={vS28['_dir']}")
+    check("28-5h SHORT gross_actual=12.5/fee_est=-7.5(対称)", math.isclose(vS28["_gross_actual"], 12.5)
+          and math.isclose(vS28["_fee_est"], -7.5), f"gross={vS28['_gross_actual']} fee={vS28['_fee_est']}")
+    vN28 = recon28.loc["vNaNSide"]
+    check("28-5i Side欠損行はLONG既定(dir=+1)でvLと同一結果", math.isclose(vN28["_dir"], 1.0)
+          and math.isclose(vN28["_gross_actual"], 25.0) and math.isclose(vN28["_fee_est"], -25.0),
+          f"dir={vN28['_dir']} gross={vN28['_gross_actual']} fee={vN28['_fee_est']}")
+
+    # --- 28-6(g): fee_est = 実績gross_actual - 実績PnL_USD の検算(生存3行全て) ---
+    fee_ok28 = all(
+        math.isclose(recon28.loc[i, "_fee_est"], recon28.loc[i, "_gross_actual"] - recon28.loc[i, "PnL_USD"])
+        for i in recon28.index
+    )
+    check("28-6 fee_est=gross_actual-PnL_USDが生存3行全てで成立", fee_ok28)
+
+    # --- 28-7(f): 全トグルOFF恒等性(sim_net==実績PnL_USD)+ok=False分岐(決済時刻欠損/経路欠落) ---
+    now28 = _ts28("2026-06-01 00:00:00")
+    trade28_L = {
+        "entry_time": vL28["Entry_Time"], "exit_time": vL28["Exit_Time"],
+        "entry_price": float(vL28["Entry_Price"]), "exit_price": float(vL28["Exit_Price"]),
+        "side": "LONG", "qty": float(vL28["_qty"]), "dir": float(vL28["_dir"]),
+        "fee_est": float(vL28["_fee_est"]), "leverage": float(vL28["Leverage"]),
+    }
+    out28_L = compute_trade_whatif_outcome(trade28_L, None, None, None, None, now28)
+    check("28-7a LONG 全トグルOFF: sim_net==実績PnL_USD(50)かつevent注記",
+          out28_L["ok"] and math.isclose(out28_L["sim_net"], 50.0) and out28_L["event"] == "実績(全トグルOFF)",
+          f"{out28_L}")
+    trade28_S = {
+        "entry_time": vS28["Entry_Time"], "exit_time": vS28["Exit_Time"],
+        "entry_price": float(vS28["Entry_Price"]), "exit_price": float(vS28["Exit_Price"]),
+        "side": "SHORT", "qty": float(vS28["_qty"]), "dir": float(vS28["_dir"]),
+        "fee_est": float(vS28["_fee_est"]), "leverage": float(vS28["Leverage"]),
+    }
+    out28_S = compute_trade_whatif_outcome(trade28_S, None, None, None, None, now28)
+    check("28-7b SHORT 全トグルOFF: sim_net==実績PnL_USD(20)(対称)",
+          out28_S["ok"] and math.isclose(out28_S["sim_net"], 20.0), f"{out28_S}")
+
+    trade28_noexit = dict(trade28_L, exit_time=None)
+    out28_noexit = compute_trade_whatif_outcome(trade28_noexit, None, 50.0, None, None, now28)
+    check("28-7c 決済時刻欠損(保有時間トグルOFF+Exit_Time欠損)->ok=False",
+          out28_noexit["ok"] is False, f"{out28_noexit}")
+    out28_nopath = compute_trade_whatif_outcome(trade28_L, None, None, None, 24.0, now28)
+    check("28-7d 経路(bars)欠落->ok=False", out28_nopath["ok"] is False, f"{out28_nopath}")
+    bars28_offwindow = pd.DataFrame(
+        {"low": [1.0], "high": [2.0], "close": [1.5]},
+        index=pd.DatetimeIndex([_ts28("2020-01-01 00:00:00")]),
+    )
+    out28_badwindow = compute_trade_whatif_outcome(trade28_L, bars28_offwindow, None, None, 24.0, now28)
+    check("28-7e 窓内にバー無し(simulate_trade_exit_pathのValueError)->ok=False",
+          out28_badwindow["ok"] is False, f"{out28_badwindow}")
+
+    # --- 28-8(h): グリッド探索が既知の最適(sl,tp)を選ぶ: 独立実装(素朴なforループ)との全セル一致検証 ---
+    def _grid_brute28(paths: list[dict[str, Any]], sl_grid: list[float], tp_grid: list[float]) -> dict:
+        n = len(paths)
+        out: dict[tuple[float, float], tuple[float, float, float, float]] = {}
+        for sl in sl_grid:
+            for tp in tp_grid:
+                total = 0.0
+                wins = 0
+                gp = 0.0
+                gl = 0.0
+                for p in paths:
+                    entry = p["entry_price"]; lev = p["leverage"]; is_long = p["is_long"]
+                    qty = p["qty"]; direction = p["dir"]; fee = p["fee_est"]
+                    lows = p["lows"]; highs = p["highs"]; closes = p["closes"]
+                    sl_frac = (sl / 100.0) / lev
+                    tp_frac = (tp / 100.0) / lev
+                    if is_long:
+                        sl_price = entry * (1 - sl_frac)
+                        tp_price = entry * (1 + tp_frac)
+                    else:
+                        sl_price = entry * (1 + sl_frac)
+                        tp_price = entry * (1 - tp_frac)
+                    exit_price = closes[-1]
+                    for i in range(len(lows)):
+                        hsl = (lows[i] <= sl_price) if is_long else (highs[i] >= sl_price)
+                        htp = (highs[i] >= tp_price) if is_long else (lows[i] <= tp_price)
+                        if hsl:
+                            exit_price = sl_price
+                            break
+                        if htp:
+                            exit_price = tp_price
+                            break
+                    net = qty * (exit_price - entry) * direction - fee
+                    total += net
+                    if net > 0:
+                        wins += 1
+                        gp += net
+                    elif net < 0:
+                        gl += net
+                pf = (gp / abs(gl)) if gl != 0 else (float("inf") if gp > 0 else float("nan"))
+                out[(sl, tp)] = (total, 100.0 * wins / n, pf, total / n)
+        return out
+
+    paths28 = [
+        {  # Trade A: LONG、複数バーでSL/TPどちらも起こり得る道のり
+            "entry_price": 100.0, "leverage": 10.0, "is_long": True, "qty": 2.0, "dir": 1.0, "fee_est": 1.5,
+            "lows": np.array([99.0, 96.0, 103.0, 108.0, 90.0]),
+            "highs": np.array([101.0, 98.0, 106.0, 112.0, 140.0]),
+            "closes": np.array([100.0, 97.0, 105.0, 110.0, 120.0]),
+        },
+        {  # Trade B: SHORT(対称)、下げ->上げの往復
+            "entry_price": 200.0, "leverage": 5.0, "is_long": False, "qty": 1.0, "dir": -1.0, "fee_est": -2.0,
+            "lows": np.array([195.0, 210.0, 180.0, 220.0]),
+            "highs": np.array([205.0, 215.0, 190.0, 225.0]),
+            "closes": np.array([198.0, 212.0, 185.0, 222.0]),
+        },
+        {  # Trade C: LONG、完全横ばい(どの閾値にも触れない=no_hit分岐の一定寄与を検証)
+            "entry_price": 50.0, "leverage": 20.0, "is_long": True, "qty": 0.5, "dir": 1.0, "fee_est": 0.3,
+            "lows": np.array([50.0, 50.0, 50.0]), "highs": np.array([50.0, 50.0, 50.0]),
+            "closes": np.array([50.0, 50.0, 50.0]),
+        },
+        {  # Trade D: LONG単一バーでグリッド全域のSL/TPが同時到達->同着はSL優先を全域で検証
+            "entry_price": 100.0, "leverage": 10.0, "is_long": True, "qty": 1.0, "dir": 1.0, "fee_est": 0.0,
+            "lows": np.array([80.0]), "highs": np.array([140.0]), "closes": np.array([110.0]),
+        },
+    ]
+    sl_grid28 = [5.0, 10.0, 30.0, 100.0]
+    tp_grid28 = [3.0, 8.0, 20.0, 50.0]
+    grid_df28 = grid_search_exit_optimization(paths28, sl_grid28, tp_grid28)
+    ref28 = _grid_brute28(paths28, sl_grid28, tp_grid28)
+
+    mismatches28: list[str] = []
+    for _, rrow in grid_df28.iterrows():
+        key = (rrow["sl_pct"], rrow["tp_pct"])
+        rt, rwr, rpf, ravg = ref28[key]
+        if not (_es28_close(rrow["net_profit"], rt) and _es28_close(rrow["win_rate_pct"], rwr)
+                and _es28_close(rrow["pf"], rpf) and _es28_close(rrow["avg_trade"], ravg)):
+            mismatches28.append(f"{key}: grid=({rrow['net_profit']},{rrow['win_rate_pct']},{rrow['pf']},"
+                                 f"{rrow['avg_trade']}) ref={(rt, rwr, rpf, ravg)}")
+    check(f"28-8a grid_search全{len(sl_grid28) * len(tp_grid28)}セルが素朴forループ参照実装と一致",
+          len(mismatches28) == 0, "; ".join(mismatches28[:3]))
+
+    best_key28 = max(ref28, key=lambda k: ref28[k][0])
+    top_row28 = grid_df28.iloc[0]
+    check("28-8b net_profit降順ソート(先頭行が最大)",
+          bool((grid_df28["net_profit"].diff().dropna() <= 1e-9).all()),
+          f"head={list(grid_df28['net_profit'].head(3))}")
+    check("28-8c 先頭行(sl_pct,tp_pct)が参照実装のargmaxと一致",
+          math.isclose(top_row28["sl_pct"], best_key28[0]) and math.isclose(top_row28["tp_pct"], best_key28[1]),
+          f"top=({top_row28['sl_pct']},{top_row28['tp_pct']}) ref_best={best_key28}")
+    check("28-8d 先頭行net_profitが参照実装の最大値と一致",
+          math.isclose(top_row28["net_profit"], ref28[best_key28][0]),
+          f"{top_row28['net_profit']} vs {ref28[best_key28][0]}")
+
+    # --- 28-9(補): 足種/ルーティング分岐(resolve_exit_sim_timeframe / ensure_exit_sim_routing /
+    #     bar_interval_for_choice / compute_window_end) ---
+    check("28-9a yfinanceソースは窓幅に依らず1時間足固定",
+          resolve_exit_sim_timeframe({"source": "yfinance", "ticker": "GC=F"}, 5.0) == "1時間足"
+          and resolve_exit_sim_timeframe({"source": "yfinance", "ticker": "GC=F"}, 5000.0) == "1時間足")
+    check("28-9b ccxt bingxは窓<=72hで1分足",
+          resolve_exit_sim_timeframe({"source": "ccxt", "exchange": "bingx"}, 50.0) == "1分足(暗号のみ)")
+    check("28-9c ccxt bingxは窓>72hで1時間足",
+          resolve_exit_sim_timeframe({"source": "ccxt", "exchange": "bingx"}, 100.0) == "1時間足")
+    tf28_binance, _fb28 = resolve_zoom_timeframe("ccxt", 5.0, 0.0)
+    tf28_actual = resolve_exit_sim_timeframe({"source": "ccxt", "exchange": "binance"}, 5.0)
+    check("28-9d ccxt binance等は既存resolve_zoom_timeframeへ委譲", tf28_actual == tf28_binance,
+          f"{tf28_actual} vs {tf28_binance}")
+    check("28-9e bar_interval_for_choice: 1分足->1分/1時間足->1時間",
+          bar_interval_for_choice("1分足(暗号のみ)") == pd.Timedelta(minutes=1)
+          and bar_interval_for_choice("1時間足") == pd.Timedelta(hours=1))
+
+    _es28_test_sym = "RIVER_ES28_TESTONLY"
+    check("28-9f ensure_exit_sim_routing登録前は未登録(前提)", _es28_test_sym not in _RUNTIME_CUSTOM_ROUTING)
+    ensure_exit_sim_routing(["BTC", _es28_test_sym])
+    check("28-9g ensure_exit_sim_routing: SYMBOL_MASTER銘柄(BTC)は上書きしない",
+          "BTC" not in _RUNTIME_CUSTOM_ROUTING)
+    check("28-9h ensure_exit_sim_routing: 未登録銘柄はbingx_chart_routing相当を自己登録",
+          _es28_test_sym in _RUNTIME_CUSTOM_ROUTING
+          and _RUNTIME_CUSTOM_ROUTING[_es28_test_sym] == bingx_chart_routing(_es28_test_sym),
+          f"{_RUNTIME_CUSTOM_ROUTING.get(_es28_test_sym)}")
+    del _RUNTIME_CUSTOM_ROUTING[_es28_test_sym]  # selftestの副作用を残さない
+
+    now28b = _ts28("2026-06-10 00:00:00")
+    entry28b = _ts28("2026-06-01 00:00:00")
+    we28_hold = compute_window_end(entry28b, pd.NaT, 24.0, now28b)
+    check("28-9i 保有時間トグルON: entry_time+H", we28_hold == entry28b + pd.Timedelta(hours=24))
+    we28_actual = compute_window_end(entry28b, entry28b + pd.Timedelta(hours=5), None, now28b)
+    check("28-9j 保有時間トグルOFF: 実績Exit_Time", we28_actual == entry28b + pd.Timedelta(hours=5))
+    we28_missing = compute_window_end(entry28b, pd.NaT, None, now28b)
+    check("28-9k 保有時間トグルOFF+Exit_Time欠損->None", we28_missing is None)
+    we28_clip = compute_window_end(entry28b, pd.NaT, 100000.0, now28b)
+    check("28-9l 現在時刻でクリップ", we28_clip == now28b)
+
+    # --- 28-10(補): aggregate_exit_sim_outcomes の集計検算(win_rate/PF/diff/event内訳) ---
+    outs28 = [
+        {"sim_net": 10.0, "event": "TP"}, {"sim_net": -4.0, "event": "SL"},
+        {"sim_net": 6.0, "event": "時間切れ"}, {"sim_net": 0.0, "event": "TP"},
+    ]
+    actual28 = [8.0, -4.0, 2.0, 1.0]
+    agg28 = aggregate_exit_sim_outcomes(outs28, actual28)
+    check("28-10a n/sim_net_total/actual_net_total/diff",
+          agg28["n"] == 4 and math.isclose(agg28["sim_net_total"], 12.0)
+          and math.isclose(agg28["actual_net_total"], 7.0) and math.isclose(agg28["diff"], 5.0),
+          f"{agg28}")
+    check("28-10b sim勝率=2/4=50%(net>0のみ勝ち、0は勝ちに含めない)",
+          math.isclose(agg28["sim_win_rate_pct"], 50.0), f"{agg28['sim_win_rate_pct']}")
+    check("28-10c sim PF=総利益16/総損失4=4.0", math.isclose(agg28["sim_pf"], 4.0), f"{agg28['sim_pf']}")
+    check("28-10d event内訳がTP2/SL1/時間切れ1", agg28["event_counts"] == {"TP": 2, "SL": 1, "時間切れ": 1},
+          f"{agg28['event_counts']}")
+    agg28_empty = aggregate_exit_sim_outcomes([], [])
+    check("28-10e 空入力はn=0でNaN群を返し例外なし",
+          agg28_empty["n"] == 0 and math.isnan(agg28_empty["sim_pf"]), f"{agg28_empty}")
+
+    # --- 28-11: エントリーミッドバー検出(Fix2a: エントリー含みバーがSL/TP判定に入る) ---
+    bars28_midbar = pd.DataFrame(
+        {"low": [90.0, 94.0, 95.0], "high": [101.0, 97.0, 98.0], "close": [95.0, 96.0, 97.0]},
+        index=pd.DatetimeIndex([_ts28("2026-05-01 00:00:00"), _ts28("2026-05-01 01:00:00"),
+                                 _ts28("2026-05-01 02:00:00")]),
+    )
+    r28_11a = simulate_trade_exit_path(
+        bars28_midbar, _ts28("2026-05-01 00:34:00"), _ts28("2026-05-01 02:30:00"),
+        "LONG", sl_price=92.0, tp_price=None, bar_interval=pd.Timedelta(hours=1),
+    )
+    check("28-11a LONG: エントリーがミッドバー(00:34)でもエントリー含みバー(00:00始)のlow=90が"
+          "SL=92に触れて即確定(旧`index>=entry_time`だとこのバーが窓から除外され誤判定になっていた)",
+          r28_11a["event"] == "SL" and math.isclose(r28_11a["exit_price"], 92.0)
+          and r28_11a["exit_time"] == _ts28("2026-05-01 00:00:00"), f"{r28_11a}")
+    r28_11b = simulate_trade_exit_path(
+        bars28_midbar, _ts28("2026-05-01 00:34:00"), _ts28("2026-05-01 02:30:00"),
+        "SHORT", sl_price=101.0, tp_price=None, bar_interval=pd.Timedelta(hours=1),
+    )
+    check("28-11b SHORT対称: 同バーのhigh=101がSL=101に触れて即確定",
+          r28_11b["event"] == "SL" and math.isclose(r28_11b["exit_price"], 101.0)
+          and r28_11b["exit_time"] == _ts28("2026-05-01 00:00:00"), f"{r28_11b}")
+
+    # --- 28-12: Quantity優先経路(Fix1: Quantity列が有効ならPnL_Percent不問で直接qtyに使う) ---
+    df28_qty_in = pd.DataFrame(
+        [
+            # label, Entry_Time, Exit_Time, Symbol, PnL_USD, PnL_Percent, Side, Leverage,
+            #   Entry_Price, Exit_Price, Quantity
+            ("qPrimary", _ts28("2026-05-11 00:00:00"), _ts28("2026-05-11 01:00:00"), "BTC",
+             76.0, np.nan, "LONG", 4.0, 100.0, 110.0, 3.0),
+            ("qPrimaryShort", _ts28("2026-05-12 00:00:00"), _ts28("2026-05-12 01:00:00"), "ETH",
+             50.0, np.nan, "SHORT", 2.0, 200.0, 180.0, 2.5),
+            ("qZeroFallback", _ts28("2026-05-13 00:00:00"), _ts28("2026-05-13 01:00:00"), "BTC",
+             50.0, 10.0, "LONG", 5.0, 100.0, 105.0, 0.0),
+        ],
+        columns=["_label", "Entry_Time", "Exit_Time", "Symbol", "PnL_USD", "PnL_Percent", "Side",
+                 "Leverage", "Entry_Price", "Exit_Price", "Quantity"],
+    ).set_index("_label")
+    recon28q, skip28q = reconstruct_trades_for_exit_sim(df28_qty_in)
+    check("28-12a 3行とも生存(Quantity無効行はフォールバックへ回るだけでスキップされない)",
+          list(recon28q.index) == ["qPrimary", "qPrimaryShort", "qZeroFallback"]
+          and sum(skip28q.values()) == 0, f"index={list(recon28q.index)} skip={skip28q}")
+    qP28 = recon28q.loc["qPrimary"]
+    check("28-12b Quantity優先(LONG): PnL_PercentがNaNでもqty=Quantity=3.0のまま復元・"
+          "size_method=quantity(notional=qty*Entry=300/margin=notional/Lev=75)",
+          qP28["_size_method"] == "quantity" and math.isclose(qP28["_qty"], 3.0)
+          and math.isclose(qP28["_notional"], 300.0) and math.isclose(qP28["_margin"], 75.0),
+          f"method={qP28['_size_method']} qty={qP28['_qty']} notional={qP28['_notional']} "
+          f"margin={qP28['_margin']}")
+    check("28-12c Quantity優先(LONG)のgross_actual=qty*(Exit-Entry)*dir=3*(110-100)*1=30・"
+          "fee_est=gross-PnL_USD=30-76=-46", math.isclose(qP28["_gross_actual"], 30.0)
+          and math.isclose(qP28["_fee_est"], -46.0), f"gross={qP28['_gross_actual']} fee={qP28['_fee_est']}")
+    qPS28 = recon28q.loc["qPrimaryShort"]
+    check("28-12d Quantity優先(SHORT対称): qty=2.5・notional=2.5*200=500/margin=500/2=250/dir=-1",
+          qPS28["_size_method"] == "quantity" and math.isclose(qPS28["_qty"], 2.5)
+          and math.isclose(qPS28["_notional"], 500.0) and math.isclose(qPS28["_margin"], 250.0)
+          and math.isclose(qPS28["_dir"], -1.0),
+          f"method={qPS28['_size_method']} qty={qPS28['_qty']} notional={qPS28['_notional']} "
+          f"margin={qPS28['_margin']} dir={qPS28['_dir']}")
+    check("28-12e Quantity優先(SHORT)のgross_actual=2.5*(180-200)*(-1)=50・fee_est=50-50=0",
+          math.isclose(qPS28["_gross_actual"], 50.0) and math.isclose(qPS28["_fee_est"], 0.0),
+          f"gross={qPS28['_gross_actual']} fee={qPS28['_fee_est']}")
+    qZ28 = recon28q.loc["qZeroFallback"]
+    check("28-12f Quantity=0.0(無効)は自動でnotional_fallback経路に回る(vLと同一入力->同一結果)",
+          qZ28["_size_method"] == "notional_fallback" and math.isclose(qZ28["_qty"], 5.0)
+          and math.isclose(qZ28["_notional"], 500.0) and math.isclose(qZ28["_margin"], 100.0),
+          f"method={qZ28['_size_method']} qty={qZ28['_qty']} notional={qZ28['_notional']} "
+          f"margin={qZ28['_margin']}")
+
+    # --- 28-13: 保有時間トグルOFF+SL/TP不到達->実績決済価格へ置換(Fix3a) ---
+    trade28_L_wide = dict(trade28_L)  # vL28ベース(entry=100/exit=105/qty=5/dir=+1/fee_est=-25/lev=5)
+    bars28_flatL = pd.DataFrame(
+        {"low": [98.0], "high": [102.0], "close": [99.0]},  # closeはexit_price(105)とは異なる値
+        index=pd.DatetimeIndex([_ts28("2026-05-01 00:00:00")]),
+    )
+    out28_holdoffL = compute_trade_whatif_outcome(
+        trade28_L_wide, bars28_flatL, 50.0, 50.0, None, now28,
+    )
+    check("28-13a LONG 保有OFF+触れず: event=実績決済(触れず)・sim_exit_price=実績Exit_Price"
+          "(105。バーcloseの99ではない)",
+          out28_holdoffL["ok"] and out28_holdoffL["event"] == "実績決済(触れず)"
+          and math.isclose(out28_holdoffL["sim_exit_price"], 105.0), f"{out28_holdoffL}")
+    check("28-13b 上記のsim_net=実績PnL_USD(50)と一致(qty/dir/fee_estの内部整合の帰結)",
+          math.isclose(out28_holdoffL["sim_net"], 50.0), f"{out28_holdoffL}")
+
+    trade28_S_wide = dict(trade28_S)  # vS28ベース(entry=200/exit=190/qty=1.25/dir=-1/fee_est=-7.5/lev=10)
+    bars28_flatS = pd.DataFrame(
+        {"low": [198.0], "high": [202.0], "close": [199.0]},
+        index=pd.DatetimeIndex([_ts28("2026-05-02 00:00:00")]),
+    )
+    out28_holdoffS = compute_trade_whatif_outcome(
+        trade28_S_wide, bars28_flatS, 20.0, 20.0, None, now28,
+    )
+    check("28-13c SHORT対称: event=実績決済(触れず)・sim_exit_price=実績Exit_Price(190)",
+          out28_holdoffS["ok"] and out28_holdoffS["event"] == "実績決済(触れず)"
+          and math.isclose(out28_holdoffS["sim_exit_price"], 190.0), f"{out28_holdoffS}")
+    check("28-13d 上記のsim_net=実績PnL_USD(20)と一致", math.isclose(out28_holdoffS["sim_net"], 20.0),
+          f"{out28_holdoffS}")
+
+    # --- 28-14: グリッド探索と単一トレードシミュの完全一致(エントリーミッドバー+
+    #     fallback_exit_price(保有OFF)を同時に含む合成データでのクロスチェック。Fix2c+Fix3b+Fix3c) ---
+    entryA28 = _ts28("2026-07-01 00:34:00")  # ミッドバーエントリー(00:00始バー内)
+    exitA28 = _ts28("2026-07-01 02:00:00")   # =保有OFF時の窓終端(実績Exit_Time)
+    bars28_gA = pd.DataFrame(
+        {"low": [98.8, 98.5, 99.7], "high": [100.3, 101.5, 100.6], "close": [99.5, 100.0, 100.2]},
+        index=pd.DatetimeIndex([_ts28("2026-07-01 00:00:00"), _ts28("2026-07-01 01:00:00"),
+                                 _ts28("2026-07-01 02:00:00")]),
+    )
+    entryB28 = _ts28("2026-07-02 00:47:00")
+    exitB28 = _ts28("2026-07-02 02:00:00")
+    bars28_gB = pd.DataFrame(
+        {"low": [199.0, 198.5, 197.0], "high": [202.3, 201.5, 200.6], "close": [200.5, 200.0, 200.1]},
+        index=pd.DatetimeIndex([_ts28("2026-07-02 00:00:00"), _ts28("2026-07-02 01:00:00"),
+                                 _ts28("2026-07-02 02:00:00")]),
+    )
+    now28d = _ts28("2026-08-01 00:00:00")
+    valid_df28d = pd.DataFrame(
+        {
+            "Entry_Time": [entryA28, entryB28], "Exit_Time": [exitA28, exitB28],
+            "Entry_Price": [100.0, 200.0], "Exit_Price": [103.0, 194.0],
+            "Leverage": [10.0, 10.0], "Side": ["LONG", "SHORT"],
+            "_qty": [2.0, 1.0], "_dir": [1.0, -1.0], "_fee_est": [1.0, -0.5],
+        },
+        index=["gA", "gB"],
+    )
+    bars_by_idx28d = {"gA": bars28_gA, "gB": bars28_gB}
+    timeframe_by_idx28d = {"gA": "1時間足", "gB": "1時間足"}
+    paths28d = build_grid_search_trade_paths(valid_df28d, bars_by_idx28d, timeframe_by_idx28d, None, now28d)
+    check("28-14a build_grid_search_trade_paths: 2件ともfallback_exit_price=実績Exit_Price"
+          "(保有OFF=hold_hours None)を保持", len(paths28d) == 2
+          and math.isclose(paths28d[0]["fallback_exit_price"], 103.0)
+          and math.isclose(paths28d[1]["fallback_exit_price"], 194.0), f"{paths28d}")
+
+    sl_grid28d = [10.0, 50.0]
+    tp_grid28d = [10.0, 50.0]
+    grid28d = grid_search_exit_optimization(paths28d, sl_grid28d, tp_grid28d)
+    expected28d = {
+        (10.0, 10.0): (-4.5, 0.0, 0.0, -2.25),
+        (10.0, 50.0): (-4.5, 0.0, 0.0, -2.25),
+        (50.0, 10.0): (3.5, 100.0, float("inf"), 1.75),
+        (50.0, 50.0): (11.5, 100.0, float("inf"), 5.75),
+    }
+    mismatches28d: list[str] = []
+    for _, rr in grid28d.iterrows():
+        key = (rr["sl_pct"], rr["tp_pct"])
+        enp, ewr, epf, eavg = expected28d[key]
+        if not (_es28_close(rr["net_profit"], enp) and _es28_close(rr["win_rate_pct"], ewr)
+                and _es28_close(rr["pf"], epf) and _es28_close(rr["avg_trade"], eavg)):
+            mismatches28d.append(f"{key}: got=({rr['net_profit']},{rr['win_rate_pct']},{rr['pf']},"
+                                  f"{rr['avg_trade']}) exp={expected28d[key]}")
+    check("28-14b グリッド探索の全4セルが手計算(エントリーミッドバー含み+no_hitはfallback使用)と一致",
+          len(mismatches28d) == 0, "; ".join(mismatches28d))
+
+    # 単一トレードシミュ(compute_trade_whatif_outcome、元の未トリムbars)との突合=真のパイプライン間一致検証
+    trade28d_A = {
+        "entry_time": entryA28, "exit_time": exitA28, "entry_price": 100.0, "exit_price": 103.0,
+        "side": "LONG", "qty": 2.0, "dir": 1.0, "fee_est": 1.0, "leverage": 10.0,
+    }
+    trade28d_B = {
+        "entry_time": entryB28, "exit_time": exitB28, "entry_price": 200.0, "exit_price": 194.0,
+        "side": "SHORT", "qty": 1.0, "dir": -1.0, "fee_est": -0.5, "leverage": 10.0,
+    }
+    single_mismatches28d: list[str] = []
+    for sl28d, tp28d in [(10.0, 10.0), (10.0, 50.0), (50.0, 10.0), (50.0, 50.0)]:
+        outA28d = compute_trade_whatif_outcome(trade28d_A, bars28_gA, sl28d, tp28d, None, now28d)
+        outB28d = compute_trade_whatif_outcome(trade28d_B, bars28_gB, sl28d, tp28d, None, now28d)
+        combined28d = outA28d["sim_net"] + outB28d["sim_net"]
+        grid_row28d = grid28d[(grid28d["sl_pct"] == sl28d) & (grid28d["tp_pct"] == tp28d)].iloc[0]
+        if not (outA28d["ok"] and outB28d["ok"] and _es28_close(combined28d, grid_row28d["net_profit"])):
+            single_mismatches28d.append(
+                f"(sl={sl28d},tp={tp28d}): single_sim_total={combined28d} grid={grid_row28d['net_profit']} "
+                f"A={outA28d} B={outB28d}"
+            )
+    check("28-14c 単一トレードシミュ(compute_trade_whatif_outcome、生barsから独立に再トリム)の"
+          "sl×tp全4通り合計がグリッド探索結果と完全一致(2本の独立実装が同じミッドバートリム+"
+          "fallback_exit_price規則を適用している証拠)",
+          len(single_mismatches28d) == 0, "; ".join(single_mismatches28d))
+
+    out28d_A_5050 = compute_trade_whatif_outcome(trade28d_A, bars28_gA, 50.0, 50.0, None, now28d)
+    out28d_B_5050 = compute_trade_whatif_outcome(trade28d_B, bars28_gB, 50.0, 50.0, None, now28d)
+    check("28-14d no_hitセル(sl=50,tp=50)は両建てとも実際にevent=実績決済(触れず)で確定"
+          "(fallback_exit_priceが使われた経路の裏取り)",
+          out28d_A_5050["event"] == "実績決済(触れず)" and out28d_B_5050["event"] == "実績決済(触れず)",
+          f"A={out28d_A_5050} B={out28d_B_5050}")
+
+    # --- 28-15: exit_sim_cache_is_valid の4象限(Fix4: SL/TPはキー非依存・was_fetch_runで判定) ---
+    ck_a28 = "keyA_28_15"
+    ck_b28 = "keyB_28_15"
+    check("28-15a キャッシュ無し(None)->常にFalse", exit_sim_cache_is_valid(None, ck_a28, True) is False
+          and exit_sim_cache_is_valid(None, ck_a28, False) is False)
+    check("28-15b キャッシュ空dict({})->False(空dictはnot cacheでFalse即返し)",
+          exit_sim_cache_is_valid({}, ck_a28, False) is False)
+    cache28_match_fetched = {"cache_key": ck_a28, "was_fetch_run": True}
+    check("28-15c キー一致+フェッチ済+今回フェッチ不要(トグルOFF系)->True",
+          exit_sim_cache_is_valid(cache28_match_fetched, ck_a28, False) is True)
+    check("28-15d キー一致+フェッチ済+今回もフェッチ必要(トグルON系)->True(再フェッチ不要で流用可)",
+          exit_sim_cache_is_valid(cache28_match_fetched, ck_a28, True) is True)
+    cache28_match_unfetched = {"cache_key": ck_a28, "was_fetch_run": False}
+    check("28-15e キー一致だが恒等モードのみで未フェッチ+今回フェッチ不要->True(経路不要なので無問題)",
+          exit_sim_cache_is_valid(cache28_match_unfetched, ck_a28, False) is True)
+    check("28-15f キー一致だが未フェッチ+今回フェッチ必要(SL/TP/保有ONへ切替)->False(再フェッチ要求。"
+          "Fix4の核心=旧実装はここをTrueと誤判定していた)",
+          exit_sim_cache_is_valid(cache28_match_unfetched, ck_a28, True) is False)
+    check("28-15g キー不一致(対象トレード内容や保有時間設定が変わった)->フェッチ済でもFalse",
+          exit_sim_cache_is_valid(cache28_match_fetched, ck_b28, False) is False
+          and exit_sim_cache_is_valid(cache28_match_fetched, ck_b28, True) is False)
 
     print("\n" + "=" * 78)
     if all_ok:
