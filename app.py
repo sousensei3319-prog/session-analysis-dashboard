@@ -5064,6 +5064,181 @@ def compute_trade_evaluation(df: Optional[pd.DataFrame]) -> dict:
     return out
 
 
+# ---- 🧭 環境vs方向診断(順張り/逆張り・2026-07-21): 純ロジック関数群(st非依存・selftest対象) ---------
+# 各トレードの市場変動 move_pct = (Exit_Price/Entry_Price - 1)*100 (方向非依存) をSideと突き合わせ、
+# 「逆行(counter)」= 建玉と逆向きに±0.05%を超えて動いたトレードを判別する。
+COUNTER_MOVE_THRESHOLD_PCT = 0.05  # 逆行/順行の判定しきい値(%)。境界(ちょうど0.05)は順行側扱い(厳密不等号)。
+
+DIRECTIONAL_STATS_COLUMNS: list[str] = [
+    "env_move", "n_all", "n_long", "n_short", "long_pnl", "short_pnl",
+    "with_n", "with_pnl", "counter_n", "counter_pnl", "counter_rate",
+]
+BAND_SYMBOL_SIDE_COLUMNS: list[str] = ["Symbol", "Side", "n", "win_rate", "pnl", "counter_n"]
+
+
+def _dir_side_series(df: pd.DataFrame) -> pd.Series:
+    """Side列を大文字化した安全なSeries("LONG"/"SHORT"/NaN)を返す。列欠落にも頑健。"""
+    if "Side" not in df.columns:
+        return pd.Series(np.nan, index=df.index, dtype=object)
+    return df["Side"].map(lambda v: str(v).strip().upper() if pd.notna(v) else np.nan)
+
+
+def _dir_move_pct_series(df: pd.DataFrame) -> pd.Series:
+    """move_pct = (Exit_Price/Entry_Price - 1)*100(方向非依存の市場変動)。
+    Entry_Price/Exit_Price列の欠落・NaN・0はNaNを返す(例外を出さない)。"""
+    if "Entry_Price" not in df.columns or "Exit_Price" not in df.columns:
+        return pd.Series(np.nan, index=df.index)
+    entry = pd.to_numeric(df["Entry_Price"], errors="coerce")
+    exit_ = pd.to_numeric(df["Exit_Price"], errors="coerce")
+    entry_safe = entry.where(entry != 0)  # ゼロ割回避(0はNaN扱いにしてから割り算)
+    return (exit_ / entry_safe - 1.0) * 100.0
+
+
+def _dir_counter_mask(move_pct: pd.Series, side: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """(classifiable, counter) を返す。classifiable=move_pct/Sideとも判定可能な行、
+    counter=建玉と逆向きに閾値を超えて動いた行(classifiable内の部分集合)。"""
+    classifiable = move_pct.notna() & side.isin(["LONG", "SHORT"])
+    counter = classifiable & (
+        ((move_pct > COUNTER_MOVE_THRESHOLD_PCT) & (side == "SHORT"))
+        | ((move_pct < -COUNTER_MOVE_THRESHOLD_PCT) & (side == "LONG"))
+    )
+    return classifiable, counter
+
+
+def _dir_prepare(
+    trades_df: Optional[pd.DataFrame], weekday: Optional[int],
+) -> Optional[pd.DataFrame]:
+    """compute_directional_band_stats/compute_band_symbol_side共通の前処理。
+    Entry_Time欠落・空dfならNoneを返す(呼び出し側で空DataFrameへ変換=例外を出さない)。
+    weekday指定時はEntry_Timeの曜日(0=月〜6=日。pd.Timestamp.weekday()と同じ規約)で絞る。
+    戻り値には _band(詳細帯)/_move_pct/_side/_pnl の作業列を付加する。"""
+    if trades_df is None or trades_df.empty or "Entry_Time" not in trades_df.columns:
+        return None
+    df = trades_df.copy()
+    entry_time = pd.to_datetime(df["Entry_Time"], errors="coerce")
+    valid = entry_time.notna()
+    df = df.loc[valid].copy()
+    entry_time = entry_time.loc[valid]
+    if df.empty:
+        return None
+    if weekday is not None:
+        wd_mask = entry_time.apply(lambda ts: ts.weekday()) == weekday
+        df = df.loc[wd_mask].copy()
+        entry_time = entry_time.loc[wd_mask]
+    if df.empty:
+        return None
+    df["_band"] = entry_time.apply(lambda ts: hour_to_zone(int(ts.hour)))
+    df["_move_pct"] = _dir_move_pct_series(df)
+    df["_side"] = _dir_side_series(df)
+    df["_pnl"] = pd.to_numeric(df["PnL_USD"], errors="coerce") if "PnL_USD" in df.columns \
+        else pd.Series(np.nan, index=df.index)
+    return df
+
+
+def compute_directional_band_stats(
+    trades_df: Optional[pd.DataFrame], weekday: Optional[int] = None,
+) -> pd.DataFrame:
+    """🧭 環境vs方向診断(順張り/逆張り)の帯別集計(純ロジック・st非依存・selftest対象・2026-07-21)。
+
+    各トレードのmove_pct=(Exit_Price/Entry_Price-1)*100(方向非依存の市場変動)を計算し、
+    建玉Sideと逆向きに閾値(±COUNTER_MOVE_THRESHOLD_PCT%)を超えて動いたトレードを
+    「逆行(counter)」、それ以外(判定可能な残り)を「順行(with)」とラベルする:
+      counter = (move_pct > +0.05 and Side==SHORT) or (move_pct < -0.05 and Side==LONG)
+    weekday指定時はEntry_Timeの曜日(0=月〜6=日)で絞り込む。
+
+    戻り値: DataFrame(index=帯ラベル。BAND_ORDER順・トレードが1件以上ある帯のみ、
+      columns=DIRECTIONAL_STATS_COLUMNS)。
+      env_move=帯トレード群のmove_pct平均(NaN除外。全NaNならNaN)、n_all=帯の全トレード数、
+      n_long/n_short=Side別件数、long_pnl/short_pnl=Side別合計損益、
+      with_n/with_pnl・counter_n/counter_pnl=順行/逆行の件数・合計損益、
+      counter_rate=counter_n/n_all*100。
+    空df・Entry_Time等の必須列欠落でも例外を出さず空DataFrame(columns=DIRECTIONAL_STATS_COLUMNS)を返す。
+    """
+    df = _dir_prepare(trades_df, weekday)
+    if df is None:
+        return pd.DataFrame(columns=DIRECTIONAL_STATS_COLUMNS)
+
+    _, counter = _dir_counter_mask(df["_move_pct"], df["_side"])
+    classifiable = df["_move_pct"].notna() & df["_side"].isin(["LONG", "SHORT"])
+    with_ = classifiable & ~counter
+
+    rows: list[dict] = []
+    for band in BAND_ORDER:
+        sub_mask = df["_band"] == band
+        n_all = int(sub_mask.sum())
+        if n_all == 0:
+            continue
+        sub = df.loc[sub_mask]
+        sub_counter = counter.loc[sub_mask]
+        sub_with = with_.loc[sub_mask]
+        long_mask = sub["_side"] == "LONG"
+        short_mask = sub["_side"] == "SHORT"
+        rows.append({
+            "band": band,
+            "env_move": float(sub["_move_pct"].mean()) if sub["_move_pct"].notna().any() else np.nan,
+            "n_all": n_all,
+            "n_long": int(long_mask.sum()),
+            "n_short": int(short_mask.sum()),
+            "long_pnl": float(sub.loc[long_mask, "_pnl"].sum()) if long_mask.any() else 0.0,
+            "short_pnl": float(sub.loc[short_mask, "_pnl"].sum()) if short_mask.any() else 0.0,
+            "with_n": int(sub_with.sum()),
+            "with_pnl": float(sub.loc[sub_with, "_pnl"].sum()) if sub_with.any() else 0.0,
+            "counter_n": int(sub_counter.sum()),
+            "counter_pnl": float(sub.loc[sub_counter, "_pnl"].sum()) if sub_counter.any() else 0.0,
+            "counter_rate": (100.0 * int(sub_counter.sum()) / n_all) if n_all > 0 else np.nan,
+        })
+    if not rows:
+        return pd.DataFrame(columns=DIRECTIONAL_STATS_COLUMNS)
+    out = pd.DataFrame(rows).set_index("band")
+    order = [b for b in BAND_ORDER if b in out.index]
+    out = out.reindex(order)[DIRECTIONAL_STATS_COLUMNS]
+    out.index.name = "band"
+    return out
+
+
+def compute_band_symbol_side(
+    trades_df: Optional[pd.DataFrame], band: str, weekday: Optional[int] = None,
+) -> pd.DataFrame:
+    """🧭 環境vs方向診断のドリルダウン: 指定帯(+曜日)のトレードを 銘柄×Side で集計する
+    純ロジック(st非依存・selftest対象・2026-07-21)。draw(引き分け)は勝率の分母から除外する
+    (compute_trade_evaluation等と同じ規約)。counter_nの定義はcompute_directional_band_statsと同一。
+
+    戻り値: DataFrame(columns=BAND_SYMBOL_SIDE_COLUMNS=[Symbol, Side, n, win_rate, pnl, counter_n]、
+      PnL(pnl列)降順)。空df・必須列欠落・該当帯なしでも例外を出さず空DataFrameを返す。
+    """
+    df = _dir_prepare(trades_df, weekday)
+    if df is None:
+        return pd.DataFrame(columns=BAND_SYMBOL_SIDE_COLUMNS)
+    df = df.loc[df["_band"] == band]
+    if df.empty:
+        return pd.DataFrame(columns=BAND_SYMBOL_SIDE_COLUMNS)
+
+    _, counter = _dir_counter_mask(df["_move_pct"], df["_side"])
+    symbol = df["Symbol"] if "Symbol" in df.columns else pd.Series(np.nan, index=df.index)
+    win_loss = df["Win_Loss"] if "Win_Loss" in df.columns else pd.Series(np.nan, index=df.index)
+
+    work = pd.DataFrame({
+        "Symbol": symbol, "Side": df["_side"], "pnl": df["_pnl"],
+        "win_loss": win_loss, "counter": counter,
+    })
+
+    rows: list[dict] = []
+    for (sym, side), g in work.groupby(["Symbol", "Side"], dropna=False):
+        n_wins = int((g["win_loss"] == "win").sum())
+        n_losses = int((g["win_loss"] == "loss").sum())
+        win_rate = (100.0 * n_wins / (n_wins + n_losses)) if (n_wins + n_losses) > 0 else np.nan
+        rows.append({
+            "Symbol": sym if pd.notna(sym) else "(不明)",
+            "Side": side if pd.notna(side) else "(不明)",
+            "n": int(len(g)),
+            "win_rate": win_rate,
+            "pnl": float(g["pnl"].sum()),
+            "counter_n": int(g["counter"].sum()),
+        })
+    out = pd.DataFrame(rows, columns=BAND_SYMBOL_SIDE_COLUMNS)
+    return out.sort_values("pnl", ascending=False, kind="stable").reset_index(drop=True)
+
+
 def _filtered_record_df(record: Optional[dict[str, Any]]) -> Optional[pd.DataFrame]:
     """共通ヘルパ: record["df"]へ現在のst.session_state["trade_filters"]を適用したDataFrameを返す。
     トレード一覧/累積損益/詳細帯別損益/多重クロス表/曜日・月別の全ビューはrecord["df"]を直接読まず
@@ -5271,6 +5446,103 @@ def render_trade_evaluation(records: list[dict[str, Any]]) -> None:
             _tbl("曜日別", ev["by_weekday"], key_order=["月", "火", "水", "木", "金", "土", "日"])
 
 
+def _dir_diag_env_label(v: Any) -> str:
+    """帯の環境move_pct平均を「↑ +0.123%」のような表示文字列にする(UI表示専用)。"""
+    if pd.isna(v):
+        return "—"
+    arrow = "↑" if v > 0 else ("↓" if v < 0 else "→")
+    return f"{arrow} {v:+.3f}%"
+
+
+def _dir_diag_neg_pnl_color(v: Any, vmax: float) -> str:
+    """逆張りPnL列: 負の値だけ赤系背景で強調する(pandas 2.3系: Styler.map用。applymapは非推奨)。"""
+    if pd.isna(v) or v >= 0:
+        return ""
+    eff_vmax = vmax if (vmax is not None and not pd.isna(vmax) and vmax > 0) else 1.0
+    intensity = min(1.0, abs(v) / eff_vmax)
+    alpha = 0.20 + 0.5 * intensity
+    return f"background-color: rgba(224,64,64,{alpha:.2f}); color: #fff"
+
+
+def render_directional_diagnosis(records: list[dict[str, Any]]) -> None:
+    """🧭 環境vs方向(順張り・逆張り)診断(2026-07-21)。フィルタ適用後の全トレードを対象に、
+    帯ごとの市場変動(環境=move_pct平均の↑/↓)に対しSide(方向)が順張り(with)か逆張り(counter)
+    だったかを可視化し、逆張りの損失と銘柄内訳を見せる。render_trade_evaluationの直後に呼ぶ
+    独立セクション(既存の多重クロス表タブとは無関係・非改変)。"""
+    frames = [_filtered_record_df(r) for r in records]
+    frames = [f for f in frames if f is not None and len(f)]
+    with st.expander("🧭 環境 vs 方向(順張り・逆張り診断)", expanded=True):
+        if not frames:
+            st.info("フィルタ適用後の有効なトレードデータがありません。")
+            return
+        df = pd.concat(frames, ignore_index=True)
+        st.caption(
+            "フィルタ適用後の全トレードが対象です。move_pct=(決済価格÷建値-1)×100(方向非依存の市場変動)"
+            "を計算し、建玉Sideと逆向きに±0.05%を超えて動いたトレードを「逆張り」、それ以外を「順張り」"
+            "とラベルします(建値/決済価格が無いトレードは判定対象外)。"
+        )
+
+        weekday_options = ["すべて"] + WEEKDAY_LABELS
+        weekday_label = st.selectbox("曜日で絞る", weekday_options, key="dir_diag_weekday")
+        weekday_sel = WEEKDAY_LABELS.index(weekday_label) if weekday_label != "すべて" else None
+
+        band_stats = compute_directional_band_stats(df, weekday=weekday_sel)
+        if band_stats.empty:
+            st.info("該当するトレードがありません(価格情報の欠落・曜日フィルタ等をご確認ください)。")
+            return
+
+        total_counter_n = int(band_stats["counter_n"].sum())
+        total_counter_pnl = float(band_stats["counter_pnl"].sum())
+        total_with_n = int(band_stats["with_n"].sum())
+        total_with_pnl = float(band_stats["with_pnl"].sum())
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("逆張り件数", f"{total_counter_n:,}")
+        c2.metric("逆張りPnL(USD)", f"{total_counter_pnl:,.1f}")
+        c3.metric("順張り件数", f"{total_with_n:,}")
+        c4.metric("順張りPnL(USD)", f"{total_with_pnl:,.1f}")
+
+        st.markdown("**帯別サマリー**")
+        disp = pd.DataFrame({
+            "帯": band_stats.index,
+            "環境": [_dir_diag_env_label(v) for v in band_stats["env_move"]],
+            "全件": band_stats["n_all"].astype(int).values,
+            "順張り件数": band_stats["with_n"].astype(int).values,
+            "順張りPnL": band_stats["with_pnl"].round(1).values,
+            "逆張り件数": band_stats["counter_n"].astype(int).values,
+            "逆張りPnL": band_stats["counter_pnl"].round(1).values,
+            "逆張り率%": band_stats["counter_rate"].round(1).values,
+        })
+        counter_pnl_vmax = float(disp["逆張りPnL"].abs().max()) if len(disp) else 1.0
+        styler = disp.style.map(
+            lambda v: _dir_diag_neg_pnl_color(v, counter_pnl_vmax), subset=["逆張りPnL"],
+        )
+        st.dataframe(styler, width="stretch", hide_index=True)
+
+        st.markdown("**帯ドリルダウン(銘柄×方向)**")
+        band_options = list(band_stats.index)
+        band_choice = st.selectbox("帯を選択", band_options, key="dir_diag_band_choice")
+        drill = compute_band_symbol_side(df, band_choice, weekday=weekday_sel)
+        if drill.empty:
+            st.info("この帯には銘柄別内訳を出せるトレードがありません。")
+        else:
+            drill_disp = drill.rename(columns={
+                "Symbol": "銘柄", "Side": "方向", "n": "件数", "win_rate": "勝率%",
+                "pnl": "損益USD", "counter_n": "逆行件数",
+            }).copy()
+            drill_disp["勝率%"] = drill_disp["勝率%"].round(1)
+            drill_disp["損益USD"] = drill_disp["損益USD"].round(1)
+            st.dataframe(drill_disp, width="stretch", hide_index=True)
+
+        entry_series = pd.to_datetime(df["Entry_Time"], errors="coerce").dropna() \
+            if "Entry_Time" in df.columns else pd.Series([], dtype="datetime64[ns]")
+        if len(entry_series):
+            st.caption(
+                f"集計期間(トレードの最初〜最後): "
+                f"{entry_series.min().date().isoformat()} 〜 {entry_series.max().date().isoformat()}"
+            )
+
+
 def render_trade_history_tab() -> None:
     if "trade_dataset_records" not in st.session_state:
         st.session_state["trade_dataset_records"] = []
@@ -5456,6 +5728,8 @@ def render_trade_history_tab() -> None:
 
     # 🩺 自動評価(いつ・なぜ勝ち負けしているか診断・2026-07-21)。フィルタ適用後の全トレードが対象。
     render_trade_evaluation(records)
+    # 🧭 環境vs方向(順張り・逆張り)診断(2026-07-21)。フィルタ適用後の全トレードが対象。
+    render_directional_diagnosis(records)
 
     st.markdown("**トレード一覧**" + ("(全データセット・時系列)" if combined_stats else ""))
     disp = df.copy().sort_values("Entry_Time")
@@ -11022,6 +11296,116 @@ def run_selftest() -> bool:
     check("25-4 実データBTC全月30分: bias_direction内訳が全→でない(↑↓とも1件以上)",
           up_25 > 0 and down_25 > 0 and range_25 < len(dirs_25_4),
           f"up={up_25} down={down_25} range={range_25} total={len(dirs_25_4)}")
+
+    # -----------------------------------------------------------------
+    # 26. 🧭 環境vs方向診断(順張り/逆張り・2026-07-21): compute_directional_band_stats /
+    #     compute_band_symbol_side の純ロジック検証
+    # -----------------------------------------------------------------
+    print("\n--- 26. 環境vs方向診断(順張り/逆張り) ---")
+
+    def _ts26(s: str) -> pd.Timestamp:
+        return pd.Timestamp(s, tz="Asia/Tokyo")
+
+    # アジア早朝(7-10)帯・月曜(2026-01-05)に6件、NY中盤(1-4)帯・火曜(2026-01-06)に2件。
+    # 閾値±0.05%の内外・LONG/SHORT双方・境界(ちょうど0.05%)を含む構成(手計算をpythonで再検算済み)。
+    rows26 = [
+        # Entry_Time, Exit_Time, Symbol, Side, Entry_Price, Exit_Price, PnL_USD, Win_Loss
+        (_ts26("2026-01-05 07:00:00"), _ts26("2026-01-05 07:30:00"), "BTC", "LONG", 100.0, 100.10, 5.0, "win"),
+        (_ts26("2026-01-05 07:05:00"), _ts26("2026-01-05 07:35:00"), "BTC", "SHORT", 100.0, 100.10, -5.0, "loss"),
+        (_ts26("2026-01-05 07:10:00"), _ts26("2026-01-05 07:40:00"), "ETH", "LONG", 100.0, 99.90, -3.0, "loss"),
+        (_ts26("2026-01-05 07:15:00"), _ts26("2026-01-05 07:45:00"), "ETH", "SHORT", 100.0, 99.90, 3.0, "win"),
+        (_ts26("2026-01-05 07:20:00"), _ts26("2026-01-05 07:50:00"), "SOL", "SHORT", 100.0, 100.02, 1.0, "win"),
+        (_ts26("2026-01-05 07:25:00"), _ts26("2026-01-05 07:55:00"), "SOL", "SHORT", 100.0, 100.05, 2.0, "win"),
+        (_ts26("2026-01-06 01:00:00"), _ts26("2026-01-06 01:30:00"), "BTC", "LONG", 200.0, 198.0, -10.0, "loss"),
+        (_ts26("2026-01-06 01:05:00"), _ts26("2026-01-06 01:35:00"), "BTC", "SHORT", 200.0, 198.0, 10.0, "win"),
+    ]
+    df26 = pd.DataFrame(rows26, columns=[
+        "Entry_Time", "Exit_Time", "Symbol", "Side", "Entry_Price", "Exit_Price", "PnL_USD", "Win_Loss",
+    ])
+
+    # 26-1: 空df/None/必須列欠落は例外を出さず空DataFrame(規定columns)を返す
+    empty_ok_26 = True
+    try:
+        r1 = compute_directional_band_stats(None)
+        r2 = compute_directional_band_stats(pd.DataFrame())
+        r3 = compute_directional_band_stats(pd.DataFrame({"foo": [1, 2]}))
+        r4 = compute_band_symbol_side(None, "アジア早朝 (7-10)")
+        r5 = compute_band_symbol_side(pd.DataFrame(), "アジア早朝 (7-10)")
+        empty_ok_26 = (
+            r1.empty and list(r1.columns) == DIRECTIONAL_STATS_COLUMNS
+            and r2.empty and r3.empty
+            and r4.empty and list(r4.columns) == BAND_SYMBOL_SIDE_COLUMNS
+            and r5.empty
+        )
+    except Exception as e:  # noqa: BLE001
+        empty_ok_26 = False
+        print(f"    [26-1例外] {e}")
+    check("26-1 空df/None/列欠損でも例外を出さず空DataFrameを返す", empty_ok_26)
+
+    # 26-2: 全曜日合算(weekday=None)で2帯とも算出される
+    bs26_all = compute_directional_band_stats(df26)
+    check("26-2 全曜日合算: 2帯(アジア早朝/NY中盤)がBAND_ORDER順で算出",
+          list(bs26_all.index) == ["アジア早朝 (7-10)", "NY中盤 (1-4)"], f"got={list(bs26_all.index)}")
+
+    # 26-3: 曜日フィルタ(0=月)でアジア早朝帯のみ残る
+    bs26_mon = compute_directional_band_stats(df26, weekday=0)
+    check("26-3a weekday=0(月)でアジア早朝帯のみ", list(bs26_mon.index) == ["アジア早朝 (7-10)"],
+          f"got={list(bs26_mon.index)}")
+    row26_mon = bs26_mon.loc["アジア早朝 (7-10)"]
+
+    # 26-4: env_move(市場変動平均)の符号・値。moves=[+0.10,+0.10,-0.10,-0.10,+0.02,+0.05]→平均+0.011667(↑)
+    check("26-4 env_move(アジア早朝・月)は正符号(↑)で値が一致",
+          row26_mon["env_move"] > 0 and math.isclose(row26_mon["env_move"], 0.07 / 6, rel_tol=1e-6),
+          f"got={row26_mon['env_move']}")
+
+    # 26-5: 逆行判定(counter)。境界(ちょうど±0.05%)・閾値未満(±0.02%)は順行(with)扱い。
+    #   counter = T2(SHORT,+0.10) + T3(LONG,-0.10) の2件・pnl=-5-3=-8
+    #   with    = T1,T4,T5,T6 の4件・pnl=5+3+1+2=11
+    check("26-5a counter_n=2・counter_pnl=-8.0(境界0.05/閾値未満0.02は順行扱い)",
+          row26_mon["counter_n"] == 2 and math.isclose(row26_mon["counter_pnl"], -8.0),
+          f"n={row26_mon['counter_n']} pnl={row26_mon['counter_pnl']}")
+    check("26-5b with_n=4・with_pnl=11.0", row26_mon["with_n"] == 4 and math.isclose(row26_mon["with_pnl"], 11.0),
+          f"n={row26_mon['with_n']} pnl={row26_mon['with_pnl']}")
+    check("26-5c counter_rate=counter_n/n_all*100=33.33...",
+          math.isclose(row26_mon["counter_rate"], 200.0 / 6.0, rel_tol=1e-6), f"got={row26_mon['counter_rate']}")
+
+    # 26-6: Side別内訳。n_long=2(T1,T3)・n_short=4(T2,T4,T5,T6)・long_pnl=5-3=2・short_pnl=-5+3+1+2=1
+    check("26-6 n_long/n_short/long_pnl/short_pnl",
+          row26_mon["n_long"] == 2 and row26_mon["n_short"] == 4
+          and math.isclose(row26_mon["long_pnl"], 2.0) and math.isclose(row26_mon["short_pnl"], 1.0),
+          f"n_long={row26_mon['n_long']} n_short={row26_mon['n_short']} "
+          f"long_pnl={row26_mon['long_pnl']} short_pnl={row26_mon['short_pnl']}")
+
+    # 26-7: 曜日フィルタ(1=火)でNY中盤帯のみ・env_moveは負符号(↓)
+    bs26_tue = compute_directional_band_stats(df26, weekday=1)
+    check("26-7a weekday=1(火)でNY中盤帯のみ", list(bs26_tue.index) == ["NY中盤 (1-4)"],
+          f"got={list(bs26_tue.index)}")
+    row26_tue = bs26_tue.loc["NY中盤 (1-4)"]
+    check("26-7b env_move(NY中盤・火)は負符号(↓)でmove=-1.0",
+          row26_tue["env_move"] < 0 and math.isclose(row26_tue["env_move"], -1.0), f"got={row26_tue['env_move']}")
+    check("26-7c NY中盤: counter_n=1(T7 LONG-1.0%)・counter_pnl=-10.0",
+          row26_tue["counter_n"] == 1 and math.isclose(row26_tue["counter_pnl"], -10.0),
+          f"n={row26_tue['counter_n']} pnl={row26_tue['counter_pnl']}")
+
+    # 26-8: 銘柄×Side ドリルダウン(compute_band_symbol_side)。アジア早朝・月曜=5グループ・PnL降順・counter_n整合
+    drill26 = compute_band_symbol_side(df26, "アジア早朝 (7-10)", weekday=0)
+    check("26-8a 銘柄×Sideが5グループ(BTC/L,BTC/S,ETH/L,ETH/S,SOL/S)", len(drill26) == 5, f"got={len(drill26)}")
+    check("26-8b PnL降順に整列", list(drill26["pnl"]) == sorted(drill26["pnl"], reverse=True),
+          f"got={list(drill26['pnl'])}")
+    lut26 = {(r["Symbol"], r["Side"]): r for _, r in drill26.iterrows()}
+    check("26-8c BTC/LONG: n=1,勝率100%,pnl=5.0,counter_n=0(with)",
+          lut26[("BTC", "LONG")]["n"] == 1 and math.isclose(lut26[("BTC", "LONG")]["win_rate"], 100.0)
+          and math.isclose(lut26[("BTC", "LONG")]["pnl"], 5.0) and lut26[("BTC", "LONG")]["counter_n"] == 0)
+    check("26-8d BTC/SHORT: n=1,勝率0%,pnl=-5.0,counter_n=1(counter)",
+          lut26[("BTC", "SHORT")]["n"] == 1 and math.isclose(lut26[("BTC", "SHORT")]["win_rate"], 0.0)
+          and math.isclose(lut26[("BTC", "SHORT")]["pnl"], -5.0) and lut26[("BTC", "SHORT")]["counter_n"] == 1)
+    check("26-8e SOL/SHORT: n=2(閾値内外1件ずつ),勝率100%,pnl=3.0,counter_n=0",
+          lut26[("SOL", "SHORT")]["n"] == 2 and math.isclose(lut26[("SOL", "SHORT")]["win_rate"], 100.0)
+          and math.isclose(lut26[("SOL", "SHORT")]["pnl"], 3.0) and lut26[("SOL", "SHORT")]["counter_n"] == 0)
+
+    # 26-9: 該当帯なし(帯にトレードが1件も無い)ドリルダウンは空DataFrame
+    drill26_empty = compute_band_symbol_side(df26, "薄商い (6-7)", weekday=0)
+    check("26-9 該当帯なしは空DataFrame", drill26_empty.empty, f"len={len(drill26_empty)}")
 
     print("\n" + "=" * 78)
     if all_ok:
