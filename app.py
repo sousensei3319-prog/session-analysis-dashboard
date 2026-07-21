@@ -6370,23 +6370,51 @@ def render_trade_analytics_tab() -> None:
     # ---- D. 時間ごとの取引活動 --------------------------------------------------------
     st.subheader("D. 時間ごとの取引活動(JST)")
     hourly = compute_hourly_activity(df)
-    custom = np.stack([hourly["n_wins"], hourly["n_losses"], hourly["total_pnl"], hourly["avg_pnl"]], axis=-1)
+    # 各時刻の詳細帯名をhover用customdataへ添える(ユーザー要望: セッション詳細の表記)。
+    _avg_hr = hourly["avg_pnl"].astype(float)
+    custom = [[int(hourly["n_wins"].iloc[i]), int(hourly["n_losses"].iloc[i]),
+               float(hourly["total_pnl"].iloc[i]),
+               (float(_avg_hr.iloc[i]) if pd.notna(_avg_hr.iloc[i]) else 0.0),
+               HOUR_TO_BAND[int(hourly.index[i])]] for i in range(len(hourly))]
+    _hover_hr = ("%{x}時 【%{customdata[4]}】<br>勝ち=%{customdata[0]}件・負け=%{customdata[1]}件"
+                 "<br>合計PnL=%{customdata[2]:,.1f}・平均PnL=%{customdata[3]:,.2f}<extra></extra>")
     fig_hr = go.Figure()
     fig_hr.add_trace(go.Bar(
         x=hourly.index, y=hourly["n_wins"], name="勝ち", marker_color="#2ECC71", customdata=custom,
-        hovertemplate="%{x}時<br>勝ち=%{customdata[0]}件・負け=%{customdata[1]}件"
-                      "<br>合計PnL=%{customdata[2]:,.1f}・平均PnL=%{customdata[3]:,.2f}<extra></extra>",
+        hovertemplate=_hover_hr,
     ))
     fig_hr.add_trace(go.Bar(
         x=hourly.index, y=hourly["n_losses"], name="負け", marker_color="#E74C3C", customdata=custom,
-        hovertemplate="%{x}時<br>勝ち=%{customdata[0]}件・負け=%{customdata[1]}件"
-                      "<br>合計PnL=%{customdata[2]:,.1f}・平均PnL=%{customdata[3]:,.2f}<extra></extra>",
+        hovertemplate=_hover_hr,
     ))
+    # セッション詳細帯の背景色分け+ラベル(ユーザー要望): 表示順(0-23時)で連続する同一帯のランを検出し、
+    # 大枠セッション色(青=アジア/緑=ロンドン/赤=NY/灰=薄商い)で薄く塗る。ラベルは各帯を最長ランの
+    # 中央に一度だけ配置(NY重複の日跨ぎ[…23,0]で同名ラベルが二重に出るのを避ける)。
+    _runs: list[list[Any]] = []  # [band, h0, h1]
+    for _h in range(24):
+        _b = HOUR_TO_BAND[_h]
+        if _runs and _runs[-1][0] == _b:
+            _runs[-1][2] = _h
+        else:
+            _runs.append([_b, _h, _h])
+    _label_run: dict[str, list[Any]] = {}
+    for _r in _runs:
+        if _r[0] not in _label_run or (_r[2] - _r[1]) > (_label_run[_r[0]][2] - _label_run[_r[0]][1]):
+            _label_run[_r[0]] = _r
+    for _b, _h0, _h1 in _runs:
+        _rgb = BG_GROUP_COLOR_RGB[BG_HOUR_GROUP[_h0]]
+        fig_hr.add_vrect(x0=_h0 - 0.5, x1=_h1 + 0.5, layer="below", line_width=0,
+                         fillcolor=f"rgba({_rgb[0]},{_rgb[1]},{_rgb[2]},0.10)")
+    for _b, _lr in _label_run.items():
+        fig_hr.add_annotation(x=(_lr[1] + _lr[2]) / 2.0, y=1.0, yref="paper", yanchor="bottom",
+                              text=_b.split(" (")[0], showarrow=False, font=dict(size=9, color="#9AA0A6"))
     fig_hr.update_layout(
         template="plotly_dark", barmode="stack", height=380,
-        margin=dict(l=40, r=20, t=40, b=20), xaxis_title="時刻(JST)", yaxis_title="トレード件数",
+        margin=dict(l=40, r=20, t=54, b=20), xaxis_title="時刻(JST)", yaxis_title="トレード件数",
         xaxis=dict(tickmode="linear", dtick=1),
     )
+    st.caption("背景色=大枠セッション(青=アジア/緑=ロンドン/赤=NY/灰=薄商い)、上部ラベル=詳細帯。"
+               "バーにカーソルを当てると詳細帯名と勝敗内訳が出ます。")
     st.plotly_chart(fig_hr, width="stretch", key="ta_hourly_chart")
 
 
