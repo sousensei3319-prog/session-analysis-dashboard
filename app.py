@@ -2044,6 +2044,69 @@ def compute_win_loss_hold_stats(df: pd.DataFrame) -> dict[str, Any]:
     return out
 
 
+def compute_hold_bucket_comments(bucket_df: pd.DataFrame, wl: Optional[dict] = None) -> list[str]:
+    """追補v14b: 保有時間バケット分析の初心者向け自動コメント(純関数・selftest対象)。
+    ユーザー要望「見方や傾向をわかりやすく」に対応し、データ駆動で以下を生成する:
+    ① いちばん稼げている保有レンジ(n>=5かつ合計プラスの最大)
+    ② 短時間側から連続する赤字ゾーン(n=0バケットは跨いで判定)と、それを見送った場合の
+       過去データ上の改善試算($)
+    ③ 勝ち/負け保有中央値の解釈(wl=compute_win_loss_hold_statsの結果。省略可)
+    ④ 掟2の免責(末尾固定)
+    データが無い(全バケットn=0)場合は空リストを返す(コメント欄ごと非表示にする)。"""
+    out: list[str] = []
+    if bucket_df is None or bucket_df.empty or int(bucket_df["n"].sum()) == 0:
+        return out
+    dfb = bucket_df.reset_index(drop=True)
+    cand = dfb[(dfb["n"] >= 5) & (dfb["total_pnl"] > 0)]
+    if not cand.empty:
+        best = cand.loc[cand["total_pnl"].idxmax()]
+        out.append(
+            f"✅ **いちばん稼げているのは保有「{best['bucket']}」**です"
+            f"(合計 +{best['total_pnl']:,.0f} USD・{int(best['n'])}件・勝率{best['win_rate_pct']:.0f}%)。"
+            "あなたの得意な保有リズムはこのあたりにあります。エントリーの根拠が"
+            "このくらいの時間持つ想定のトレードを軸にするのが近道です。"
+        )
+    prefix_rows: list[Any] = []
+    for _, r in dfb.iterrows():
+        if int(r["n"]) == 0:
+            continue  # 空バケットは跨いで連続とみなす
+        if float(r["total_pnl"]) < 0:
+            prefix_rows.append(r)
+        else:
+            break
+    if prefix_rows:
+        loss_sum = -sum(float(r["total_pnl"]) for r in prefix_rows)
+        n_sum = sum(int(r["n"]) for r in prefix_rows)
+        out.append(
+            f"🔻 **保有が短いゾーン({prefix_rows[0]['bucket']}〜{prefix_rows[-1]['bucket']})が"
+            f"合計 -{loss_sum:,.0f} USD({n_sum}件)**。値動きに飛び乗ってすぐ決着がつく"
+            "反射的なトレードで削られています。エントリー前に『この根拠は数時間持てるものか?』を"
+            "自問して短時間の取引を見送っていれば、過去データ上は"
+            f"約 +{loss_sum:,.0f} USD の改善が期待できた計算です。"
+        )
+    if wl and wl.get("ok"):
+        _r = float(wl["loss_to_win_ratio"])
+        _wm_s = format_hold_duration(wl["win_median_h"])
+        _lm_s = format_hold_duration(wl["loss_median_h"])
+        if pd.notna(_r) and _r >= 1.5:
+            out.append(
+                f"⚠️ **負けトレードを勝ちの約{_r:.1f}倍長く持っています**"
+                f"(勝ちの真ん中={_wm_s}・負けの真ん中={_lm_s})。含み損を『戻るまで待つ』傾向の"
+                "サインです。入る前に損切りラインを決めておくことをお勧めします。"
+            )
+        elif pd.notna(_r) and _r <= 0.67:
+            out.append(
+                f"✅ **負けは{_lm_s}で早めに切り、勝ちは{_wm_s}まで伸ばせています。**"
+                "『損小利大』の形は守れているので、この規律は今のまま維持してください。"
+            )
+        else:
+            out.append(
+                f"ℹ️ 勝ち(真ん中={_wm_s})と負け(真ん中={_lm_s})で保有時間に大きな差はありません。"
+            )
+    out.append("※ いずれも過去データ上の傾向・試算であり、将来の成績を保証するものではありません(掟2)。")
+    return out
+
+
 def format_trade_select_label(
     seq: int, symbol: Any, side: Any, leverage: Any,
     entry_time: Any, exit_time: Any, pnl_usd: Any,
@@ -7229,6 +7292,18 @@ def render_mytrade_diagnosis_tab() -> None:
                 f" 集計期間: {pd.to_datetime(df['Entry_Time'], errors='coerce').min():%Y-%m-%d} 〜 "
                 f"{pd.to_datetime(df['Entry_Time'], errors='coerce').max():%Y-%m-%d}(掟6)"
             )
+            # 追補v14b: 初心者向けの読み方+データ駆動コメント(ユーザー要望)。
+            _bk_comments_v14 = compute_hold_bucket_comments(_bucket_v14, _wl_v14)
+            if _bk_comments_v14:
+                st.markdown("##### 💬 この表の読み方とあなたの傾向")
+                st.caption(
+                    "**読み方**: 棒グラフは『その保有時間のトレードを全部合計したら勝ったか負けたか』を"
+                    "表します。緑の棒=そのレンジは合計で勝ち、赤の棒=合計で負け。左の棒ほど"
+                    "短い保有(数秒〜数分のスキャルピング)、右ほど長い保有です。棒の上の件数が"
+                    "少ないレンジ(目安10件未満)は、たまたまの結果かもしれないので割り引いて見てください。"
+                )
+                for _c_v14 in _bk_comments_v14:
+                    st.markdown(_c_v14)
         _entry_p5 = pd.to_datetime(df["Entry_Time"], errors="coerce")
         _exit_p5 = pd.to_datetime(df["Exit_Time"], errors="coerce")
         _plot_df_p5 = df.copy()
@@ -16889,6 +16964,38 @@ def run_selftest() -> bool:
     check("37-2d 空dfは空/ok=False",
           compute_hold_bucket_stats(pd.DataFrame()).empty
           and not compute_win_loss_hold_stats(pd.DataFrame())["ok"], "")
+
+    # 37-3 追補v14b: compute_hold_bucket_comments(初心者向け自動コメント)
+    _bk37c = pd.DataFrame([
+        {"bucket": "1分未満", "n": 10, "win_rate_pct": 20.0, "total_pnl": -50.0, "avg_pnl": -5.0},
+        {"bucket": "1〜5分", "n": 8, "win_rate_pct": 25.0, "total_pnl": -30.0, "avg_pnl": -3.75},
+        {"bucket": "5〜15分", "n": 0, "win_rate_pct": float("nan"), "total_pnl": 0.0, "avg_pnl": float("nan")},
+        {"bucket": "15分〜1時間", "n": 20, "win_rate_pct": 55.0, "total_pnl": 100.0, "avg_pnl": 5.0},
+        {"bucket": "1〜4時間", "n": 3, "win_rate_pct": 66.7, "total_pnl": 500.0, "avg_pnl": 166.7},
+    ])
+    _wl37c = {"ok": True, "n_win": 10, "n_loss": 8, "win_median_h": 1.0,
+              "loss_median_h": 2.0, "loss_to_win_ratio": 2.0}
+    _cm37 = compute_hold_bucket_comments(_bk37c, _wl37c)
+    check("37-3a 稼ぎ場コメント=n>=5条件で15分〜1時間(n=3の+500は除外)",
+          any("15分〜1時間" in c and "+100" in c for c in _cm37), f"{_cm37[:1]}")
+    check("37-3b 赤字ゾーン=1分未満〜1〜5分(空バケット跨ぎ)・合計-80・18件・改善+80",
+          any(("1分未満〜1〜5分" in c) and ("-80" in c) and ("18件" in c) and ("+80" in c) for c in _cm37),
+          f"{[c for c in _cm37 if '🔻' in c]}")
+    check("37-3c 塩漬け警告(ratio2.0>=1.5)が含まれる",
+          any("2.0倍" in c and "⚠️" in c for c in _cm37), "")
+    check("37-3d 末尾は掟2免責", bool(_cm37) and "掟2" in _cm37[-1], f"{_cm37[-1] if _cm37 else ''}")
+    _cm37_praise = compute_hold_bucket_comments(
+        _bk37c, {"ok": True, "n_win": 5, "n_loss": 5, "win_median_h": 2.0,
+                 "loss_median_h": 0.5, "loss_to_win_ratio": 0.25})
+    check("37-3e ratio0.25<=0.67で損小利大の称賛コメント",
+          any("損小利大" in c for c in _cm37_praise), "")
+    check("37-3f 全バケットn=0/空dfは空リスト",
+          compute_hold_bucket_comments(pd.DataFrame(columns=["bucket", "n", "win_rate_pct", "total_pnl", "avg_pnl"])) == []
+          and compute_hold_bucket_comments(_bk37c.assign(n=0)) == [], "")
+    _cm37_nopfx = compute_hold_bucket_comments(
+        pd.DataFrame([{"bucket": "1分未満", "n": 6, "win_rate_pct": 60.0, "total_pnl": 30.0, "avg_pnl": 5.0}]))
+    check("37-3g 先頭バケットが黒字なら赤字ゾーンコメントなし",
+          not any("🔻" in c for c in _cm37_nopfx), f"{_cm37_nopfx}")
 
     print("\n" + "=" * 78)
     if all_ok:
