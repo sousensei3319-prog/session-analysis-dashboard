@@ -7194,6 +7194,211 @@ def _load_sample_trade_datasets(records: list[dict[str, Any]]) -> None:
     _add_trade_dataset_record(records, "師匠", generate_sample_trades_mentor(), "サンプルデータ(師匠・アプリ内生成)")
 
 
+# 追補: 📂ワンクリック読み込み(保存済みデータ・2026-07-22)。my_data/配下のファイル名先頭一致から
+# データセットラベルを自動推定するルール(大文字小文字非依存)。該当なしはファイル名先頭12字。
+_PRESET_LABEL_RULES: list[tuple[str, str]] = [
+    ("accounts_trading", "MT4口座"),
+    ("btcc", "BTCC"),
+    ("mexc", "MEXC"),
+    ("superior", "Superior"),
+    ("order_history", "BingX"),
+]
+
+
+def _preset_label_for_filename(name: str) -> str:
+    """my_data/配下のファイル名からデータセットラベルを自動推定する純関数(st非依存・selftest対象・
+    2026-07-22)。_PRESET_LABEL_RULESの先頭一致(大文字小文字非依存)に該当しなければファイル名
+    (拡張子除く)先頭12字を返す。"""
+    stem = Path(name).stem
+    low = stem.lower()
+    for prefix, label in _PRESET_LABEL_RULES:
+        if low.startswith(prefix):
+            return label
+    return stem[:12]
+
+
+def list_preset_datasets(base_dir: Path) -> dict[str, list[dict[str, Any]]]:
+    """保存済みプリセットデータ(wallet_trades/index.json + my_data/)を列挙する純関数
+    (st非依存・selftest対象・2026-07-22)。フォルダ不在・index.json欠損・壊れJSON・想定外の型は
+    例外を出さず空リストとして安全に扱う(公開Cloud版でmy_data/が存在しない等を許容するため)。
+    戻り値: {"wallets": [{file, tag, addr, style, n_trades, total_pnl, win_rate, csv_exists}...],
+             "my_data": [{file, label}...]}
+    CSVファイル名規約: f"{tag}_{addr[:8]}.csv"(wallet_bridge.pyの出力規約に合わせる)。
+    """
+    wallets_out: list[dict[str, Any]] = []
+    my_data_out: list[dict[str, Any]] = []
+
+    wallet_dir = base_dir / "wallet_trades"
+    index_path = wallet_dir / "index.json"
+    if index_path.is_file():
+        try:
+            raw = json.loads(index_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 — 壊れJSONは空扱い(selftest 39-4)
+            raw = None
+        if isinstance(raw, dict):
+            wallets_list = raw.get("wallets")
+        elif isinstance(raw, list):
+            wallets_list = raw
+        else:
+            wallets_list = None
+        if isinstance(wallets_list, list):
+            for w in wallets_list:
+                if not isinstance(w, dict):
+                    continue
+                addr = str(w.get("addr") or "")
+                tag = str(w.get("tag") or "")
+                if not addr or not tag:
+                    continue
+                fname = f"{tag}_{addr[:8]}.csv"
+                wallets_out.append({
+                    "file": fname,
+                    "tag": tag,
+                    "addr": addr,
+                    "style": w.get("style", "不明"),
+                    "n_trades": w.get("n_trades", 0),
+                    "total_pnl": w.get("total_pnl", 0.0),
+                    "win_rate": w.get("win_rate", float("nan")),
+                    "csv_exists": (wallet_dir / fname).is_file(),
+                })
+
+    my_data_dir = base_dir / "my_data"
+    if my_data_dir.is_dir():
+        for fp in sorted(my_data_dir.iterdir(), key=lambda p: p.name):
+            if fp.is_file() and fp.suffix.lower() in (".csv", ".xlsx", ".xls"):
+                my_data_out.append({"file": fp.name, "label": _preset_label_for_filename(fp.name)})
+
+    return {"wallets": wallets_out, "my_data": my_data_out}
+
+
+def _load_preset_file(
+    records: list[dict[str, Any]], file_path: Path, label_base: str, source_name: str,
+) -> bool:
+    """保存済みファイル1件を既存アップロードパイプライン(_read_uploaded_trade_bytes→
+    _add_trade_dataset_record)へ流す(2026-07-22)。成功時はTrueを返しpreset_loaded_namesへ
+    記録、失敗時はst.errorでファイル名+理由を表示しFalseを返す(全体は止めない)。"""
+    try:
+        content = file_path.read_bytes()
+    except Exception as e:  # noqa: BLE001
+        st.error(f"{file_path.name}: 読み込みに失敗しました({e})")
+        return False
+    raw_df, decode_errs = _read_uploaded_trade_bytes(content, file_path.name)
+    if raw_df is None:
+        st.error(
+            f"{file_path.name}: 読み込みに失敗しました"
+            f"(utf-8-sig / cp932 のどちらでもデコードできません)。詳細: {' / '.join(decode_errs)}"
+        )
+        return False
+    _add_trade_dataset_record(records, label_base, raw_df, source_name)
+    st.session_state["preset_loaded_names"].add(source_name)
+    return True
+
+
+def render_preset_data_loader(records: list[dict[str, Any]]) -> None:
+    """📂ワンクリック読み込み(保存済みデータ・2026-07-22)。wallet_trades/(公開・追跡ウォレット
+    比較用)とmy_data/(個人の過去口座履歴・.gitignore済でローカル/Oracle版のみ)を列挙し、
+    ボタン一発で既存アップロードパイプラインへ流す。st.session_state["preset_loaded_names"]で
+    二重読み込みを防ぐが、データセット削除時はrecordsのsource_name突合で自動的にガードを解除し
+    再読み込みを許す。純関数list_preset_datasets/_preset_label_for_filenameのUI側呼び出し。"""
+    if "preset_loaded_names" not in st.session_state:
+        st.session_state["preset_loaded_names"] = set()
+    current_sources = {r["source_name"] for r in records}
+    st.session_state["preset_loaded_names"] = {
+        n for n in st.session_state["preset_loaded_names"] if n in current_sources
+    }
+    loaded_names: set[str] = st.session_state["preset_loaded_names"]
+
+    base_dir = Path(__file__).resolve().parent
+    preset = list_preset_datasets(base_dir)
+
+    with st.expander("📂 ワンクリック読み込み(保存済みデータ)", expanded=True):
+        st.markdown("**🐋 追跡ウォレット(比較用)**")
+        wallets = [w for w in preset["wallets"] if w.get("csv_exists")]
+        if not wallets:
+            st.caption("追跡ウォレットデータが未配置です(wallet_bridge.pyで生成)")
+        else:
+            wallet_dir = base_dir / "wallet_trades"
+
+            def _wallet_label_base(w: dict[str, Any]) -> str:
+                return f"🐋{w['tag']}_{str(w['addr'])[:6]}"
+
+            if st.button("🐋 全ウォレットを読み込む", key="preset_load_all_wallets", type="primary"):
+                any_new = False
+                for w in wallets:
+                    source_name = f"wallet_trades/{w['file']}"
+                    if source_name in loaded_names:
+                        continue
+                    if _load_preset_file(records, wallet_dir / w["file"], _wallet_label_base(w), source_name):
+                        any_new = True
+                if any_new:
+                    st.rerun()
+
+            for w in wallets:
+                source_name = f"wallet_trades/{w['file']}"
+                already = source_name in loaded_names
+                wr = w.get("win_rate")
+                wr_str = "—" if wr is None or (isinstance(wr, float) and math.isnan(wr)) else f"{float(wr):.1f}%"
+                pnl_raw = w.get("total_pnl", 0.0)
+                pnl = 0.0 if (isinstance(pnl_raw, float) and math.isnan(pnl_raw)) else float(pnl_raw)
+                n_tr = w.get("n_trades", 0)
+                n_tr = 0 if (isinstance(n_tr, float) and math.isnan(n_tr)) else int(n_tr)
+                c1, c2, c3 = st.columns([4, 1.2, 1])
+                with c1:
+                    st.caption(
+                        f"**{w['tag']}** / {str(w['addr'])[:8]}… / {w['style']} / "
+                        f"{n_tr:,}件 / 総PnL {pnl:,.0f} / 勝率{wr_str}"
+                    )
+                with c2:
+                    if already:
+                        st.button("✅読み込み済み", key=f"preset_wallet_done_{w['file']}", disabled=True)
+                    elif st.button("読み込む", key=f"preset_wallet_load_{w['file']}", type="primary"):
+                        if _load_preset_file(records, wallet_dir / w["file"], _wallet_label_base(w), source_name):
+                            st.rerun()
+                with c3:
+                    try:
+                        csv_bytes = (wallet_dir / w["file"]).read_bytes()
+                        st.download_button(
+                            "⬇CSV", data=csv_bytes, file_name=w["file"], mime="text/csv",
+                            key=f"preset_wallet_dl_{w['file']}",
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"{w['file']}: ダウンロード用の読み込みに失敗しました({e})")
+
+        st.markdown("---")
+        st.markdown("**🗂 自分の過去口座データ(ローカルのみ)**")
+        my_data = preset["my_data"]
+        if not my_data:
+            st.caption(
+                "個人データ(my_data/)はローカル/Oracle版のみ。公開版ではファイルを直接"
+                "アップロードしてください(個人情報保護のため公開リポジトリに含めていません)"
+            )
+        else:
+            my_data_dir = base_dir / "my_data"
+            for item in my_data:
+                source_name = f"my_data/{item['file']}"
+                already = source_name in loaded_names
+                c1, c2, c3 = st.columns([4, 1.2, 1])
+                with c1:
+                    st.caption(f"**{item['label']}** — {item['file']}")
+                with c2:
+                    if already:
+                        st.button("✅読み込み済み", key=f"preset_my_done_{item['file']}", disabled=True)
+                    elif st.button("読み込む", key=f"preset_my_load_{item['file']}", type="primary"):
+                        if _load_preset_file(records, my_data_dir / item["file"], item["label"], source_name):
+                            st.rerun()
+                with c3:
+                    try:
+                        file_bytes = (my_data_dir / item["file"]).read_bytes()
+                        low_name = item["file"].lower()
+                        mime = "text/csv" if low_name.endswith(".csv") else \
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        st.download_button(
+                            "⬇", data=file_bytes, file_name=item["file"], mime=mime,
+                            key=f"preset_my_dl_{item['file']}",
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"{item['file']}: ダウンロード用の読み込みに失敗しました({e})")
+
+
 def render_trade_evaluation(records: list[dict[str, Any]]) -> None:
     """🩺 自動評価(勝ち負けパターン診断・2026-07-21)。現在のフィルタ適用後の全トレードを
     compute_trade_evaluationで機械診断し、概況・自動コメント・軸別内訳を表示する。"""
@@ -7529,6 +7734,10 @@ def render_mytrade_intake_tab() -> None:
         # 追補v10: KPIヘッダー(本ランで既に描画済み)へ即時反映。file_id既処理集合が
         # 再実行時の二重取込を防ぐ。エラー表示のみのケースではrerunしない(メッセージ保持)。
         st.rerun()
+
+    # 追補: 📂ワンクリック読み込み(保存済みデータ・2026-07-22)。アップロードUI直下に配置し、
+    # レコードが0件でもここから読み込めるようにする(「if not records: return」より前)。
+    render_preset_data_loader(records)
 
     if not records:
         st.info("トレード履歴CSVをアップロードするか、「サンプル(弟子+師匠)を読み込む」をクリックしてください。")
@@ -17704,6 +17913,73 @@ def run_selftest() -> bool:
           and _is_superior_btc(list(_btcc_en_df.columns)) is False
           and _is_btcc_jp(list(_mexc_pos_df.columns)) is False
           and _is_superior_btc(list(_mexc_pos_df.columns)) is False, "")
+
+    # ============ 39. ワンクリック読み込み(保存済みデータ) ============
+    print("\n--- 39. ワンクリック読み込み ---")
+    # 39-1: _preset_label_for_filename ラベル推定(既知5種+未知フォールバック)
+    check("39-1a accounts_trading→MT4口座",
+          _preset_label_for_filename("accounts_trading_history_23022026093250.csv") == "MT4口座", "")
+    check("39-1b BTCC→BTCC(大文字小文字非依存)",
+          _preset_label_for_filename("BTCC-Derivatives-TransactionHistory-x.xlsx") == "BTCC"
+          and _preset_label_for_filename("btcc_lower_case.csv") == "BTCC", "")
+    check("39-1c MEXC→MEXC", _preset_label_for_filename("MEXC-ポジション履歴-x.xlsx") == "MEXC", "")
+    check("39-1d Superior→Superior",
+          _preset_label_for_filename("Superior_BTC_Trade history_x.xlsx") == "Superior", "")
+    check("39-1e Order_History→BingX",
+          _preset_label_for_filename("Order_History_123_abc_2026-07-21.csv") == "BingX", "")
+    _fallback_name39 = "randomfile_abcdefghijklmnop.csv"
+    _fallback_got39 = _preset_label_for_filename(_fallback_name39)
+    check("39-1f 未知形式はファイル名(拡張子除く)先頭12字",
+          _fallback_got39 == Path(_fallback_name39).stem[:12], f"{_fallback_got39}")
+
+    with tempfile.TemporaryDirectory() as _td39:
+        _base39 = Path(_td39)
+
+        # 39-2: wallet_trades/my_data 双方不在 -> 例外なく空リスト
+        _empty39 = list_preset_datasets(_base39)
+        check("39-2a フォルダ丸ごと不在でも例外なく空リスト",
+              _empty39 == {"wallets": [], "my_data": []}, f"{_empty39}")
+
+        # 39-3: wallet_trades/index.json(dict形式)+ CSV実在/不在の混在 -> csv_exists判定
+        _wt_dir39 = _base39 / "wallet_trades"
+        _wt_dir39.mkdir(parents=True, exist_ok=True)
+        _idx39 = {
+            "wallets": [
+                {"addr": "0xaaaaaaaa1111111111111111111111111111aaaa", "tag": "sample_a",
+                 "n_trades": 10, "total_pnl": 123.4, "win_rate": 55.5, "style": "デイトレード"},
+                {"addr": "0xbbbbbbbb2222222222222222222222222222bbbb", "tag": "sample_b",
+                 "n_trades": 0, "total_pnl": 0.0, "win_rate": float("nan"), "style": "不明"},
+            ]
+        }
+        (_wt_dir39 / "index.json").write_text(json.dumps(_idx39), encoding="utf-8")
+        # sample_aのみCSVを実在させる(ファイル名規約: {tag}_{addr[:8]}.csv)
+        (_wt_dir39 / "sample_a_0xaaaaaa.csv").write_text(
+            "Entry_Time,Exit_Time,Symbol,PnL_USD\n", encoding="utf-8")
+        _res39 = list_preset_datasets(_base39)
+        check("39-3a index.json実在: wallets 2件を検出", len(_res39["wallets"]) == 2, f"{len(_res39['wallets'])}")
+        _wa39 = next(w for w in _res39["wallets"] if w["tag"] == "sample_a")
+        _wb39 = next(w for w in _res39["wallets"] if w["tag"] == "sample_b")
+        check("39-3b csv_exists判定: 実ファイルありはTrue", _wa39["csv_exists"] is True, f"{_wa39}")
+        check("39-3c csv_exists判定: 実ファイルなしはFalse", _wb39["csv_exists"] is False, f"{_wb39}")
+        check("39-3d ファイル名規約={tag}_{addr[:8]}.csv",
+              _wa39["file"] == "sample_a_0xaaaaaa.csv", f"{_wa39['file']}")
+
+        # 39-4: 壊れJSON -> 例外なくwallets=空リスト
+        (_wt_dir39 / "index.json").write_text("{not valid json", encoding="utf-8")
+        _res39b = list_preset_datasets(_base39)
+        check("39-4a 壊れJSONでも例外なくwallets=空リスト", _res39b["wallets"] == [], f"{_res39b['wallets']}")
+
+        # 39-5: my_data/ に複数拡張子を配置 -> .csv/.xlsx/.xlsのみ列挙+ラベル自動推定
+        _my_dir39 = _base39 / "my_data"
+        _my_dir39.mkdir(parents=True, exist_ok=True)
+        (_my_dir39 / "accounts_trading_history_x.csv").write_bytes(b"dummy")
+        (_my_dir39 / "BTCC-x.xlsx").write_bytes(b"dummy")
+        (_my_dir39 / "notes.txt").write_bytes(b"dummy")  # 対象外拡張子
+        _res39c = list_preset_datasets(_base39)
+        check("39-5a my_dataは.csv/.xlsx/.xlsのみ列挙(.txtは除外)",
+              len(_res39c["my_data"]) == 2, f"{_res39c['my_data']}")
+        check("39-5b my_dataのラベルが自動推定されている",
+              {d["label"] for d in _res39c["my_data"]} == {"MT4口座", "BTCC"}, f"{_res39c['my_data']}")
 
     print("\n" + "=" * 78)
     if all_ok:
