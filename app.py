@@ -836,14 +836,473 @@ def reconstruct_bingx_transaction_history(df: pd.DataFrame) -> tuple[pd.DataFram
     return out, msgs
 
 
+# ============ マルチブローカー取込(MT4/BTCC/MEXC/Superior BTC・2026-07-22) ============
+# 4形式を追加。出力スキーマはBingXアダプタと共通(Entry_Time/Exit_Time/Symbol/PnL_USD/
+# PnL_Percent/Win_Loss/Side/Leverage/Entry_Price/Exit_Price/Quantity)。
+# PnL_Percentは全アダプタ共通で「価格変動%(レバ非考慮)」= (Exit/Entry-1)×100×(LONG:+1/SHORT:-1)
+# として自前計算する(ブローカーが出す%列はレバ込みのことがあるため使わない)。
+def _strip_quote_suffix(sym: Any) -> str:
+    """末尾の -USDT/-USD/USDT/USD/PERP を除去し大文字化する共通シンボル正規化ヘルパ。
+    'BTCUSD'->'BTC'、'SILVERUSDT'->'SILVER'、'BTC-USDT'->'BTC' のように使う。"""
+    s = str(sym).strip().upper()
+    for suf in ("-USDT", "-USD", "USDT", "USD", "PERP"):
+        if s.endswith(suf):
+            s = s[: -len(suf)]
+            break
+    return s.rstrip("-")
+
+
+def _compute_pnl_percent_series(entry: pd.Series, exit_: pd.Series, side: pd.Series) -> pd.Series:
+    """共通PnL_Percent計算(価格変動%・レバ非考慮): (Exit/Entry-1)×100×(LONG:+1/SHORT:-1)。"""
+    e = pd.to_numeric(entry, errors="coerce")
+    x = pd.to_numeric(exit_, errors="coerce")
+    sgn = side.map({"LONG": 1.0, "SHORT": -1.0})
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pct = (x / e - 1.0) * 100.0 * sgn
+    return pct.replace([np.inf, -np.inf], np.nan)
+
+
+def _derive_win_loss_series(pnl: pd.Series) -> pd.Series:
+    p = pd.to_numeric(pnl, errors="coerce")
+    return p.apply(lambda v: ("win" if v > 0 else ("loss" if v < 0 else "draw")) if pd.notna(v) else None)
+
+
+# ---- 形式1: MT4口座履歴CSV -----------------------------------------------------------
+def _is_mt4_history(df: pd.DataFrame) -> bool:
+    cols = {str(c).strip() for c in df.columns}
+    if not {"チケット", "オープン時間", "決済時間", "ロット"}.issubset(cols):
+        return False
+    plat_col = next((c for c in df.columns if str(c).strip() == "プラットフォーム"), None)
+    if plat_col is None:
+        return False
+    try:
+        return bool(df[plat_col].astype(str).str.upper().str.contains("MT4").any())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def reconstruct_mt4_history(df: pd.DataFrame) -> tuple[pd.DataFrame, list[tuple[str, str]]]:
+    """MT4口座履歴CSV(accounts_trading_history_*.csv)→アプリ内部形式へ直接マップ。
+    既に1行=1完結トレードの形式(ポジション会計は不要)。時刻はMT4ブローカーのサーバー時間の
+    ままで、JSTへの変換は行わない(タイムゾーンが不明なため。時間帯分析に注意を促す警告を出す)。
+    「損益（USD）」列(ドル建て)を採用し、円建ての「損益」列は使わない。
+    """
+    cmap = {str(c).strip(): c for c in df.columns}
+
+    def col(*names):
+        for n in names:
+            if n in cmap:
+                return cmap[n]
+        return None
+
+    c_open_t = col("オープン時間")
+    c_close_t = col("決済時間")
+    c_symbol = col("銘柄")
+    c_type = col("タイプ")
+    c_open_px = col("オープン価格")
+    c_close_px = col("決済価格", "平均価格")
+    c_pnl_usd = col("損益（USD）", "利益（USD）")
+    c_sl = col("S/L")
+    c_tp = col("T/P")
+    c_comment = col("コメント")
+
+    out = pd.DataFrame()
+    out["Entry_Time"] = df[c_open_t]
+    out["Exit_Time"] = df[c_close_t]
+    out["Symbol"] = df[c_symbol].map(_strip_quote_suffix)
+    out["Side"] = df[c_type].astype(str).str.strip().str.lower().map(
+        {"買い": "LONG", "売り": "SHORT", "buy": "LONG", "sell": "SHORT"}
+    )
+    out["PnL_USD"] = _clean_numeric_series(df[c_pnl_usd])
+    out["Entry_Price"] = _clean_numeric_series(df[c_open_px])
+    out["Exit_Price"] = _clean_numeric_series(df[c_close_px])
+    out["Leverage"] = np.nan
+    out["Quantity"] = np.nan
+    out["PnL_Percent"] = _compute_pnl_percent_series(out["Entry_Price"], out["Exit_Price"], out["Side"])
+    out["Win_Loss"] = _derive_win_loss_series(out["PnL_USD"])
+
+    msgs: list[tuple[str, str]] = [
+        ("warning",
+         "時刻はMT4ブローカーのサーバー時間のままです(JSTでない可能性が高い。"
+         "時間帯・セッション分析は時差分ズレます)。"),
+    ]
+    sl_vals = _clean_numeric_series(df[c_sl]) if c_sl else pd.Series(dtype=float)
+    tp_vals = _clean_numeric_series(df[c_tp]) if c_tp else pd.Series(dtype=float)
+    all_zero = bool((sl_vals.fillna(0) == 0).all() and (tp_vals.fillna(0) == 0).all()) if len(sl_vals) else False
+    so_count = int(df[c_comment].astype(str).str.contains("so:", case=False, na=False).sum()) if c_comment else 0
+    if all_zero:
+        msgs.append(("info", f"S/L・T/P列は全行0(未設定)でした。コメント'so:'=強制ロスカットが{so_count}件"))
+    else:
+        msgs.append(("info", f"S/L・T/P列に設定のある行があります。コメント'so:'=強制ロスカットが{so_count}件"))
+    return out, msgs
+
+
+# ---- 形式2: BTCC Derivatives TransactionHistory(英語版) ------------------------------
+def _is_btcc_en(cols) -> bool:
+    c = {str(x).strip() for x in cols}
+    return {"Position order no.", "Filled Type", "Transaction Time(UTC+8)"}.issubset(c)
+
+
+def reconstruct_btcc_en(df: pd.DataFrame) -> tuple[pd.DataFrame, list[tuple[str, str]]]:
+    """BTCC Derivatives TransactionHistory(英語版xlsx)→Position order no.でグループ化し、
+    OPEN行(加重平均建値・数量・最初の時刻・Direction・Leverage)とCLOSE行(各1トレード)を対応付ける。
+    UTC+8→JST(+1h)。OPENが無いポジションのCLOSEはorphanとしてスキップ、P/L='-'(未確定)行もスキップする。
+    """
+    cmap = {str(c).strip().lower(): c for c in df.columns}
+
+    def col(*names):
+        for n in names:
+            if n in cmap:
+                return cmap[n]
+        return None
+
+    c_time = col("transaction time(utc+8)")
+    c_pos = col("position order no.")
+    c_ftype = col("filled type")
+    c_qty = col("filled qty")
+    c_price = col("filled price")
+    c_pnl = col("p/l")
+    c_dir = col("direction")
+    c_lev = col("leverage")
+    c_contract = col("contracts")
+
+    tmp = df.copy()
+    tmp["_t"] = pd.to_datetime(tmp[c_time], errors="coerce")
+    tmp = tmp.sort_values("_t", kind="stable")
+
+    trades: list = []
+    orphan = 0
+    bad_pnl = 0
+    for _pos_id, g in tmp.groupby(c_pos, sort=False):
+        ftype = g[c_ftype].astype(str).str.strip().str.upper()
+        opens = g[ftype == "OPEN"]
+        closes = g[ftype == "CLOSE"]
+        if opens.empty:
+            orphan += len(closes)
+            continue
+        qty_o = pd.to_numeric(opens[c_qty], errors="coerce")
+        px_o = pd.to_numeric(opens[c_price], errors="coerce")
+        qty_sum = float(qty_o.sum())
+        cost_sum = float((qty_o * px_o).sum())
+        avg_price = cost_sum / qty_sum if qty_sum else np.nan
+        open_time = opens["_t"].min()
+        direction = str(opens.iloc[0][c_dir]).strip().upper()
+        side = "LONG" if direction == "BUY" else ("SHORT" if direction == "SELL" else np.nan)
+        lev = pd.to_numeric(opens.iloc[0][c_lev], errors="coerce") if c_lev else np.nan
+        symbol = _strip_quote_suffix(opens.iloc[0][c_contract]) if c_contract else None
+        for _, r in closes.iterrows():
+            pnl = pd.to_numeric(r[c_pnl], errors="coerce")
+            if pd.isna(pnl):
+                bad_pnl += 1
+                continue
+            trades.append({
+                "Entry_Time": open_time, "Exit_Time": r["_t"], "Symbol": symbol,
+                "PnL_USD": float(pnl), "Side": side, "Leverage": lev,
+                "Entry_Price": avg_price, "Exit_Price": pd.to_numeric(r[c_price], errors="coerce"),
+                "Quantity": pd.to_numeric(r[c_qty], errors="coerce"),
+            })
+    out = pd.DataFrame(trades)
+    if not out.empty:
+        out["Win_Loss"] = _derive_win_loss_series(out["PnL_USD"])
+        out["PnL_Percent"] = _compute_pnl_percent_series(out["Entry_Price"], out["Exit_Price"], out["Side"])
+        for cc in ("Entry_Time", "Exit_Time"):
+            out[cc] = (pd.to_datetime(out[cc], errors="coerce")
+                       + pd.Timedelta(hours=1)).dt.strftime("%Y-%m-%d %H:%M:%S")
+    msgs = [
+        ("info",
+         f"BTCC(英語版)を検出: {len(df)}約定 → {len(out)}トレードへ再構築しました"
+         f"(建玉なしクローズ{orphan}件・PnL未確定{bad_pnl}件はスキップ)。時刻はUTC+8→JST(+1h)換算です。"),
+        ("warning", "日本語版『BTCC-取引履歴』と同期間の重複に注意してください(両方読み込むと二重計上になります)。"),
+    ]
+    return out, msgs
+
+
+# ---- 形式3: BTCC 取引履歴(日本語版・セル内改行のパック形式) ----------------------------
+def _is_btcc_jp(cols) -> bool:
+    c = {str(x).strip() for x in cols}
+    return {"先物", "注文ステータス", "追跡指値"}.issubset(c)
+
+
+def reconstruct_btcc_jp(df: pd.DataFrame) -> tuple[pd.DataFrame, list[tuple[str, str]]]:
+    """BTCC 取引履歴(日本語版xlsx)→「先物」セル(シンボル/アクション/マージンモード/レバの
+    改行区切り)と「時間」セル(日付/時刻の改行区切り)を分解し、時系列順に(symbol,side)の
+    ポジション会計(BingX方式: OPENで加重平均、決済行ごとに1トレード。確定損益=PnL_USD)を行う。
+    時間はUTC+8想定→+1hでJST(英語版Derivativesと整合)。
+    """
+    cmap = {str(c).strip(): c for c in df.columns}
+
+    def col(*names):
+        for n in names:
+            if n in cmap:
+                return cmap[n]
+        return None
+
+    c_time = col("時間")
+    c_fut = col("先物")
+    c_qty = col("全て約定 / 数量")
+    c_price = col("平均取引価格 / 価格", "平均約定価格 / 価格")
+    c_pnl = col("確定損益")
+
+    tmp = df.copy()
+
+    def _parse_time(v: Any):
+        parts = str(v).split("\n")
+        s = " ".join(p.strip() for p in parts if p.strip())
+        return pd.to_datetime(s, errors="coerce")
+
+    tmp["_t"] = tmp[c_time].map(_parse_time)
+    tmp = tmp.sort_values("_t", kind="stable")
+
+    pos: dict = {}
+    trades: list = []
+    orphan = 0
+    bad_row = 0
+    for _, r in tmp.iterrows():
+        fut_parts = [p.strip() for p in str(r[c_fut]).split("\n") if p.strip()]
+        if len(fut_parts) < 4:
+            bad_row += 1
+            continue
+        symbol_raw, action, _margin_mode, lev_raw = fut_parts[0], fut_parts[1], fut_parts[2], fut_parts[3]
+        symbol = _strip_quote_suffix(symbol_raw)
+        lev = _bingx_parse_lev(lev_raw)
+        t = r["_t"]
+        try:
+            q = float(r[c_qty])
+        except (TypeError, ValueError):
+            q = 0.0
+        try:
+            px = float(r[c_price])
+        except (TypeError, ValueError):
+            px = 0.0
+        if action in ("ロング", "ショート"):
+            side = "LONG" if action == "ロング" else "SHORT"
+            key = (symbol, side)
+            st_ = pos.setdefault(key, {"qty": 0.0, "cost": 0.0, "open_time": t, "lev": lev})
+            if st_["qty"] <= 1e-12:
+                st_["open_time"] = t
+                st_["lev"] = lev
+            st_["qty"] += q
+            st_["cost"] += q * px
+        elif action in ("ロング決済", "ショート決済"):
+            side = "LONG" if action == "ロング決済" else "SHORT"
+            key = (symbol, side)
+            st_ = pos.get(key)
+            if st_ is None or st_["qty"] <= 1e-12:
+                orphan += 1
+                continue
+            pnl = pd.to_numeric(r[c_pnl], errors="coerce")
+            if pd.isna(pnl):
+                pnl = 0.0
+            avg = st_["cost"] / st_["qty"]
+            cq = min(q, st_["qty"])
+            trades.append({
+                "Entry_Time": st_["open_time"], "Exit_Time": t, "Symbol": symbol,
+                "PnL_USD": float(pnl), "Side": side, "Leverage": st_["lev"],
+                "Entry_Price": avg, "Exit_Price": px, "Quantity": cq,
+            })
+            st_["qty"] -= cq
+            st_["cost"] -= cq * avg
+            if st_["qty"] <= 1e-12:
+                st_["qty"] = 0.0
+                st_["cost"] = 0.0
+        else:
+            bad_row += 1
+    out = pd.DataFrame(trades)
+    if not out.empty:
+        out["Win_Loss"] = _derive_win_loss_series(out["PnL_USD"])
+        out["PnL_Percent"] = _compute_pnl_percent_series(out["Entry_Price"], out["Exit_Price"], out["Side"])
+        for cc in ("Entry_Time", "Exit_Time"):
+            out[cc] = (pd.to_datetime(out[cc], errors="coerce")
+                       + pd.Timedelta(hours=1)).dt.strftime("%Y-%m-%d %H:%M:%S")
+    msgs = [
+        ("info",
+         f"BTCC(日本語版)を検出: {len(df)}行 → {len(out)}トレードへ再構築しました"
+         f"(建玉前決済{orphan}件・解析不能{bad_row}件はスキップ)。時刻はUTC+8想定→JST(+1h)換算です。"),
+        ("warning", "英語版Derivatives履歴がある場合はそちらを推奨します(重複注意)。"),
+    ]
+    return out, msgs
+
+
+# ---- 形式4: MEXC ポジション履歴 / 先物注文履歴(拒否) -----------------------------------
+def _is_mexc_order_history(cols) -> bool:
+    c = {str(x).strip() for x in cols}
+    return "注文の種類" in c and any("約定数量" in str(x) for x in c)
+
+
+def _is_mexc_position_history(cols) -> bool:
+    c = {str(x).strip() for x in cols}
+    if "注文の種類" in c:
+        return False
+    has_pnl = "実現損益" in c or "決済損益" in c
+    return {"取引ペア", "オープン時間"}.issubset(c) and has_pnl
+
+
+def reconstruct_mexc_positions(df: pd.DataFrame) -> tuple[pd.DataFrame, list[tuple[str, str]]]:
+    """MEXC ポジション履歴(往復完結型)xlsx→1行=1トレードへ直接マップ。
+    決済数量（枚）列はカンマ入り文字列("10,137")のため_clean_numeric_seriesで数値化する。
+    枚の契約サイズが不明なためQuantity/Leverageは実質流用しない(Leverageは列自体が無い)。
+    """
+    cmap = {str(c).strip(): c for c in df.columns}
+
+    def col(*names):
+        for n in names:
+            if n in cmap:
+                return cmap[n]
+        return None
+
+    c_pair = col("取引ペア")
+    c_open_t = col("オープン時間")
+    c_close_t = col("決済時刻", "決済時間")
+    c_open_px = col("平均オープン価格")
+    c_close_px = col("平均決済価格")
+    c_side = col("方向")
+    c_qty = col("決済数量（枚）")
+    c_pnl = col("実現損益", "決済損益")
+
+    out = pd.DataFrame()
+    out["Entry_Time"] = df[c_open_t]
+    out["Exit_Time"] = df[c_close_t]
+    out["Symbol"] = df[c_pair].map(_strip_quote_suffix)
+    out["Side"] = df[c_side].astype(str).str.strip().str.upper()
+    out["Entry_Price"] = _clean_numeric_series(df[c_open_px])
+    out["Exit_Price"] = _clean_numeric_series(df[c_close_px])
+    out["PnL_USD"] = _clean_numeric_series(df[c_pnl])
+    out["Quantity"] = _clean_numeric_series(df[c_qty]) if c_qty else np.nan
+    out["Leverage"] = np.nan
+    out["Win_Loss"] = _derive_win_loss_series(out["PnL_USD"])
+    out["PnL_Percent"] = _compute_pnl_percent_series(out["Entry_Price"], out["Exit_Price"], out["Side"])
+
+    msgs = [
+        ("info", "決済損益はMEXC表示値です(手数料を含むかは口座設定に依存します)。"),
+        ("warning", "MEXCの複数ファイルは期間重複があることがあります。最も広い期間の1ファイルのみの読み込みを推奨します。"),
+    ]
+    return out, msgs
+
+
+# ---- 形式5: Superior BTC ------------------------------------------------------------
+def _is_superior_btc(cols) -> bool:
+    c = {str(x).strip() for x in cols}
+    return {"Phase Id", "Closing time (UTC+00:00)", "Pair"}.issubset(c)
+
+
+def reconstruct_superior(df: pd.DataFrame) -> tuple[pd.DataFrame, list[tuple[str, str]]]:
+    """Superior BTC xlsx→時系列順に(Pair,Direction)のポジション会計。Type=Open行で加重平均建値を
+    集約し、Type=Close/*(take profit・stop loss)行ごとに1トレードを発行する(PnL_USD/Exit_Price/
+    Quantityは当該行の値をそのまま採用)。UTC+0→+9hでJST。建玉情報の無いクローズはorphanスキップ。
+    """
+    cmap = {str(c).strip(): c for c in df.columns}
+
+    def col(*names):
+        for n in names:
+            if n in cmap:
+                return cmap[n]
+        return None
+
+    c_pair = col("Pair")
+    c_dir = col("Direction")
+    c_price = col("Closing price")
+    c_time = col("Closing time (UTC+00:00)")
+    c_qty = col("Quantity")
+    c_pnl = col("PNL")
+    c_type = col("Type")
+
+    tmp = df.copy()
+    tmp["_t"] = pd.to_datetime(tmp[c_time], errors="coerce", dayfirst=True)
+    tmp = tmp.sort_values("_t", kind="stable")
+
+    pos: dict = {}
+    trades: list = []
+    orphan = 0
+    n_tp = 0
+    n_sl = 0
+    for _, r in tmp.iterrows():
+        pair = r[c_pair]
+        direction = str(r[c_dir]).strip().upper()
+        typ = str(r[c_type]).strip()
+        try:
+            q = float(r[c_qty])
+        except (TypeError, ValueError):
+            q = 0.0
+        try:
+            px = float(r[c_price])
+        except (TypeError, ValueError):
+            px = 0.0
+        t = r["_t"]
+        key = (str(pair), direction)
+        if typ.lower() == "open":
+            st_ = pos.setdefault(key, {"qty": 0.0, "cost": 0.0, "open_time": t})
+            if st_["qty"] <= 1e-12:
+                st_["open_time"] = t
+            st_["qty"] += q
+            st_["cost"] += q * px
+        elif typ.lower().startswith("close"):
+            st_ = pos.get(key)
+            if st_ is None or st_["qty"] <= 1e-12:
+                orphan += 1
+                continue
+            pnl = pd.to_numeric(r[c_pnl], errors="coerce")
+            if pd.isna(pnl):
+                pnl = 0.0
+            avg = st_["cost"] / st_["qty"]
+            cq = min(q, st_["qty"]) if q > 0 else st_["qty"]
+            trades.append({
+                "Entry_Time": st_["open_time"], "Exit_Time": t, "Symbol": _strip_quote_suffix(pair),
+                "PnL_USD": float(pnl), "Side": direction, "Leverage": np.nan,
+                "Entry_Price": avg, "Exit_Price": px, "Quantity": q,
+            })
+            st_["qty"] -= cq
+            st_["cost"] -= cq * avg
+            if st_["qty"] <= 1e-12:
+                st_["qty"] = 0.0
+                st_["cost"] = 0.0
+            if "take profit" in typ.lower():
+                n_tp += 1
+            elif "stop loss" in typ.lower():
+                n_sl += 1
+    out = pd.DataFrame(trades)
+    if not out.empty:
+        out["Win_Loss"] = _derive_win_loss_series(out["PnL_USD"])
+        out["PnL_Percent"] = _compute_pnl_percent_series(out["Entry_Price"], out["Exit_Price"], out["Side"])
+        for cc in ("Entry_Time", "Exit_Time"):
+            out[cc] = (pd.to_datetime(out[cc], errors="coerce")
+                       + pd.Timedelta(hours=9)).dt.strftime("%Y-%m-%d %H:%M:%S")
+    msgs = [
+        ("info", f"決済理由(利確/損切)が記録されています: 利確{n_tp}件・損切{n_sl}件"),
+    ]
+    if orphan:
+        msgs.append((
+            "warning",
+            f"建玉情報が無いクローズ{orphan}件はスキップしました"
+            "(エクスポート期間の開始時点で既に保有していたポジションと見られます)。",
+        ))
+    return out, msgs
+
+
 def _adapt_broker_export(raw_df: pd.DataFrame) -> tuple[pd.DataFrame, list[tuple[str, str]]]:
-    """アップロードDataFrameがBingXエクスポートなら往復トレードへ再構築。非該当ならそのまま返す。"""
+    """アップロードDataFrameが対応ブローカーのエクスポートなら往復トレードへ再構築する。
+    非該当ならそのまま返す(既存の自作CSV形式はここを素通りする)。
+    検出チェーン: BingX(注文/取引履歴) → MT4 → BTCC(英語/日本語) → MEXC(注文履歴は拒否/ポジション履歴) → Superior BTC。
+    """
     try:
         cols = list(raw_df.columns)
         if _is_bingx_order_history(cols):
             return reconstruct_bingx_order_history(raw_df)
         if _is_bingx_transaction_history(cols):
             return reconstruct_bingx_transaction_history(raw_df)
+        if _is_mt4_history(raw_df):
+            return reconstruct_mt4_history(raw_df)
+        if _is_btcc_en(cols):
+            return reconstruct_btcc_en(raw_df)
+        if _is_btcc_jp(cols):
+            return reconstruct_btcc_jp(raw_df)
+        if _is_mexc_order_history(cols):
+            return pd.DataFrame(), [("warning",
+                                      "これは注文履歴です。往復が完結している「ポジション履歴」の"
+                                      "エクスポートを使ってください。")]
+        if _is_mexc_position_history(cols):
+            return reconstruct_mexc_positions(raw_df)
+        if _is_superior_btc(cols):
+            return reconstruct_superior(raw_df)
     except Exception as e:  # noqa: BLE001
         return raw_df, [("warning", f"ブローカー形式の自動判定に失敗しました(通常CSVとして処理します): {e}")]
     return raw_df, []
@@ -7012,12 +7471,21 @@ def render_mytrade_intake_tab() -> None:
             "**A) 自分でCSVを作る場合**\n\n"
             "① 「テンプレートCSV」をDL ② Entry_Time(JST)/Exit_Time(JST)/Symbol/PnL_USD/"
             "PnL_Percent/Win_Lossの列を埋める ③ アップロードしてラベルを付ける\n\n"
-            "**B) BingXの明細をそのまま取り込む場合(2026-07-21対応)**\n\n"
-            "BingXの「注文履歴(Order History)」または「取引履歴(Transaction History)」を"
-            "**CSVでもExcel(.xlsx)でも**そのままアップロードできます。Open/Close約定を自動で"
-            "往復トレードに再構築します(時刻はUTC+8→JST換算)。\n\n"
-            "・**注文履歴(Order History)を推奨**=建値・エグジット価格・レバレッジまで復元できます。\n\n"
-            "・取引履歴(Transaction History)は実現損益のみのため、価格分析はできません(時刻=決済時刻)。\n\n"
+            "**B) ブローカーの明細をそのまま取り込む場合**\n\n"
+            "対応ブローカーのエクスポートファイルは**CSVでもExcel(.xlsx)でも**そのまま"
+            "アップロードでき、Open/Close約定から自動で往復トレードに再構築されます"
+            "(列名・形式は自動判定・変換の詳細はアップロード後のメッセージで表示)。\n\n"
+            "・**BingX**「注文履歴(Order History)」推奨(建値・エグジット価格・レバレッジまで復元)、"
+            "「取引履歴(Transaction History)」も可(実現損益のみ・価格分析不可)。時刻はUTC+8→JST換算。"
+            "(2026-07-21対応)\n\n"
+            "・**MT4**口座履歴CSV(accounts_trading_history_*.csv)。時刻はブローカーのサーバー時間の"
+            "ままで変換されません(時間帯分析は時差分ズレます・注意喚起あり)。\n\n"
+            "・**BTCC** Derivatives TransactionHistory(英語版・推奨)/取引履歴(日本語版)。"
+            "同一期間を両方読み込むと二重計上になるため、どちらか一方のみ推奨。時刻はUTC+8→JST換算。\n\n"
+            "・**MEXC** ポジション履歴(往復完結・推奨)。先物注文履歴は往復が完結していないため"
+            "取り込めません(取込時にエラー表示)。複数ファイルは期間重複に注意。\n\n"
+            "・**Superior BTC** 取引履歴xlsx。利確/損切の別を自動集計。時刻はUTC+0→JST換算(+9h)。\n\n"
+            "(2026-07-22: MT4/BTCC英語版/BTCC日本語版/MEXCポジション履歴/Superior BTCに対応)\n\n"
             "まず試すだけなら「サンプル(弟子+師匠)を読み込む」ボタン。詳しい仕様は📖使い方ガイド参照。"
         )
 
@@ -16996,6 +17464,246 @@ def run_selftest() -> bool:
         pd.DataFrame([{"bucket": "1分未満", "n": 6, "win_rate_pct": 60.0, "total_pnl": 30.0, "avg_pnl": 5.0}]))
     check("37-3g 先頭バケットが黒字なら赤字ゾーンコメントなし",
           not any("🔻" in c for c in _cm37_nopfx), f"{_cm37_nopfx}")
+
+    # ============ 38. マルチブローカー取込 ============
+    # 38-1: MT4口座履歴CSV --------------------------------------------------------------
+    _mt4_df = pd.DataFrame([
+        {"チケット": 1, "銘柄": "BTCUSD", "タイプ": "買い", "ロット": 0.1,
+         "オープン時間": "2026-02-01 08:00:00", "決済時間": "2026-02-01 09:00:00",
+         "オープン価格": 100, "決済価格": 110, "損益": 1000, "利益（USD）": 10.0,
+         "S/L": 0, "T/P": 0, "コメント": "", "プラットフォーム": "MT4"},
+        {"チケット": 2, "銘柄": "BTCUSD", "タイプ": "売り", "ロット": 0.1,
+         "オープン時間": "2026-02-01 10:00:00", "決済時間": "2026-02-01 11:00:00",
+         "オープン価格": 200, "決済価格": 190, "損益": 1000, "利益（USD）": 10.0,
+         "S/L": 0, "T/P": 0, "コメント": "", "プラットフォーム": "MT4"},
+        {"チケット": 3, "銘柄": "BTCUSD", "タイプ": "買い", "ロット": 0.1,
+         "オープン時間": "2026-02-01 12:00:00", "決済時間": "2026-02-01 13:00:00",
+         "オープン価格": 100, "決済価格": 95, "損益": -500, "利益（USD）": -5.0,
+         "S/L": 0, "T/P": 0, "コメント": "so: 2.0% Stop Out", "プラットフォーム": "MT4"},
+        {"チケット": 4, "銘柄": "BTCUSD", "タイプ": "売り", "ロット": 0.1,
+         "オープン時間": "2026-02-01 14:00:00", "決済時間": "2026-02-01 15:00:00",
+         "オープン価格": 50, "決済価格": 55, "損益": -500, "利益（USD）": -5.0,
+         "S/L": 0, "T/P": 0, "コメント": "", "プラットフォーム": "MT4"},
+        {"チケット": 5, "銘柄": "BTCUSD", "タイプ": "買い", "ロット": 0.1,
+         "オープン時間": "2026-02-01 16:00:00", "決済時間": "2026-02-01 17:00:00",
+         "オープン価格": 100, "決済価格": 100, "損益": 0, "利益（USD）": 0.0,
+         "S/L": 0, "T/P": 0, "コメント": "", "プラットフォーム": "MT4"},
+    ])
+    check("38-1a MT4検出=True(チケット/オープン時間/決済時間/ロット+プラットフォームMT4)",
+          _is_mt4_history(_mt4_df) is True, "")
+    _mt4_no_plat = _mt4_df.drop(columns=["プラットフォーム"])
+    check("38-1b プラットフォーム列が無ければMT4検出=False", _is_mt4_history(_mt4_no_plat) is False, "")
+    _mt4_mt5 = _mt4_df.assign(プラットフォーム="MT5")
+    check("38-1c プラットフォームがMT5(MT4を含まない)ならMT4検出=False",
+          _is_mt4_history(_mt4_mt5) is False, "")
+    _mt4_out, _mt4_msgs = reconstruct_mt4_history(_mt4_df)
+    check("38-1d MT4変換件数=5", len(_mt4_out) == 5, f"{len(_mt4_out)}")
+    check("38-1e MT4 Side=LONG/SHORT/LONG/SHORT/LONG",
+          list(_mt4_out["Side"]) == ["LONG", "SHORT", "LONG", "SHORT", "LONG"], f"{list(_mt4_out['Side'])}")
+    check("38-1f MT4 PnL_USDは利益（USD）列採用(円建て損益は不使用)",
+          list(_mt4_out["PnL_USD"]) == [10.0, 10.0, -5.0, -5.0, 0.0], f"{list(_mt4_out['PnL_USD'])}")
+    check("38-1g MT4 Win_Loss=win/win/loss/loss/draw",
+          list(_mt4_out["Win_Loss"]) == ["win", "win", "loss", "loss", "draw"], f"{list(_mt4_out['Win_Loss'])}")
+    _mt4_pct_expect = [
+        (110 / 100 - 1) * 100 * 1, (190 / 200 - 1) * 100 * -1,
+        (95 / 100 - 1) * 100 * 1, (55 / 50 - 1) * 100 * -1, (100 / 100 - 1) * 100 * 1,
+    ]
+    check("38-1h MT4 PnL_Percent=価格変動%(レバ非考慮・LONG/SHORTで符号反転)",
+          all(abs(a - b) < 1e-9 for a, b in zip(_mt4_out["PnL_Percent"], _mt4_pct_expect)),
+          f"{list(_mt4_out['PnL_Percent'])} vs {_mt4_pct_expect}")
+    check("38-1i MT4 時刻はサーバー時間のまま(JST変換しない)",
+          list(_mt4_out["Entry_Time"]) == list(_mt4_df["オープン時間"]), "")
+    check("38-1j MT4 msgsにサーバー時間warning + S/L・T/P全行0検出+so:件数1件のinfo",
+          any("サーバー時間" in m for _, m in _mt4_msgs)
+          and any("全行0" in m and "so:'=強制ロスカットが1件" in m for _, m in _mt4_msgs),
+          f"{_mt4_msgs}")
+
+    # 38-2: BTCC Derivatives TransactionHistory(英語版) ---------------------------------
+    _btcc_en_df = pd.DataFrame([
+        {"Position order no.": "P1", "Filled Type": "OPEN", "Direction": "BUY", "Contracts": "BTCUSDT",
+         "Filled Qty": 1, "Filled Price": 100, "Leverage": 10, "P/L": "-",
+         "Transaction Time(UTC+8)": "2026-02-01 10:00:00"},
+        {"Position order no.": "P1", "Filled Type": "OPEN", "Direction": "BUY", "Contracts": "BTCUSDT",
+         "Filled Qty": 1, "Filled Price": 120, "Leverage": 10, "P/L": "-",
+         "Transaction Time(UTC+8)": "2026-02-01 10:05:00"},
+        {"Position order no.": "P1", "Filled Type": "CLOSE", "Direction": "SELL", "Contracts": "BTCUSDT",
+         "Filled Qty": 2, "Filled Price": 130, "Leverage": 10, "P/L": 40,
+         "Transaction Time(UTC+8)": "2026-02-01 12:00:00"},
+        {"Position order no.": "P2", "Filled Type": "CLOSE", "Direction": "SELL", "Contracts": "ETHUSDT",
+         "Filled Qty": 1, "Filled Price": 50, "Leverage": 5, "P/L": 5,
+         "Transaction Time(UTC+8)": "2026-02-01 11:00:00"},
+        {"Position order no.": "P3", "Filled Type": "OPEN", "Direction": "SELL", "Contracts": "XRPUSDT",
+         "Filled Qty": 1, "Filled Price": 10, "Leverage": 5, "P/L": "-",
+         "Transaction Time(UTC+8)": "2026-02-01 09:00:00"},
+        {"Position order no.": "P3", "Filled Type": "CLOSE", "Direction": "BUY", "Contracts": "XRPUSDT",
+         "Filled Qty": 1, "Filled Price": 11, "Leverage": 5, "P/L": "-",
+         "Transaction Time(UTC+8)": "2026-02-01 09:30:00"},
+    ])
+    check("38-2a BTCC英語版 検出=True", _is_btcc_en(list(_btcc_en_df.columns)) is True, "")
+    check("38-2b BTCC英語版 MT4/MEXC等では誤検出しない",
+          _is_mt4_history(_btcc_en_df) is False and _is_mexc_order_history(list(_btcc_en_df.columns)) is False,
+          "")
+    _btcc_en_out, _btcc_en_msgs = reconstruct_btcc_en(_btcc_en_df)
+    check("38-2c BTCC英語版 6約定→1トレード(orphan1+bad_pnl1をスキップ)",
+          len(_btcc_en_out) == 1, f"{len(_btcc_en_out)}")
+    _r = _btcc_en_out.iloc[0]
+    check("38-2d BTCC英語版 加重平均建値=(1*100+1*120)/2=110・Exit_Price=130・Quantity=2",
+          abs(_r["Entry_Price"] - 110.0) < 1e-9 and abs(_r["Exit_Price"] - 130.0) < 1e-9
+          and abs(_r["Quantity"] - 2.0) < 1e-9, f"{_r['Entry_Price']}/{_r['Exit_Price']}/{_r['Quantity']}")
+    check("38-2e BTCC英語版 Side=LONG(OPENのDirection=BUYより)・PnL_USD=40・Leverage=10",
+          _r["Side"] == "LONG" and abs(_r["PnL_USD"] - 40.0) < 1e-9 and abs(_r["Leverage"] - 10.0) < 1e-9,
+          f"{_r['Side']}/{_r['PnL_USD']}/{_r['Leverage']}")
+    check("38-2f BTCC英語版 時刻はUTC+8→JST(+1h): Entry 10:00→11:00・Exit 12:00→13:00",
+          _r["Entry_Time"] == "2026-02-01 11:00:00" and _r["Exit_Time"] == "2026-02-01 13:00:00",
+          f"{_r['Entry_Time']} / {_r['Exit_Time']}")
+    check("38-2g BTCC英語版 msgsに6約定・建玉なしクローズ1件・PnL未確定1件のinfo+日本語版重複警告",
+          any("6約定" in m and "建玉なしクローズ1件" in m and "PnL未確定1件" in m for _, m in _btcc_en_msgs)
+          and any("日本語版" in m for _, m in _btcc_en_msgs), f"{_btcc_en_msgs}")
+
+    # 38-3: BTCC 取引履歴(日本語版・セル内改行パック) -----------------------------------
+    _btcc_jp_df = pd.DataFrame([
+        {"先物": "BTCUSDT\nショート決済\nクロス\n5X", "時間": "2026-02-01\n09:00:00",
+         "全て約定 / 数量": 1, "平均取引価格 / 価格": 50, "確定損益": 5,
+         "注文ステータス": "全部完了", "追跡指値": ""},
+        {"先物": "ETHUSDT\nロング", "時間": "2026-02-01\n09:30:00",
+         "全て約定 / 数量": 1, "平均取引価格 / 価格": 10, "確定損益": "",
+         "注文ステータス": "全部完了", "追跡指値": ""},
+        {"先物": "SILVERUSDT\nロング\nクロス\n10X", "時間": "2026-02-01\n10:00:00",
+         "全て約定 / 数量": 1, "平均取引価格 / 価格": 100, "確定損益": "",
+         "注文ステータス": "全部完了", "追跡指値": ""},
+        {"先物": "SILVERUSDT\nロング決済\nクロス\n10X", "時間": "2026-02-01\n11:00:00",
+         "全て約定 / 数量": 1, "平均取引価格 / 価格": 110, "確定損益": 10,
+         "注文ステータス": "全部完了", "追跡指値": ""},
+        {"先物": "SILVERUSDT\nショート\nクロス\n20X", "時間": "2026-02-01\n12:00:00",
+         "全て約定 / 数量": 2, "平均取引価格 / 価格": 200, "確定損益": "",
+         "注文ステータス": "全部完了", "追跡指値": ""},
+        {"先物": "SILVERUSDT\nショート決済\nクロス\n20X", "時間": "2026-02-01\n13:00:00",
+         "全て約定 / 数量": 2, "平均取引価格 / 価格": 190, "確定損益": 20,
+         "注文ステータス": "全部完了", "追跡指値": ""},
+    ])
+    check("38-3a BTCC日本語版 検出=True", _is_btcc_jp(list(_btcc_jp_df.columns)) is True, "")
+    _btcc_jp_out, _btcc_jp_msgs = reconstruct_btcc_jp(_btcc_jp_df)
+    check("38-3b BTCC日本語版 6行→2トレード(建玉前決済1件・解析不能1件をスキップ)",
+          len(_btcc_jp_out) == 2, f"{len(_btcc_jp_out)}")
+    _r1 = _btcc_jp_out[_btcc_jp_out["Side"] == "LONG"].iloc[0]
+    _r2 = _btcc_jp_out[_btcc_jp_out["Side"] == "SHORT"].iloc[0]
+    check("38-3c BTCC日本語版 ロング決済: Entry=100/Exit=110/PnL=10/Lev=10/Qty=1",
+          abs(_r1["Entry_Price"] - 100.0) < 1e-9 and abs(_r1["Exit_Price"] - 110.0) < 1e-9
+          and abs(_r1["PnL_USD"] - 10.0) < 1e-9 and _r1["Leverage"] == 10 and abs(_r1["Quantity"] - 1.0) < 1e-9,
+          f"{_r1.to_dict()}")
+    check("38-3d BTCC日本語版 ショート決済: Entry=200/Exit=190/PnL=20/Lev=20/Qty=2",
+          abs(_r2["Entry_Price"] - 200.0) < 1e-9 and abs(_r2["Exit_Price"] - 190.0) < 1e-9
+          and abs(_r2["PnL_USD"] - 20.0) < 1e-9 and _r2["Leverage"] == 20 and abs(_r2["Quantity"] - 2.0) < 1e-9,
+          f"{_r2.to_dict()}")
+    check("38-3e BTCC日本語版 時刻はUTC+8想定→JST(+1h): ロング決済 10:00→11:00/11:00→12:00",
+          _r1["Entry_Time"] == "2026-02-01 11:00:00" and _r1["Exit_Time"] == "2026-02-01 12:00:00",
+          f"{_r1['Entry_Time']} / {_r1['Exit_Time']}")
+    check("38-3f BTCC日本語版 Symbol正規化(SILVERUSDT→SILVER)・シンボル別プールで混線しない",
+          _r1["Symbol"] == "SILVER" and _r2["Symbol"] == "SILVER", f"{_r1['Symbol']}/{_r2['Symbol']}")
+    check("38-3g BTCC日本語版 msgsに建玉前決済1件・解析不能1件のinfo+英語版推奨warning",
+          any("建玉前決済1件" in m and "解析不能1件" in m for _, m in _btcc_jp_msgs)
+          and any("英語版" in m for _, m in _btcc_jp_msgs), f"{_btcc_jp_msgs}")
+
+    # 38-4: MEXC ポジション履歴(往復完結) / 先物注文履歴(拒否) --------------------------
+    _mexc_pos_df = pd.DataFrame([
+        {"取引ペア": "BIOUSDT", "オープン時間": "2026-03-01 08:00:00", "決済時刻": "2026-03-01 09:00:00",
+         "平均オープン価格": 0.05, "平均決済価格": 0.049, "方向": "Short",
+         "決済数量（枚）": "10,137", "実現損益": -7.48, "ステータス": "全て決済済み"},
+        {"取引ペア": "HYPERUSDT", "オープン時間": "2026-03-02 08:00:00", "決済時刻": "2026-03-02 10:00:00",
+         "平均オープン価格": 0.10, "平均決済価格": 0.11, "方向": "Long",
+         "決済数量（枚）": "444", "実現損益": 15.66, "ステータス": "全て決済済み"},
+        {"取引ペア": "ETHUSDT", "オープン時間": "2026-03-03 08:00:00", "決済時刻": "2026-03-03 08:30:00",
+         "平均オープン価格": 100, "平均決済価格": 100, "方向": "Long",
+         "決済数量（枚）": "1", "実現損益": 0, "ステータス": "全て決済済み"},
+    ])
+    check("38-4a MEXCポジション履歴 検出=True", _is_mexc_position_history(list(_mexc_pos_df.columns)) is True, "")
+    _mexc_out, _mexc_msgs = reconstruct_mexc_positions(_mexc_pos_df)
+    check("38-4b MEXCポジション履歴 3行→3トレード(1行=1トレード直接マップ)",
+          len(_mexc_out) == 3, f"{len(_mexc_out)}")
+    check("38-4c MEXCポジション履歴 カンマ入り数量'10,137'→10137.0に正規化",
+          abs(_mexc_out.loc[0, "Quantity"] - 10137.0) < 1e-9, f"{_mexc_out.loc[0, 'Quantity']}")
+    check("38-4d MEXCポジション履歴 Side=SHORT/LONG/LONG(大文字化)",
+          list(_mexc_out["Side"]) == ["SHORT", "LONG", "LONG"], f"{list(_mexc_out['Side'])}")
+    check("38-4e MEXCポジション履歴 Win_Loss=loss/win/draw",
+          list(_mexc_out["Win_Loss"]) == ["loss", "win", "draw"], f"{list(_mexc_out['Win_Loss'])}")
+    _mexc_pct0 = (0.049 / 0.05 - 1) * 100 * -1
+    check("38-4f MEXCポジション履歴 PnL_Percent=価格変動%(SHORT符号反転)",
+          abs(_mexc_out.loc[0, "PnL_Percent"] - _mexc_pct0) < 1e-9,
+          f"{_mexc_out.loc[0, 'PnL_Percent']} vs {_mexc_pct0}")
+    check("38-4g MEXCポジション履歴 時刻はJST済で変換なし(そのまま)",
+          list(_mexc_out["Entry_Time"]) == list(_mexc_pos_df["オープン時間"]), "")
+
+    _mexc_order_df = pd.DataFrame([
+        {"UID": "u1", "時間(UTC+09:00)": "2026-04-30 08:00:00", "先物取引ペア": "BTCUSDT",
+         "方向": "買い増し", "レバレッジ": 20, "注文の種類": "指値", "注文数量 (枚)": 10,
+         "約定数量 (枚)": 10, "決済損益": 0, "ステータス": "完全約定"},
+        {"UID": "u2", "時間(UTC+09:00)": "2026-04-30 09:00:00", "先物取引ペア": "ETHUSDT",
+         "方向": "売り", "レバレッジ": 10, "注文の種類": "成行", "注文数量 (枚)": 5,
+         "約定数量 (枚)": 5, "決済損益": 3.2, "ステータス": "完全約定"},
+    ])
+    check("38-4h MEXC注文履歴 検出=True(注文の種類+約定数量)",
+          _is_mexc_order_history(list(_mexc_order_df.columns)) is True, "")
+    check("38-4i MEXC注文履歴 決済損益列があってもポジション履歴とは誤検出しない(コリジョン修正確認)",
+          _is_mexc_position_history(list(_mexc_order_df.columns)) is False, "")
+    _mexc_rej_df, _mexc_rej_msgs = _adapt_broker_export(_mexc_order_df)
+    check("38-4j MEXC注文履歴 _adapt_broker_export経由で空df+ポジション履歴使用を促すwarning",
+          len(_mexc_rej_df) == 0 and any("ポジション履歴" in m for _, m in _mexc_rej_msgs),
+          f"rows={len(_mexc_rej_df)} msgs={_mexc_rej_msgs}")
+
+    # 38-5: Superior BTC ----------------------------------------------------------------
+    _sup_df = pd.DataFrame([
+        {"Phase Id": 1, "Pair": "BTC-USDT", "Direction": "Long", "Type": "Close/take profit",
+         "Closing price": 50, "Closing time (UTC+00:00)": "15/02/2026 01:00:00", "Quantity": 1, "PNL": 5},
+        {"Phase Id": 2, "Pair": "BTC-USDT", "Direction": "Long", "Type": "Open",
+         "Closing price": 100, "Closing time (UTC+00:00)": "15/02/2026 02:00:00", "Quantity": 1, "PNL": ""},
+        {"Phase Id": 2, "Pair": "BTC-USDT", "Direction": "Long", "Type": "Open",
+         "Closing price": 120, "Closing time (UTC+00:00)": "15/02/2026 03:00:00", "Quantity": 1, "PNL": ""},
+        {"Phase Id": 2, "Pair": "BTC-USDT", "Direction": "Long", "Type": "Close/take profit",
+         "Closing price": 130, "Closing time (UTC+00:00)": "15/02/2026 04:00:00", "Quantity": 2, "PNL": 40},
+        {"Phase Id": 3, "Pair": "BTC-USDT", "Direction": "Long", "Type": "Open",
+         "Closing price": 90, "Closing time (UTC+00:00)": "15/02/2026 05:00:00", "Quantity": 1, "PNL": ""},
+        {"Phase Id": 3, "Pair": "BTC-USDT", "Direction": "Long", "Type": "Close/stop loss",
+         "Closing price": 80, "Closing time (UTC+00:00)": "15/02/2026 06:00:00", "Quantity": 1, "PNL": -10},
+    ])
+    check("38-5a Superior BTC 検出=True", _is_superior_btc(list(_sup_df.columns)) is True, "")
+    _sup_out, _sup_msgs = reconstruct_superior(_sup_df)
+    check("38-5b Superior BTC 6行→2トレード(建玉なしクローズ1件をスキップ)",
+          len(_sup_out) == 2, f"{len(_sup_out)}")
+    _s1 = _sup_out.iloc[0]
+    _s2 = _sup_out.iloc[1]
+    check("38-5c Superior BTC 1本目: 加重平均建値(100+120)/2=110・Exit=130・Qty=2・PnL=40・利確",
+          abs(_s1["Entry_Price"] - 110.0) < 1e-9 and abs(_s1["Exit_Price"] - 130.0) < 1e-9
+          and abs(_s1["Quantity"] - 2.0) < 1e-9 and abs(_s1["PnL_USD"] - 40.0) < 1e-9,
+          f"{_s1.to_dict()}")
+    check("38-5d Superior BTC 2本目: Entry=90・Exit=80・Qty=1・PnL=-10・損切",
+          abs(_s2["Entry_Price"] - 90.0) < 1e-9 and abs(_s2["Exit_Price"] - 80.0) < 1e-9
+          and abs(_s2["Quantity"] - 1.0) < 1e-9 and abs(_s2["PnL_USD"] - (-10.0)) < 1e-9,
+          f"{_s2.to_dict()}")
+    check("38-5e Superior BTC Symbol正規化(BTC-USDT→BTC)",
+          _s1["Symbol"] == "BTC" and _s2["Symbol"] == "BTC", f"{_s1['Symbol']}/{_s2['Symbol']}")
+    check("38-5f Superior BTC 時刻はUTC+0→JST(+9h): 1本目Entry 02:00→11:00・Exit 04:00→13:00",
+          _s1["Entry_Time"] == "2026-02-15 11:00:00" and _s1["Exit_Time"] == "2026-02-15 13:00:00",
+          f"{_s1['Entry_Time']} / {_s1['Exit_Time']}")
+    check("38-5g Superior BTC 2本目時刻(+9h): Entry 05:00→14:00・Exit 06:00→15:00",
+          _s2["Entry_Time"] == "2026-02-15 14:00:00" and _s2["Exit_Time"] == "2026-02-15 15:00:00",
+          f"{_s2['Entry_Time']} / {_s2['Exit_Time']}")
+    check("38-5h Superior BTC msgsに利確1件・損切1件のinfo+建玉なしクローズ1件のwarning",
+          any("利確1件" in m and "損切1件" in m for _, m in _sup_msgs)
+          and any("1件" in m and "スキップ" in m for _, m in _sup_msgs), f"{_sup_msgs}")
+
+    # 38-6: 検出チェーンの相互非衝突(既存自作CSV形式・他形式との誤検出防止) --------------
+    _native_cols = ["Entry_Time", "Exit_Time", "Symbol", "PnL_USD", "PnL_Percent",
+                    "Win_Loss", "Side", "Leverage", "Entry_Price", "Exit_Price", "Quantity"]
+    _native_df = pd.DataFrame([{c: None for c in _native_cols}])
+    check("38-6a 自作CSV形式の列集合はどの新形式検出にも該当しない",
+          _is_btcc_en(_native_cols) is False and _is_btcc_jp(_native_cols) is False
+          and _is_mexc_order_history(_native_cols) is False and _is_mexc_position_history(_native_cols) is False
+          and _is_superior_btc(_native_cols) is False and _is_mt4_history(_native_df) is False, "")
+    check("38-6b 各新形式は互いの列集合とも衝突しない(BTCC英語版がMEXC/Superiorに誤検出されない)",
+          _is_mexc_position_history(list(_btcc_en_df.columns)) is False
+          and _is_superior_btc(list(_btcc_en_df.columns)) is False
+          and _is_btcc_jp(list(_mexc_pos_df.columns)) is False
+          and _is_superior_btc(list(_mexc_pos_df.columns)) is False, "")
 
     print("\n" + "=" * 78)
     if all_ok:
