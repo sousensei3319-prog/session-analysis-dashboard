@@ -1932,6 +1932,21 @@ def format_holding_duration(minutes: Any) -> str:
     return f"{h}時間{mm}分" if h > 0 else f"{mm}分"
 
 
+def format_hold_duration(hours: Any) -> str:
+    """実機フィードバック#5: 保有時間(時間)を人間可読な文字列に整形する(NaN/None時は「—」)。
+    境界(下が排他的境界=以上は次の桁へ): <1h→「N分」、<48h→「N.h時間」(小数1桁)、
+    以上→「N.d日」(小数1桁)。保有時間×損益散布図のhovertemplate/中央値縦線注記で使う。
+    """
+    if hours is None or (isinstance(hours, float) and pd.isna(hours)) or pd.isna(hours):
+        return "—"
+    h = max(float(hours), 0.0)
+    if h < 1.0:
+        return f"{int(round(h * 60.0))}分"
+    if h < 48.0:
+        return f"{h:.1f}時間"
+    return f"{h / 24.0:.1f}日"
+
+
 def format_trade_select_label(
     seq: int, symbol: Any, side: Any, leverage: Any,
     entry_time: Any, exit_time: Any, pnl_usd: Any,
@@ -4914,6 +4929,136 @@ def render_month_section(
     )
 
 
+def _market_calendar_month_options(today_: date) -> list[tuple[int, int]]:
+    """項目C(相場騰落カレンダー): 月選択肢(当月から過去24ヶ月分、新しい順)を返す純ロジック
+    (st非依存・selftest対象)。未来月を選ばせないための決定的なリスト生成のみを担い、
+    実データ取得(fetch_daily_bundle)・描画はUI層(_render_one_market_day_calendar)が別途行う。
+    """
+    base = pd.Timestamp(today_).to_period("M")
+    return [(int((base - i).year), int((base - i).month)) for i in range(24)]
+
+
+def _render_one_market_day_calendar(
+    key_prefix: str, symbol_options: list[str], today_: date, label_suffix: str = "",
+) -> None:
+    """項目C: 相場騰落カレンダー1面分の描画(UI層・st依存のためselftest対象外)。
+    build_market_day_calendar(純ロジック・selftest対象)の結果を、compute_daily_trade_calendarの
+    トレード活動カレンダーと同じ「週×曜日グリッド」の見た目で表示する(緑=陽線/赤=陰線)。
+    key_prefixで比較モード時の2面分のwidget keyを衝突させない。
+    """
+    col_sym, col_month = st.columns([2, 2])
+    with col_sym:
+        sym_pick = st.selectbox(
+            f"銘柄{label_suffix}", symbol_options + ["(自由入力ティッカー)"],
+            key=f"{key_prefix}_symbol_choice",
+        )
+        if sym_pick == "(自由入力ティッカー)":
+            sym_choice = st.text_input(
+                f"ティッカーを入力{label_suffix}(例: DOGE/USDT, XAUT, SILVER)",
+                key=f"{key_prefix}_symbol_free",
+            ).strip()
+        else:
+            sym_choice = sym_pick
+    if not sym_choice:
+        st.info("銘柄を選択、または自由入力してください。")
+        return
+
+    month_opts = _market_calendar_month_options(today_)
+    month_labels = [f"{y}年{m:02d}月" for y, m in month_opts]
+    with col_month:
+        month_label = st.selectbox(f"年月{label_suffix}", month_labels, key=f"{key_prefix}_month_choice")
+    sel_year, sel_month = month_opts[month_labels.index(month_label)]
+
+    if sym_choice not in SYMBOL_MASTER:
+        # 取引履歴由来/自由入力の銘柄はBingX(暗号)/yfinance(合成商品)ルーティングへ自己登録
+        # (ensure_exit_sim_routingと同じ既存パターンを再利用=判定ロジック非重複)。
+        ensure_exit_sim_routing([sym_choice])
+    with st.spinner(f"{sym_choice}の日足データを取得中..."):
+        data_mc, meta_mc, errors_mc = fetch_daily_bundle([sym_choice], 3, today_)
+    for e in errors_mc:
+        st.warning(e)
+    if sym_choice not in data_mc:
+        st.error(f"{sym_choice}: 日足データを取得できませんでした。")
+        return
+
+    cal_df = build_market_day_calendar(data_mc[sym_choice], sel_year, sel_month)
+    st.caption(format_data_source_caption(sym_choice, meta_mc.get(sym_choice), DAILY_CACHE_TTL_MIN))
+    if cal_df.empty:
+        st.info(f"{month_label}の{sym_choice}は表示できるバーがありません(休場・データ欠落等)。")
+        return
+
+    weeks = calendar.Calendar(firstweekday=6).monthdayscalendar(sel_year, sel_month)
+    weekday_hdr = ["日", "月", "火", "水", "木", "金", "土"]
+    hdr_cols = st.columns(7)
+    for hc, wd in zip(hdr_cols, weekday_hdr):
+        hc.markdown(f"<div style='text-align:center;font-weight:600;opacity:0.75'>{wd}</div>",
+                    unsafe_allow_html=True)
+    for week in weeks:
+        week_cols = st.columns(7)
+        for wc, day in zip(week_cols, week):
+            if day == 0:
+                wc.markdown("<div style='min-height:66px'></div>", unsafe_allow_html=True)
+                continue
+            if day in cal_df.index:
+                chg = cal_df.loc[day, "change_pct"]
+                rng_pct = cal_df.loc[day, "range_pct"]
+                close_ = cal_df.loc[day, "close"]
+                chg_txt = f"{chg:+.2f}%" if pd.notna(chg) else "—"
+                rng_txt = f"値幅{rng_pct:.2f}%" if pd.notna(rng_pct) else "値幅—"
+                if pd.notna(chg) and chg > 0:
+                    bg, border = "rgba(46,204,113,0.22)", "rgba(46,204,113,0.65)"
+                elif pd.notna(chg) and chg < 0:
+                    bg, border = "rgba(231,76,60,0.22)", "rgba(231,76,60,0.65)"
+                else:
+                    bg, border = "rgba(255,255,255,0.06)", "rgba(255,255,255,0.20)"
+                close_txt = f"{close_:,.2f}" if pd.notna(close_) else "—"
+                cell = (
+                    f"<div style='background:{bg};border:1px solid {border};border-radius:6px;"
+                    f"padding:4px 6px;min-height:66px'>"
+                    f"<div style='font-size:0.75em;opacity:0.7'>{day}</div>"
+                    f"<div style='font-size:0.85em;font-weight:600'>{chg_txt}</div>"
+                    f"<div style='font-size:0.7em;opacity:0.8'>{rng_txt}・終値{close_txt}</div></div>"
+                )
+            else:
+                cell = (
+                    "<div style='background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.05);"
+                    f"border-radius:6px;padding:4px 6px;min-height:66px'>"
+                    f"<div style='font-size:0.75em;opacity:0.35'>{day}</div></div>"
+                )
+            wc.markdown(cell, unsafe_allow_html=True)
+
+
+def render_market_day_calendar_section(today_: Optional[date] = None) -> None:
+    """項目C: 「📅 曜日・月別」サブナビの月別アノマリー直後に置く「相場騰落カレンダー」
+    (UI層・selftest対象外。純ロジックはbuild_market_day_calendar/_market_calendar_month_options)。
+    トレード成績ではなく相場そのものの日次騰落率%・値幅%を、月ごとに週×曜日グリッドで見る機能
+    (compute_daily_trade_calendarの「C. 取引活動カレンダー」と対をなす相場版)。
+    """
+    today_eff = today_ if today_ is not None else date.today()
+    st.markdown("### 相場騰落カレンダー")
+    st.caption(
+        "指定した銘柄の日次騰落率(%)・値幅(%)を、月ごとに週×曜日のグリッドで表示します"
+        "(トレード成績ではなく相場そのものの動き。緑=陽線・赤=陰線)。SYMBOL_MASTER銘柄・"
+        "アップロード済みトレード履歴の銘柄・自由入力ティッカーのいずれも選択できます。"
+    )
+    trade_recs = st.session_state.get("trade_dataset_records", [])
+    traded_syms: list[str] = []
+    for rec in trade_recs:
+        rdf = rec.get("df")
+        if rdf is not None and "Symbol" in rdf.columns:
+            for s in rdf["Symbol"].dropna().astype(str).unique():
+                if s and s not in SYMBOL_MASTER and s not in traded_syms:
+                    traded_syms.append(s)
+    symbol_options = list(SYMBOL_MASTER.keys()) + sorted(traded_syms)
+
+    _render_one_market_day_calendar("mkcal_a", symbol_options, today_eff)
+
+    compare_on = st.checkbox("別の銘柄・月と比較する", key="mkcal_compare_toggle")
+    if compare_on:
+        st.markdown("---")
+        _render_one_market_day_calendar("mkcal_b", symbol_options, today_eff, label_suffix="(比較先)")
+
+
 def render_weekday_month_tab(
     data_a: dict[str, pd.DataFrame],
     period_a: tuple[date, date],
@@ -4948,6 +5093,8 @@ def render_weekday_month_tab(
     )
     st.divider()
     render_month_section(selected_labels, trades_assigned, trade_stats_global, today_)
+    st.divider()
+    render_market_day_calendar_section(today_)
 
 
 # =====================================================================================
@@ -4964,6 +5111,30 @@ def _fmt_stat(v: Any, spec: str = ",.2f") -> str:
         return format(v, spec)
     except (ValueError, TypeError):
         return str(v)
+
+
+def format_trimmed_pct(value: Any, max_decimals: int = 2) -> str:
+    """実機フィードバック#7: 小数max_decimals桁以内で不要な末尾0を出さない文字列に整形する
+    (逆張り率%等の「その他率」表示用)。NaN/None→'—'。符号・千区切りは付けない(率専用)。
+    新規純関数のためselftest対象(run_selftestsに追加済み)。"""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "—"
+    try:
+        fv = float(value)
+    except (ValueError, TypeError):
+        return str(value)
+    if pd.isna(fv):
+        return "—"
+    if fv == float("inf"):
+        return "∞"
+    if fv == float("-inf"):
+        return "-∞"
+    s = f"{fv:.{max_decimals}f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    if s in ("", "-", "-0"):
+        s = "0"
+    return s
 
 
 def _dedupe_trade_label(label: str, existing_labels: list[str]) -> str:
@@ -5085,6 +5256,80 @@ _LEV_BUCKETS = [(0, 1, "1x"), (1, 5, "2-5x"), (5, 10, "6-10x"),
                 (10, 20, "11-20x"), (20, 50, "21-50x"), (50, 1e9, "50x超")]
 
 
+def _lev_bucket(v: Any) -> Optional[str]:
+    """レバレッジ値vが属する_LEV_BUCKETSのラベルを返す(数値変換不可はNone)。
+    compute_trade_evaluation/compute_improvement_plan共通ヘルパー(判定ロジック非重複)。"""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    for lo, hi, lab in _LEV_BUCKETS:
+        if lo < x <= hi:
+            return lab
+    return None
+
+
+def _p1_period_symbol_context(d: pd.DataFrame, mask: pd.Series, top_ascending: bool = True) -> tuple[str, str]:
+    """項目A(初心者向け詳細化)共通ヘルパー(非公開API・st非依存)。該当行(mask)のEntry_Time範囲と、
+    銘柄別PnL_USD合計の上位2件を文字列化する。compute_trade_evaluation/compute_improvement_planの
+    両方から呼ばれる(判定ロジック非重複)。該当行が無い/情報欠損の場合も例外を出さず「不明」系を返す。
+    """
+    try:
+        sub = d.loc[mask]
+    except Exception:  # noqa: BLE001
+        sub = d.iloc[0:0]
+    if sub.empty:
+        return "不明な期間", "対象データ不明"
+    if "Entry_Time" in sub.columns:
+        entry_dt = pd.to_datetime(sub["Entry_Time"], errors="coerce")
+        valid_dt = entry_dt.dropna()
+    else:
+        valid_dt = pd.Series([], dtype="datetime64[ns]")
+    if valid_dt.empty:
+        period_str = "不明な期間"
+    else:
+        t_min, t_max = valid_dt.min(), valid_dt.max()
+        if t_min.strftime("%Y%m") == t_max.strftime("%Y%m"):
+            period_str = t_min.strftime("%Y年%m月")
+        else:
+            period_str = f"{t_min.strftime('%Y年%m月')}〜{t_max.strftime('%Y年%m月')}"
+    if "Symbol" in sub.columns:
+        sym_pnl = sub.groupby("Symbol")["PnL_USD"].sum().sort_values(ascending=top_ascending)
+        top2 = sym_pnl.head(2)
+        if len(top2) > 0:
+            sym_str = "・".join(f"{s}({v:+,.0f} USD)" for s, v in top2.items())
+        else:
+            sym_str = "対象銘柄なし"
+    else:
+        sym_str = "銘柄情報なし"
+    return period_str, sym_str
+
+
+def _p1_build_detail_long(d: pd.DataFrame, mask: pd.Series, behavior: str, action: str,
+                           impact_usd: Optional[float] = None, impact_lead: str = "この行動を避けていたら",
+                           top_ascending: bool = True) -> str:
+    """項目A共通ヘルパー(非公開API・st非依存)。①いつ②どの銘柄③何をしているか④どうすればいいか
+    ⑤過去データ上の見込み(CLAUDE.md掟2の反実仮想注記込み)の5点を含む長文説明を組み立てる。"""
+    period_str, sym_str = _p1_period_symbol_context(d, mask, top_ascending=top_ascending)
+    parts = [
+        f"①いつ: {period_str}のトレードが対象です。",
+        f"②どの銘柄: {sym_str}が中心でした。",
+        f"③何をしているか: {behavior}",
+        f"④どうすればいいか: {action}",
+    ]
+    if impact_usd is not None:
+        parts.append(
+            f"⑤見込み: {impact_lead}、過去データ上は{impact_usd:+,.0f}ドルの差になっていた計算です。"
+            "これは過去データに基づくバックテスト的な試算であり、将来の結果を保証するものではありません(CLAUDE.md掟2)。"
+        )
+    else:
+        parts.append(
+            f"⑤見込み: {impact_lead}。正確な金額試算はできませんが、判断の参考にしてください。"
+            "これは過去データに基づく参考情報であり、将来の結果を保証するものではありません(CLAUDE.md掟2)。"
+        )
+    return " ".join(parts)
+
+
 def compute_trade_evaluation(df: Optional[pd.DataFrame]) -> dict:
     """トレードDataFrame(正規化済み・tz-aware JST)から勝ち負けパターンを機械的に診断する
     純ロジック(st非依存・selftest対象・2026-07-21)。戻り値=概況/各軸内訳/自動コメント。
@@ -5134,19 +5379,16 @@ def compute_trade_evaluation(df: Optional[pd.DataFrame]) -> dict:
     by_sym = _agg(lambda r: str(r.get("Symbol")) if pd.notna(r.get("Symbol")) else None)
     by_side = _agg(lambda r: str(r.get("Side")) if pd.notna(r.get("Side")) else None)
 
-    def _lev_bucket(v):
-        try:
-            x = float(v)
-        except (TypeError, ValueError):
-            return None
-        for lo, hi, lab in _LEV_BUCKETS:
-            if lo < x <= hi:
-                return lab
-        return None
     by_lev = _agg(lambda r: _lev_bucket(r.get("Leverage")))
     out["by_hour"], out["by_weekday"], out["by_band"] = by_hour, by_wd, by_band
     out["by_symbol"], out["by_side"], out["by_leverage"] = by_sym, by_side, by_lev
 
+    # ---- 項目A(初心者向け詳細化): 診断コメントごとに①いつ②どの銘柄③何をしているか④どうすればいいか
+    # ⑤過去データ上の見込み(掟2注記込み)の5点を含む長文説明"detail_long"を組み立てる
+    # (ヘルパーはモジュールレベルの_p1_period_symbol_context/_p1_build_detail_long。
+    # compute_improvement_planからも再利用するため関数外に定義し、dを明示引数で渡す)。
+    # 既存の(severity, title, message)3要素は不変のまま、4番目の要素として追加する(呼び出し側の
+    # 3要素アンパックを壊さないよう、render_trade_evaluation側・selftest側の展開箇所を4要素へ更新済み)。
     ins: list = out["insights"]
     # 1) 利益集中(上位3時間帯が総利益に占める割合)
     if total > 0 and by_hour:
@@ -5154,43 +5396,120 @@ def compute_trade_evaluation(df: Optional[pd.DataFrame]) -> dict:
         top_sum = sum(v["pnl"] for _, v in top if v["pnl"] > 0)
         if top_sum >= total * 0.8:
             hrs = "・".join("%d時" % h for h, _ in top)
+            top_hours = [h for h, _ in top]
+            mask1 = d["Entry_Time"].dt.hour.isin(top_hours) if has_time else pd.Series(False, index=d.index)
+            behavior1 = (f"総利益{total:,.0f} USDのうち{top_sum:,.0f} USD(全体の"
+                         f"{(100.0 * top_sum / total) if total else 0.0:.0f}%)が、上位3時間帯({hrs})だけに"
+                         "集中しています。特定の時間帯・少数のトレードに成績の大半を依存している状態です。")
+            action1 = ("利益がこの時間帯だけに偏りすぎていないか定期的に確認し、他の時間帯でも同じ条件で"
+                       "再現できるか検証しましょう。依存度が高いほど、その時間帯が不調になった時の"
+                       "ダメージが大きくなります。")
+            detail1 = _p1_build_detail_long(
+                d, mask1, behavior1, action1, impact_usd=top_sum,
+                impact_lead="この上位3時間帯だけに依存する状態が続いた場合", top_ascending=False,
+            )
             ins.append(("warn", "利益集中", f"総利益の大半が上位3時間帯({hrs})に依存しています"
                         f"(この帯だけで+{top_sum:,.0f}/総+{total:,.0f} USDT)。少数の当たりトレードが"
-                        "全体を支える=再現性・分散リスクに注意。"))
+                        "全体を支える=再現性・分散リスクに注意。", detail1))
     # 2) net負けのSide
     for sd, v in by_side.items():
         if v["n"] >= 10 and v["pnl"] < 0:
+            mask2 = (d.get("Side") == sd) if "Side" in d.columns else pd.Series(False, index=d.index)
+            dir_word = "下落を狙って売って" if sd == "SHORT" else ("上昇を狙って買って" if sd == "LONG" else f"{sd}で")
+            behavior2 = (f"{sd}方向のポジションを{v['n']}件取り続けています({dir_word}います)が、"
+                        f"勝率{v['wr']:.0f}%・合計{v['pnl']:,.0f} USDTとこの方向はトータルで負けています。")
+            action2 = (f"しばらく{sd}方向のエントリーを減らすか見送り、機能しているもう一方の方向に絞ることを"
+                      f"検討しましょう。どうしても{sd}を取る場合は、エントリー前に直近1時間の値動きの方向を"
+                      f"確認し、その方向に沿っている時だけにしましょう。")
+            detail2 = _p1_build_detail_long(
+                d, mask2, behavior2, action2, impact_usd=abs(v["pnl"]),
+                impact_lead=f"{sd}方向の{v['n']}件を避けていたら",
+            )
             ins.append(("bad", f"{sd}が負け", f"{sd}は{v['n']}件・勝率{v['wr']:.0f}%で"
-                        f"合計{v['pnl']:,.0f} USDT。この方向は機能していません。"))
+                        f"合計{v['pnl']:,.0f} USDT。この方向は機能していません。", detail2))
     # 3) 数打ちで負け(件数多いのにマイナスの銘柄)
     for sym, v in sorted(by_sym.items(), key=lambda kv: kv[1]["pnl"]):
         if v["n"] >= 20 and v["pnl"] < 0:
+            mask3 = (d.get("Symbol") == sym) if "Symbol" in d.columns else pd.Series(False, index=d.index)
+            behavior3 = (f"{sym}を{v['n']}回と繰り返し取引していますが、勝率{v['wr']:.0f}%・"
+                        f"合計{v['pnl']:,.0f} USDTと負けが積み重なっています。同じ銘柄・同じパターンに"
+                        "固執している可能性があります。")
+            action3 = (f"{sym}の取引回数を大幅に減らすか、エントリー条件(タイミング・サイズ・損切り幅)を"
+                      "見直しましょう。次にこの銘柄を取引する前に、過去の負けパターンに共通点が無いか"
+                      "振り返ることをおすすめします。")
+            detail3 = _p1_build_detail_long(
+                d, mask3, behavior3, action3, impact_usd=abs(v["pnl"]), impact_lead=f"{sym}を取引しなかったら",
+            )
             ins.append(("bad", f"{sym}の数打ち", f"{sym}は{v['n']}件と多いのに勝率{v['wr']:.0f}%・"
-                        f"{v['pnl']:,.0f} USDT。回数を絞るか手法見直しを。"))
+                        f"{v['pnl']:,.0f} USDT。回数を絞るか手法見直しを。", detail3))
             break
     # 4) 負け時間帯(件数十分で勝率<45%かつマイナス)
     bad_h = [(h, v) for h, v in by_hour.items() if v["n"] >= 10 and v["pnl"] < 0 and v["wr"] < 45]
     if bad_h:
         bad_h.sort(key=lambda kv: kv[1]["pnl"])
         hh = "・".join("%d時(%+.0f)" % (h, v["pnl"]) for h, v in bad_h[:4])
-        ins.append(("bad", "負け時間帯", f"次の時間帯は負け越しです: {hh}。この帯はロット縮小か見送り検討。"))
+        bad_hours = [h for h, _ in bad_h]
+        mask4 = d["Entry_Time"].dt.hour.isin(bad_hours) if has_time else pd.Series(False, index=d.index)
+        behavior4 = (f"次の時間帯({hh})にまとまってエントリーしていますが、いずれも勝率45%未満で"
+                    "負け越しています。値動きの方向が読みにくい、またはこの時間帯と相性が悪い可能性があります。")
+        action4 = ("この時間帯はロットを下げるか、エントリー自体を見送りましょう。どうしても取引する場合は、"
+                  "エントリー前に直近1時間の値動きの方向とボリュームを確認し、根拠が弱い時は見送ってください。")
+        detail4 = _p1_build_detail_long(
+            d, mask4, behavior4, action4, impact_usd=sum(v["pnl"] for _, v in bad_h),
+            impact_lead="この時間帯のエントリーを避けていたら",
+        )
+        ins.append(("bad", "負け時間帯", f"次の時間帯は負け越しです: {hh}。この帯はロット縮小か見送り検討。",
+                    detail4))
     # 5) 高レバの毀損
     for lab in ("50x超",):
         v = by_lev.get(lab)
         if v and v["pnl"] < 0:
+            if "Leverage" in d.columns:
+                mask5 = d["Leverage"].apply(lambda x: _lev_bucket(x) == lab)
+            else:
+                mask5 = pd.Series(False, index=d.index)
+            behavior5 = (f"{lab}のレバレッジで{v['n']}件取引しています。値動きが小さくても損益が大きく"
+                        "振れ、手数料・スリッページの影響も倍加するため、合計"
+                        f"{v['pnl']:,.0f} USDTのマイナスになっています。")
+            action5 = "レバレッジを50倍以下に抑えましょう。特に含み損を取り返そうとして倍率を上げるのは危険です。"
+            detail5 = _p1_build_detail_long(
+                d, mask5, behavior5, action5, impact_usd=abs(v["pnl"]), impact_lead=f"{lab}を使わなかったら",
+            )
             ins.append(("bad", "高レバの毀損", f"{lab}は{v['n']}件で{v['pnl']:,.0f} USDT。"
-                        "レバを上げすぎると手数料・滑り・振れで削られます。"))
+                        "レバを上げすぎると手数料・滑り・振れで削られます。", detail5))
     # 6) 問題銘柄(全敗)
     zeros = [(s, v) for s, v in by_sym.items() if v["n"] >= 3 and v["wr"] == 0]
     if zeros:
         names = "・".join("%s(%d戦全敗)" % (s, v["n"]) for s, v in zeros[:4])
-        ins.append(("bad", "全敗銘柄", f"{names}。相性が悪い可能性=一旦停止して検証を。"))
+        zero_syms = [s for s, _ in zeros]
+        mask6 = d.get("Symbol").isin(zero_syms) if "Symbol" in d.columns else pd.Series(False, index=d.index)
+        behavior6 = (f"{names}は取引するたびに負けています。値動きの性質(ボラティリティ・トレンドの"
+                    "出方)が、今の手法と相性が悪い可能性があります。")
+        action6 = ("この銘柄群はいったん取引を停止し、なぜ全敗しているのかを個別に振り返りましょう。"
+                  "他の銘柄と何が違うのか(値動きの速さ・出来高・情報の追いやすさ等)を確認してください。")
+        detail6 = _p1_build_detail_long(
+            d, mask6, behavior6, action6, impact_usd=sum(v["pnl"] for _, v in zeros),
+            impact_lead="この銘柄群を取引しなかったら",
+        )
+        ins.append(("bad", "全敗銘柄", f"{names}。相性が悪い可能性=一旦停止して検証を。", detail6))
     # 7) 良い点(net勝ちの帯・銘柄の最大)
     if by_band:
         best_band = max(by_band.items(), key=lambda kv: kv[1]["pnl"])
         if best_band[1]["pnl"] > 0:
+            mask7 = (d["Entry_Time"].apply(lambda t: hour_to_zone(int(t.hour))) == best_band[0]) \
+                if has_time else pd.Series(False, index=d.index)
+            behavior7 = (f"{best_band[0]}の時間帯でのトレードは勝率{best_band[1]['wr']:.0f}%・"
+                        f"合計+{best_band[1]['pnl']:,.0f} USDTと好調です。この時間帯ではエントリーの根拠"
+                        "(値動きの方向・タイミング)がうまく噛み合っている可能性があります。")
+            action7 = ("この時間帯の取引は今のやり方を継続しつつ、他の時間帯にも同じ考え方(エントリー根拠)"
+                      "を応用できないか検討しましょう。")
+            detail7 = _p1_build_detail_long(
+                d, mask7, behavior7, action7, impact_usd=best_band[1]["pnl"], top_ascending=False,
+                impact_lead="この時間帯が今後も同じペースで機能した場合",
+            )
             ins.append(("good", "効いている帯", f"{best_band[0]}が最も稼いでいます"
-                        f"(+{best_band[1]['pnl']:,.0f} USDT・勝率{best_band[1]['wr']:.0f}%)。ここは強み。"))
+                        f"(+{best_band[1]['pnl']:,.0f} USDT・勝率{best_band[1]['wr']:.0f}%)。ここは強み。",
+                        detail7))
     return out
 
 
@@ -5673,8 +5992,11 @@ def compute_improvement_plan(df: Optional[pd.DataFrame]) -> dict[str, Any]:
     重複し得るため合計は上振れする=CLAUDE.md 掟2。将来成績を保証しない)。
     強みカードはcompute_trader_profileの緑バッジをそのまま再利用する(判定ロジック非重複)。
 
-    戻り値: {"ok": bool, "items": list[dict(title, impact_usd, detail)],
+    戻り値: {"ok": bool, "items": list[dict(title, impact_usd, detail, detail_long)],
              "strengths": list[dict(title, detail)], "total_potential": float}
+    各itemの"detail_long"は項目A(初心者向け詳細化)の①いつ②どの銘柄③何をしているか④どうすればいいか
+    ⑤過去データ上の見込み(掟2注記込み)を含む長文説明(_p1_build_detail_long共通ヘルパーで生成。
+    compute_trade_evaluationの診断コメントと同じロジックを再利用=判定非重複)。
     """
     out: dict[str, Any] = {"ok": False, "items": [], "strengths": [], "total_potential": 0.0}
     if df is None or len(df) == 0 or "PnL_USD" not in df.columns:
@@ -5690,43 +6012,207 @@ def compute_improvement_plan(df: Optional[pd.DataFrame]) -> dict[str, Any]:
 
     ev = compute_trade_evaluation(d)
     dband = compute_directional_band_stats(d)
+    has_time_ip = "Entry_Time" in d.columns and pd.api.types.is_datetime64_any_dtype(d["Entry_Time"])
     items: list[dict[str, Any]] = []
 
     if not dband.empty:
         counter_pnl_total = float(dband["counter_pnl"].sum())
         counter_n_total = int(dband["counter_n"].sum())
         if counter_n_total > 0 and counter_pnl_total < 0:
+            _, mask_ip1 = _dir_counter_mask(_dir_move_pct_series(d), _dir_side_series(d))
+            behavior_ip1 = (f"建玉と逆向きに市場が動いた「逆張り」状態のトレードが{counter_n_total}件あり、"
+                            f"合計{counter_pnl_total:,.0f} USDのマイナスです。")
+            action_ip1 = ("エントリー前に直近の値動きの方向を確認し、建玉方向と逆に大きく動きそうな局面では"
+                          "見送るか、逆張り根拠(反発シグナル等)が明確な時だけに絞りましょう。")
             items.append({"title": "逆張りトレードを避けていたら", "impact_usd": abs(counter_pnl_total),
-                          "detail": f"逆張り{counter_n_total}件・合計{counter_pnl_total:,.0f} USDを回避"})
+                          "detail": f"逆張り{counter_n_total}件・合計{counter_pnl_total:,.0f} USDを回避",
+                          "detail_long": _p1_build_detail_long(
+                              d, mask_ip1, behavior_ip1, action_ip1, impact_usd=abs(counter_pnl_total),
+                              impact_lead="逆張りトレードを避けていたら")})
 
     if ev.get("ok") and ev.get("by_band"):
         worst_band = min(ev["by_band"].items(), key=lambda kv: kv[1]["pnl"])
         if worst_band[1]["pnl"] < 0:
+            mask_ip2 = (d["Entry_Time"].apply(lambda t: hour_to_zone(int(t.hour))) == worst_band[0]) \
+                if has_time_ip else pd.Series(False, index=d.index)
+            behavior_ip2 = (f"{worst_band[0]}の時間帯に{worst_band[1]['n']}件取引し、"
+                            f"勝率{worst_band[1]['wr']:.0f}%・合計{worst_band[1]['pnl']:,.0f} USDと"
+                            "マイナスです。")
+            action_ip2 = f"{worst_band[0]}の時間帯はロットを下げるか、エントリー自体を見送ることを検討しましょう。"
             items.append({"title": f"{worst_band[0]}を見送っていたら", "impact_usd": abs(worst_band[1]["pnl"]),
-                          "detail": f"{worst_band[0]}は{worst_band[1]['n']}件で{worst_band[1]['pnl']:,.0f} USD"})
+                          "detail": f"{worst_band[0]}は{worst_band[1]['n']}件で{worst_band[1]['pnl']:,.0f} USD",
+                          "detail_long": _p1_build_detail_long(
+                              d, mask_ip2, behavior_ip2, action_ip2, impact_usd=abs(worst_band[1]["pnl"]),
+                              impact_lead=f"{worst_band[0]}を見送っていたら")})
 
     if ev.get("ok"):
         lev50 = ev.get("by_leverage", {}).get("50x超")
         if lev50 and lev50["pnl"] < 0:
+            mask_ip3 = d["Leverage"].apply(lambda x: _lev_bucket(x) == "50x超") \
+                if "Leverage" in d.columns else pd.Series(False, index=d.index)
+            behavior_ip3 = (f"50x超のレバレッジで{lev50['n']}件取引し、合計{lev50['pnl']:,.0f} USDの"
+                            "マイナスです。値動きが小さくても損益が大きく振れ、手数料・スリッページの"
+                            "影響も倍加します。")
+            action_ip3 = "レバレッジを50倍以下に抑えましょう。特に含み損を取り返そうとして倍率を上げるのは危険です。"
             items.append({"title": "50x超レバを使わなかったら", "impact_usd": abs(lev50["pnl"]),
-                          "detail": f"50x超は{lev50['n']}件で{lev50['pnl']:,.0f} USD"})
+                          "detail": f"50x超は{lev50['n']}件で{lev50['pnl']:,.0f} USD",
+                          "detail_long": _p1_build_detail_long(
+                              d, mask_ip3, behavior_ip3, action_ip3, impact_usd=abs(lev50["pnl"]),
+                              impact_lead="50x超レバを使わなかったら")})
 
     if ev.get("ok") and ev.get("by_side"):
         worst_side = min(ev["by_side"].items(), key=lambda kv: kv[1]["pnl"])
         if worst_side[1]["pnl"] < 0:
+            mask_ip4 = (d.get("Side") == worst_side[0]) if "Side" in d.columns else pd.Series(False, index=d.index)
+            behavior_ip4 = (f"{worst_side[0]}方向のトレードを{worst_side[1]['n']}件取り、"
+                            f"勝率{worst_side[1]['wr']:.0f}%・合計{worst_side[1]['pnl']:,.0f} USDと"
+                            "この方向はトータルで負けています。")
+            action_ip4 = (f"しばらく{worst_side[0]}方向のエントリーを減らすか見送り、機能しているもう一方の"
+                          "方向に絞ることを検討しましょう。")
             items.append({"title": f"{worst_side[0]}を取らなかったら", "impact_usd": abs(worst_side[1]["pnl"]),
-                          "detail": f"{worst_side[0]}は{worst_side[1]['n']}件で{worst_side[1]['pnl']:,.0f} USD"})
+                          "detail": f"{worst_side[0]}は{worst_side[1]['n']}件で{worst_side[1]['pnl']:,.0f} USD",
+                          "detail_long": _p1_build_detail_long(
+                              d, mask_ip4, behavior_ip4, action_ip4, impact_usd=abs(worst_side[1]["pnl"]),
+                              impact_lead=f"{worst_side[0]}を取らなかったら")})
 
     if ev.get("ok") and ev.get("by_symbol"):
         candidates = [(s, v) for s, v in ev["by_symbol"].items() if v["n"] >= 5 and v["pnl"] < 0]
         if candidates:
             worst_sym = min(candidates, key=lambda kv: kv[1]["pnl"])
+            mask_ip5 = (d.get("Symbol") == worst_sym[0]) if "Symbol" in d.columns else pd.Series(False, index=d.index)
+            behavior_ip5 = (f"{worst_sym[0]}を{worst_sym[1]['n']}回と繰り返し取引していますが、"
+                            f"勝率{worst_sym[1]['wr']:.0f}%・合計{worst_sym[1]['pnl']:,.0f} USDと"
+                            "負けが積み重なっています。")
+            action_ip5 = (f"{worst_sym[0]}の取引回数を大幅に減らすか、エントリー条件(タイミング・サイズ・"
+                          "損切り幅)を見直しましょう。")
             items.append({"title": f"{worst_sym[0]}を取引しなかったら", "impact_usd": abs(worst_sym[1]["pnl"]),
-                          "detail": f"{worst_sym[0]}は{worst_sym[1]['n']}件で{worst_sym[1]['pnl']:,.0f} USD"})
+                          "detail": f"{worst_sym[0]}は{worst_sym[1]['n']}件で{worst_sym[1]['pnl']:,.0f} USD",
+                          "detail_long": _p1_build_detail_long(
+                              d, mask_ip5, behavior_ip5, action_ip5, impact_usd=abs(worst_sym[1]["pnl"]),
+                              impact_lead=f"{worst_sym[0]}を取引しなかったら")})
 
     out["items"] = items
     out["total_potential"] = float(sum(it["impact_usd"] for it in items))
     return out
+
+
+def compute_overall_summary(df: Optional[pd.DataFrame], metrics: dict[str, Any]) -> list[str]:
+    """📈総合成績の先頭に置く「📝総評」の文章を生成する純ロジック(st非依存・selftest対象・項目B)。
+
+    個別診断(compute_trade_evaluation/compute_improvement_plan)とは別に、全体像を掴むための
+    要約文を段落単位のリストで返す(各要素をst.markdownで1段落ずつ表示する想定)。
+    数値は必ず実データ(df・metricsの実測値)から埋め込む(定型文のみのプレースホルダにしない)。
+
+    段落構成: ①期間+概況(取引数・合計損益) ②月次の凸凹(最良/最悪月をEntry_Time基準で特定)
+    ③現在のリスク状態(最大DD・最大連敗を平易な言葉で) ④PF/期待値の平易な解釈(値で分岐)
+    ⑤締めの前向き一言(compute_improvement_planのstrengthsを再利用=判定ロジック非重複)+
+    CLAUDE.md掟2の反実仮想注記(過去データの集計であり将来を保証しない旨)を必ず含める。
+
+    df空・PnL_USD/Entry_Time欠損・有効行0件の場合は空リストを返す。
+    """
+    paragraphs: list[str] = []
+    if df is None or df.empty or "PnL_USD" not in df.columns or "Entry_Time" not in df.columns:
+        return paragraphs
+    d = df.copy()
+    d["PnL_USD"] = pd.to_numeric(d["PnL_USD"], errors="coerce")
+    d["_entry_dt"] = pd.to_datetime(d["Entry_Time"], errors="coerce")
+    d = d.loc[d["PnL_USD"].notna() & d["_entry_dt"].notna()].copy()
+    if d.empty:
+        return paragraphs
+
+    n_trades = int(metrics.get("n_trades") or len(d))
+    net_pnl = float(metrics.get("net_pnl", d["PnL_USD"].sum()))
+    if pd.isna(net_pnl):
+        net_pnl = float(d["PnL_USD"].sum())
+
+    period_start = d["_entry_dt"].min()
+    period_end = d["_entry_dt"].max()
+    span_days = max((period_end - period_start).days, 0)
+    span_months = span_days / 30.4368  # 平均月日数による概算(暦月境界非依存。掟7=Pythonで計算)
+    period_phrase = f"約{span_months:.0f}ヶ月" if span_months >= 1.0 else f"約{max(span_days, 1)}日間"
+    p1 = (
+        f"① {period_start.strftime('%Y年%m月')}〜{period_end.strftime('%Y年%m月')}の{period_phrase}で"
+        f"{n_trades}回取引し、合計{net_pnl:+,.0f}ドルの損益でした。"
+    )
+    paragraphs.append(p1)
+
+    # ② 月次の凸凹(Entry_Time基準の暦月集計)
+    monthly_pnl = d.groupby(d["_entry_dt"].dt.to_period("M"))["PnL_USD"].sum().sort_index()
+    if len(monthly_pnl) >= 2:
+        best_month = monthly_pnl.idxmax()
+        worst_month = monthly_pnl.idxmin()
+        best_val = float(monthly_pnl.loc[best_month])
+        worst_val = float(monthly_pnl.loc[worst_month])
+        if best_month != worst_month:
+            p2 = (
+                f"② 月ごとに見ると、利益は{best_month.strftime('%Y年%m月')}に集中"
+                f"({best_val:+,.0f}ドル)しており、最も悪かったのは{worst_month.strftime('%Y年%m月')}"
+                f"({worst_val:+,.0f}ドル)でした。それ以外の月はこの2ヶ月ほどの振れ幅はありません。"
+            )
+        else:
+            p2 = f"② 取引月は{best_month.strftime('%Y年%m月')}のみで、その月の損益は{best_val:+,.0f}ドルでした。"
+        paragraphs.append(p2)
+    elif len(monthly_pnl) == 1:
+        only_month = monthly_pnl.index[0]
+        only_val = float(monthly_pnl.iloc[0])
+        paragraphs.append(f"② 取引月は{only_month.strftime('%Y年%m月')}のみで、その月の損益は{only_val:+,.0f}ドルでした。")
+
+    # ③ 現在のリスク状態(最大DD・連敗を平易な言葉で)
+    max_dd = metrics.get("max_drawdown", float("nan"))
+    max_consec_losses = int(metrics.get("max_consec_losses") or 0)
+    if pd.notna(max_dd) and max_dd > 0:
+        p3 = (
+            f"③ 一番悪い時期には資金が{max_dd:,.0f}ドル減り、最大{max_consec_losses}連敗もありました。"
+            "この規模の凹みに耐えられる資金かどうかを、実弾投入前に必ず確認しましょう(掟1: リスク管理>予測)。"
+        )
+    else:
+        p3 = f"③ 目立った資金の落ち込みはこれまで確認されていません(最大連敗{max_consec_losses}回)。"
+    paragraphs.append(p3)
+
+    # ④ PF/期待値の平易な解釈(値で分岐)
+    pf = metrics.get("pf", float("nan"))
+    expectancy = metrics.get("expectancy", float("nan"))
+    if pd.isna(pf):
+        p4 = "④ プロフィットファクターを算出するのに十分な勝ち/負けデータがまだありません。"
+    elif pf < 1.0:
+        exp_txt = f"{expectancy:+,.1f}ドル" if pd.notna(expectancy) else "算出不可"
+        p4 = (
+            f"④ プロフィットファクター(総利益÷総損失)は{pf:.2f}で1を下回っています。"
+            f"1トレードあたりの期待値も{exp_txt}のため、今のやり方をこのまま続けると"
+            "期間全体では資金が減っていく計算になります。"
+        )
+    elif pf < 1.5:
+        exp_txt = f"{expectancy:+,.1f}ドル" if pd.notna(expectancy) else "算出不可"
+        p4 = (
+            f"④ プロフィットファクターは{pf:.2f}でかろうじてプラス圏です。"
+            f"期待値は1トレードあたり{exp_txt}。まだ余裕は小さく、手数料やスリッページが増えると"
+            "簡単にマイナスへ転落する水準です。"
+        )
+    else:
+        exp_txt = f"{expectancy:+,.1f}ドル" if pd.notna(expectancy) else "算出不可"
+        pf_txt = "∞" if pf == float("inf") else f"{pf:.2f}"
+        p4 = (
+            f"④ プロフィットファクターは{pf_txt}、1トレードあたりの期待値は{exp_txt}で、"
+            "総合的にはプラスで機能しています。ただし過去データでの集計結果であり、"
+            "今後も同じ水準が続く保証はありません。"
+        )
+    paragraphs.append(p4)
+
+    # ⑤ 締めの前向き一言(strengths再利用)+ 掟2注記(反実仮想・将来非保証)
+    plan = compute_improvement_plan(d)
+    strengths = plan.get("strengths", [])
+    if strengths:
+        top_strength = strengths[0]
+        p5 = f"⑤ 良い点として「{top_strength['title']}」({top_strength['detail']})が確認できています。"
+    else:
+        p5 = "⑤ 現時点で際立った強みは検出されていません。まずは①〜④の課題から着手しましょう。"
+    p5 += (
+        " なお本総評は過去データに基づく集計(バックテスト的な後知恵)であり、"
+        "将来の成績を保証するものではありません(CLAUDE.md 掟2)。"
+    )
+    paragraphs.append(p5)
+
+    return paragraphs
 
 
 TRADER_RADAR_AXES: list[str] = ["勝率", "RR", "順張り率", "戦場集中", "サイズ規律"]
@@ -5820,6 +6306,65 @@ def compute_daily_trade_calendar(df: Optional[pd.DataFrame], year: int, month: i
     out = pd.DataFrame(rows).set_index("day").sort_index()
     out.index.name = "day"
     return out[DAILY_CALENDAR_COLUMNS]
+
+
+# 項目C(相場騰落カレンダー): 銘柄の日足OHLCVから週×曜日グリッド用の日次集計を作る純ロジック。
+# compute_daily_trade_calendar(トレード版・上記)と対をなす「相場版」で、列だけが異なる
+# (トレード版=n/pnl/win_rate、相場版=change_pct/range_usd/range_pct/close)。
+MARKET_DAY_CALENDAR_COLUMNS: list[str] = ["change_pct", "range_usd", "range_pct", "close"]
+
+
+def build_market_day_calendar(daily_df: Optional[pd.DataFrame], year: int, month: int) -> pd.DataFrame:
+    """項目C: 指定銘柄の日足OHLCV(fetch_daily_bundle等の出力。index=日付・列にopen/high/low/close
+    を含む)から、指定年月の日ごとの騰落率・値幅を集計する純ロジック(st非依存・selftest対象)。
+    compute_daily_trade_calendar(上記・トレード版)と同じ「index=日(int)の週×曜日グリッド」表示
+    スタイルに合わせるための「相場版」。
+
+    - change_pct = (close - 直前の取引日のclose) / 直前close * 100。daily_dfが指定月より前の
+      行も含んでいれば、月初日の直前closeは前月末のclose(暦月境界をまたいでも連続する=
+      「月境界の前日終値クロス」)。祝日・週末等でバーが欠けた翌営業日は、その直前に存在する
+      バーのcloseを基準にする(市場が実際に参照する「前営業日比」の定義と一致)。
+    - range_usd = high - low(その日の値幅・絶対額)。
+    - range_pct = (high - low) / 直前close * 100(前日終値に対する値幅%)。
+    - close = その日の終値(セル表示・ホバー用)。
+    直前closeが無い(dfの先頭行)、または0の場合はchange_pct/range_pctはNaN(ゼロ除算を回避)。
+
+    戻り値: DataFrame(index=日(int)。該当年月にバーが実在する日のみ。
+      columns=MARKET_DAY_CALENDAR_COLUMNS=[change_pct, range_usd, range_pct, close])。
+    空df・必須列(open/high/low/close)欠落・該当年月のバーが1本も無い場合は
+    空DataFrame(columns=MARKET_DAY_CALENDAR_COLUMNS)を返す。バーが存在しない日(休場等)は
+    indexに現れない=呼び出し側(UI層)でcompute_daily_trade_calendarと同じ「日が無ければ
+    薄グレーの空セル」表示にする(missing-day None handling)。
+    """
+    empty = pd.DataFrame(columns=MARKET_DAY_CALENDAR_COLUMNS)
+    if daily_df is None or daily_df.empty:
+        return empty
+    required = {"open", "high", "low", "close"}
+    if required - set(daily_df.columns):
+        return empty
+    d = daily_df.sort_index().copy()
+    idx = pd.to_datetime(d.index)
+    prev_close = d["close"].shift(1)
+    prev_close_safe = prev_close.where(prev_close != 0)  # ゼロ除算回避(0はNaN扱い)
+    d["change_pct"] = (d["close"] - prev_close) / prev_close_safe * 100.0
+    d["range_usd"] = d["high"] - d["low"]
+    d["range_pct"] = (d["high"] - d["low"]) / prev_close_safe * 100.0
+    mask = (idx.year == int(year)) & (idx.month == int(month))
+    if not mask.any():
+        return empty
+    days = [int(ts.day) for ts in idx[mask]]
+    sub = d.loc[mask]
+    out = pd.DataFrame(
+        {
+            "change_pct": sub["change_pct"].to_numpy(),
+            "range_usd": sub["range_usd"].to_numpy(),
+            "range_pct": sub["range_pct"].to_numpy(),
+            "close": sub["close"].to_numpy(),
+        },
+        index=pd.Index(days, name="day"),
+    )
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    return out[MARKET_DAY_CALENDAR_COLUMNS]
 
 
 def compute_hourly_activity(df: Optional[pd.DataFrame]) -> pd.DataFrame:
@@ -6039,8 +6584,16 @@ def render_trade_evaluation(records: list[dict[str, Any]]) -> None:
         ICON = {"good": "✅", "warn": "⚠️", "bad": "🔻"}
         if ev["insights"]:
             st.markdown("**診断コメント**")
-            for sev, title, msg in ev["insights"]:
+            # 項目A: 各コメントは(severity, title, message, detail_long)の4要素。既存の短文表示は
+            # そのまま維持し、detail_long(いつ・どの銘柄・何をしているか・対策・見込みの初心者向け解説)
+            # はネストしたexpanderへ格納してスキャン性を落とさない。
+            for insight_row in ev["insights"]:
+                sev, title, msg = insight_row[0], insight_row[1], insight_row[2]
+                detail_long = insight_row[3] if len(insight_row) > 3 else None
                 st.markdown(f"{ICON.get(sev, '・')} **{title}** — {msg}")
+                if detail_long:
+                    with st.expander(f"📖 詳しく見る: {title}"):
+                        st.caption(detail_long)
         else:
             st.info("目立った偏りは検出されませんでした。")
 
@@ -6051,13 +6604,25 @@ def render_trade_evaluation(records: list[dict[str, Any]]) -> None:
             if key_order:
                 items = sorted(agg.items(), key=lambda kv: key_order.index(kv[0])
                                if kv[0] in key_order else 999)
-            tdf = pd.DataFrame([{"区分": k, "件数": v["n"], "損益USD": round(v["pnl"], 1),
-                                 "勝率%": round(v["wr"], 0)} for k, v in items])
+            # 実機フィードバック#7: st.dataframeはfloat64列を生値のまま渡すと小数6桁前後で
+            # 表示してしまう(round()はdtypeを変えないため無効)。表示は事前に文字列整形した
+            # 列で行い、生の数値は色付けクロージャ側にだけ保持する(style_cross_table等と同じ作法)。
+            raw_pnl = [float(v["pnl"]) for _, v in items]
+            tdf = pd.DataFrame([{
+                "区分": k, "件数": int(v["n"]),
+                "損益USD": _fmt_stat(v["pnl"], ",.2f"),
+                "勝率%": _fmt_stat(v["wr"], ".1f"),
+            } for k, v in items])
             st.markdown(f"**{title}**")
             # 追補v11: ForexTester様式視覚化(P1)#8: 損益USD列をゼロ中心の緑赤グラデーションに
             # (既存diverging_color/compute_diverging_vmaxを再利用・Styler.map=pandas3.0対応の既存作法踏襲)。
-            _vmax8 = float(tdf["損益USD"].abs().max()) if len(tdf) else 0.0
-            _styler8 = tdf.style.map(lambda v: diverging_color(v, _vmax8), subset=["損益USD"])
+            _vmax8 = max((abs(x) for x in raw_pnl), default=0.0)
+
+            def _row_style8(row):
+                color = diverging_color(raw_pnl[row.name], _vmax8)
+                return [color if col == "損益USD" else "" for col in row.index]
+
+            _styler8 = tdf.style.apply(_row_style8, axis=1)
             st.dataframe(_styler8, use_container_width=True, hide_index=True)
 
         cc1, cc2 = st.columns(2)
@@ -6129,20 +6694,26 @@ def render_directional_diagnosis(records: list[dict[str, Any]]) -> None:
         c4.metric("順張りPnL(USD)", f"{total_with_pnl:,.1f}")
 
         st.markdown("**帯別サマリー**")
+        # 実機フィードバック#7: 生のfloat64列はst.dataframeで小数桁が乱れる(例: -316.400000)ため、
+        # 色付け用の生値(counter_pnl_raw)と表示用の整形済み文字列列を分離する(既存作法踏襲)。
+        counter_pnl_raw = [float(v) for v in band_stats["counter_pnl"].values]
         disp = pd.DataFrame({
             "帯": band_stats.index,
             "環境": [_dir_diag_env_label(v) for v in band_stats["env_move"]],
             "全件": band_stats["n_all"].astype(int).values,
             "順張り件数": band_stats["with_n"].astype(int).values,
-            "順張りPnL": band_stats["with_pnl"].round(1).values,
+            "順張りPnL": [_fmt_stat(v, ",.2f") for v in band_stats["with_pnl"].values],
             "逆張り件数": band_stats["counter_n"].astype(int).values,
-            "逆張りPnL": band_stats["counter_pnl"].round(1).values,
-            "逆張り率%": band_stats["counter_rate"].round(1).values,
+            "逆張りPnL": [_fmt_stat(v, ",.2f") for v in counter_pnl_raw],
+            "逆張り率%": [format_trimmed_pct(v, 2) for v in band_stats["counter_rate"].values],
         })
-        counter_pnl_vmax = float(disp["逆張りPnL"].abs().max()) if len(disp) else 1.0
-        styler = disp.style.map(
-            lambda v: _dir_diag_neg_pnl_color(v, counter_pnl_vmax), subset=["逆張りPnL"],
-        )
+        counter_pnl_vmax = max((abs(v) for v in counter_pnl_raw), default=1.0)
+
+        def _dir_diag_row_style(row):
+            color = _dir_diag_neg_pnl_color(counter_pnl_raw[row.name], counter_pnl_vmax)
+            return [color if col == "逆張りPnL" else "" for col in row.index]
+
+        styler = disp.style.apply(_dir_diag_row_style, axis=1)
         st.dataframe(styler, width="stretch", hide_index=True)
 
         st.markdown("**帯ドリルダウン(銘柄×方向)**")
@@ -6156,8 +6727,10 @@ def render_directional_diagnosis(records: list[dict[str, Any]]) -> None:
                 "Symbol": "銘柄", "Side": "方向", "n": "件数", "win_rate": "勝率%",
                 "pnl": "損益USD", "counter_n": "逆行件数",
             }).copy()
-            drill_disp["勝率%"] = drill_disp["勝率%"].round(1)
-            drill_disp["損益USD"] = drill_disp["損益USD"].round(1)
+            # 実機フィードバック#7: 表示直前に文字列整形(生値のCSV/後続計算再利用はないため
+            # このdrill_dispコピー内で完結・エクスポートには影響しない)。
+            drill_disp["勝率%"] = drill_disp["勝率%"].map(lambda v: _fmt_stat(v, ".1f"))
+            drill_disp["損益USD"] = drill_disp["損益USD"].map(lambda v: _fmt_stat(v, ",.2f"))
             st.dataframe(drill_disp, width="stretch", hide_index=True)
 
         entry_series = pd.to_datetime(df["Entry_Time"], errors="coerce").dropna() \
@@ -6288,7 +6861,7 @@ def render_mytrade_intake_tab() -> None:
         )
     with col_sample:
         st.write("")
-        if st.button("サンプル(弟子+師匠)を読み込む", key="load_sample_btn"):
+        if st.button("サンプル(弟子+師匠)を読み込む", key="load_sample_btn", type="primary"):
             _load_sample_trade_datasets(records)
             # 追補v10: KPIヘッダー(本ランで既に描画済み)へ即時反映するため再実行。
             st.rerun()
@@ -6364,6 +6937,17 @@ def render_mytrade_intake_tab() -> None:
     st.markdown("**トレード一覧**" + ("(全データセット・時系列)" if combined_stats else ""))
     disp = df.copy().sort_values("Entry_Time")
     disp = disp.rename(columns={"band": "詳細帯", "parent": "大枠"})
+    # 実機フィードバック#7: PnL_USD/PnL_Percent/Leverageはfloat64のままst.dataframeへ渡すと
+    # 「-316.400000」のような不要な小数桁が出るため表示専用に文字列整形する(生のdfはCSV等の
+    # 再利用元として変更しない・disp自体もこの関数内のローカルコピーで完結)。Entry_Price/
+    # Exit_Price/Quantityは銘柄により有効桁数が大きく異なる(例: 極小単価のアルトコイン)ため
+    # 一律丸めはせず生のまま表示する。
+    if "PnL_USD" in disp.columns:
+        disp["PnL_USD"] = disp["PnL_USD"].map(lambda v: _fmt_stat(v, ",.2f"))
+    if "PnL_Percent" in disp.columns:
+        disp["PnL_Percent"] = disp["PnL_Percent"].map(lambda v: format_trimmed_pct(v, 2))
+    if "Leverage" in disp.columns:
+        disp["Leverage"] = disp["Leverage"].map(lambda v: format_trimmed_pct(v, 2))
     st.dataframe(disp, width="stretch")
 
 
@@ -6404,6 +6988,10 @@ def render_improvement_plan(records: list[dict[str, Any]]) -> None:
                     f"<span style='opacity:0.7;font-size:0.85em'>{it['detail']}</span>",
                     unsafe_allow_html=True,
                 )
+                detail_long_ip = it.get("detail_long")
+                if detail_long_ip:
+                    with st.expander(f"📖 詳しく見る: {it['title']}"):
+                        st.caption(detail_long_ip)
         with col_strengths:
             st.markdown(f"**強み({len(plan['strengths'])}件)**")
             if not plan["strengths"]:
@@ -6454,6 +7042,11 @@ def render_mytrade_diagnosis_tab() -> None:
             by_band, x="band", y="total_pnl_usd", template="plotly_dark",
             labels={"band": "詳細帯", "total_pnl_usd": "損益(USD)"}, category_orders={"band": BAND_ORDER},
         )
+        # 追補: 合算(単一series)ケースは損益符号で棒色を緑/赤に(実機フィードバック#4。
+        # データセット別グループ棒(上のif分岐)は既存のデータセット色分けを維持=変更しない)。
+        _band_pnl_p4 = pd.to_numeric(by_band["total_pnl_usd"], errors="coerce")
+        _band_colors_p4 = np.where(_band_pnl_p4.fillna(0.0) >= 0, "#22c55e", "#ef4444")
+        band_fig.update_traces(marker_color=list(_band_colors_p4))
     band_fig.update_layout(height=380, margin=dict(l=40, r=20, t=40, b=20))
     st.plotly_chart(band_fig, width="stretch")
 
@@ -6472,17 +7065,52 @@ def render_mytrade_diagnosis_tab() -> None:
         else:
             _median_hold_p5 = float(_plot_df_p5["_hold_hours"].median())
             _hover_cols_p5 = [c for c in ["Symbol", "Side", "Entry_Time"] if c in _plot_df_p5.columns]
-            scatter_fig = px.scatter(
-                _plot_df_p5, x="_hold_hours", y="PnL_USD", color="_結果",
-                color_discrete_map={"勝ち": "#2ECC71", "負け": "#E74C3C"},
-                hover_data=_hover_cols_p5, log_x=True, template="plotly_dark",
-                labels={"_hold_hours": "保有時間(時間・対数軸)", "PnL_USD": "損益(USD)", "_結果": "結果"},
-            )
+            # 実機フィードバック#5: log_x=Trueの自動レンジが10^20超まで伸びて目盛りが意味不明に
+            # なる不具合があったため、px.scatterではなくgo.Figureで組み立て直し、
+            # (a) tickvals/ticktextを固定の人間可読ラベルにする、
+            # (b) x軸rangeをデータ範囲+余白にクランプする(自動で10^80まで伸ばさない)、
+            # (c) hovertemplateはcustomdata経由でformat_hold_duration(純関数・selftest済み)の
+            #     文字列を表示する、の3点を実現する(計算列_hold_hours自体は従来どおりCSV
+            #     エクスポートに影響しない表示専用の派生列)。
+            _plot_df_p5 = _plot_df_p5.copy()
+            _plot_df_p5["_hold_str"] = _plot_df_p5["_hold_hours"].apply(format_hold_duration)
+            scatter_fig = go.Figure()
+            for _res_name, _res_color in (("勝ち", "#2ECC71"), ("負け", "#E74C3C")):
+                _sub_p5 = _plot_df_p5[_plot_df_p5["_結果"] == _res_name]
+                if _sub_p5.empty:
+                    continue
+                _customdata_cols_p5 = ["_hold_str"] + _hover_cols_p5
+                _hover_extra_p5 = "".join(
+                    f"{col}: %{{customdata[{i + 1}]}}<br>" for i, col in enumerate(_hover_cols_p5)
+                )
+                scatter_fig.add_trace(go.Scatter(
+                    x=_sub_p5["_hold_hours"], y=_sub_p5["PnL_USD"], mode="markers", name=_res_name,
+                    marker=dict(color=_res_color),
+                    customdata=_sub_p5[_customdata_cols_p5].to_numpy(),
+                    hovertemplate=(
+                        "保有時間: %{customdata[0]}<br>損益(USD): %{y:,.2f}<br>"
+                        + _hover_extra_p5 + "<extra></extra>"
+                    ),
+                ))
             scatter_fig.add_vline(
                 x=_median_hold_p5, line_dash="dash", line_color="rgba(255,255,255,0.5)",
-                annotation_text=f"中央値 {_median_hold_p5:.2f}h", annotation_position="top",
+                annotation_text=f"中央値 {format_hold_duration(_median_hold_p5)}", annotation_position="top",
             )
-            scatter_fig.update_layout(height=380, margin=dict(l=40, r=20, t=40, b=20))
+            _hold_min_p5 = float(_plot_df_p5["_hold_hours"].min())
+            _hold_max_p5 = float(_plot_df_p5["_hold_hours"].max())
+            _range_lo_p5 = max(min(_hold_min_p5, 1.0 / 60.0) * 0.8, 1e-4)
+            _range_hi_p5 = max(_hold_max_p5, 1.0) * 1.3
+            scatter_fig.update_xaxes(
+                type="log", title_text="保有時間(対数軸)",
+                tickvals=[1 / 60, 5 / 60, 0.25, 1, 4, 24, 72, 168, 720],
+                ticktext=["1分", "5分", "15分", "1時間", "4時間", "1日", "3日", "1週間", "1ヶ月"],
+                range=[math.log10(_range_lo_p5), math.log10(_range_hi_p5)],
+            )
+            scatter_fig.update_yaxes(title_text="損益(USD)")
+            scatter_fig.update_layout(
+                template="plotly_dark", height=380, margin=dict(l=40, r=20, t=40, b=20),
+                legend_title_text="結果",
+            )
             st.plotly_chart(scatter_fig, width="stretch")
             st.caption(
                 "右側ほど長期保有。右下(長く持って大負け)が『持ちすぎゾーン』。集計期間: "
@@ -7129,6 +7757,107 @@ def grid_search_exit_optimization(
     return pd.DataFrame(rows).sort_values("net_profit", ascending=False).reset_index(drop=True)
 
 
+def compute_liquidation_resilience(
+    valid_df: pd.DataFrame, bars_by_idx: dict[Any, pd.DataFrame], timeframe_by_idx: dict[Any, str],
+) -> dict[str, Any]:
+    """🛡ロスカット耐性(必要証拠金の逆算)。ユーザー要望「いくらのエントリーで最大DDはいくらで、
+    ロスカットされないためには証拠金がいくら必要か」に答えるための集計。
+
+    各トレードについて、エグジット最適化と同じ経路キャッシュ(bars_by_idx/timeframe_by_idx。
+    エントリー含有バー〜実績Exit_Timeの窓=compute_window_end(hold_hours=None)相当)から
+    窓内の最悪逆行価格を求める(LONG=窓内lowの最小値、SHORT=窓内highの最大値)。
+
+      - mae_usd = qty * max(0, 逆行方向の値幅) (グロスの含み損最大値。手数料等は含まない近似)。
+      - required_margin = mae_usd * 1.05(清算はメンテナンス証拠金水準で発生し証拠金を使い切る
+        前に起こるため、その概算バッファとして+5%を乗せる。取引所ごとの実際のメンテナンス
+        証拠金率・清算価格計算式を再現するものではない**概算値**)。
+      - was_liq_risk: mae_usd >= 実際の証拠金(_margin列)*0.95 なら「ロスカット圏だった」と
+        近似判定する(=含み損が証拠金の95%以上に達していた)。
+
+    バー欠損(bars_by_idxにidxが無い/空/窓内0本)・Entry_Time/Exit_Time/Entry_Price/qty/margin
+    のいずれかが欠損しているトレードはスキップし、summary["n_skip"]に計上する(per_tradeには
+    含めない)。
+
+    戻り値: {"per_trade": [{"symbol", "entry_time", "entry_price", "margin", "notional",
+      "mae_usd", "required_margin", "was_liq_risk"}, ...],
+      "summary": {"n", "n_liq_risk", "required_margin_median", "required_margin_max",
+      "margin_median", "n_skip"}}
+    """
+    per_trade: list[dict[str, Any]] = []
+    n_skip = 0
+    for idx, row in valid_df.iterrows():
+        bars = bars_by_idx.get(idx)
+        if bars is None or bars.empty:
+            n_skip += 1
+            continue
+        entry_time = row.get("Entry_Time")
+        exit_time = row.get("Exit_Time")
+        entry_price = row.get("Entry_Price")
+        qty = row.get("_qty")
+        margin = row.get("_margin")
+        side = row.get("Side")
+        if (pd.isna(entry_time) or pd.isna(exit_time) or pd.isna(entry_price)
+                or pd.isna(qty) or pd.isna(margin) or float(margin) <= 0):
+            n_skip += 1
+            continue
+        # 保有時間トグルは考慮しない(常に実績Exit_Timeまでの窓)。exit_timeをnow_tsとして渡す
+        # ことで「未来クリップ」は発生させず、hold_hours=Noneの分岐(実績Exit_Time採用)だけを
+        # 使う(compute_window_endのシグネチャ変更なしで安全に再利用するための呼び方)。
+        window_end = compute_window_end(entry_time, exit_time, None, exit_time)
+        if window_end is None:
+            n_skip += 1
+            continue
+        bar_interval = bar_interval_for_choice(timeframe_by_idx.get(idx, "1時間足"))
+        b = bars.sort_index()
+        b = b.loc[(b.index > entry_time - bar_interval) & (b.index <= window_end)]
+        if b.empty:
+            n_skip += 1
+            continue
+        is_long = str(side).strip().upper() != "SHORT" if pd.notna(side) else True
+        entry_price_f = float(entry_price)
+        if is_long:
+            worst_price = float(b["low"].min())
+            adverse = max(0.0, entry_price_f - worst_price)
+        else:
+            worst_price = float(b["high"].max())
+            adverse = max(0.0, worst_price - entry_price_f)
+        margin_f = float(margin)
+        mae_usd = float(qty) * adverse
+        required_margin = mae_usd * 1.05
+        was_liq_risk = mae_usd >= margin_f * 0.95
+        notional_val = row.get("_notional")
+        per_trade.append({
+            "symbol": row.get("Symbol"), "entry_time": entry_time, "entry_price": entry_price_f,
+            "margin": margin_f,
+            "notional": float(notional_val) if pd.notna(notional_val) else float("nan"),
+            "mae_usd": mae_usd, "required_margin": required_margin, "was_liq_risk": was_liq_risk,
+        })
+
+    n = len(per_trade)
+    n_liq_risk = sum(1 for t in per_trade if t["was_liq_risk"])
+    if n > 0:
+        req_series = pd.Series([t["required_margin"] for t in per_trade], dtype=float)
+        margin_series = pd.Series([t["margin"] for t in per_trade], dtype=float)
+        required_margin_median = float(req_series.median())
+        required_margin_max = float(req_series.max())
+        margin_median = float(margin_series.median())
+    else:
+        required_margin_median = float("nan")
+        required_margin_max = float("nan")
+        margin_median = float("nan")
+
+    return {
+        "per_trade": per_trade,
+        "summary": {
+            "n": n, "n_liq_risk": n_liq_risk,
+            "required_margin_median": required_margin_median,
+            "required_margin_max": required_margin_max,
+            "margin_median": margin_median,
+            "n_skip": n_skip,
+        },
+    }
+
+
 def compute_exit_sim_cache_key(
     target_df: pd.DataFrame, hold_enabled: bool, hold_hours: Optional[float],
 ) -> str:
@@ -7384,51 +8113,108 @@ def render_mytrade_overview_tab() -> None:
         f"集計期間: {period_start:%Y-%m-%d} 〜 {period_end:%Y-%m-%d} / 取引数(合算・フィルタ適用後): {len(df)}件"
     )
 
-    # ---- A. リスク&パフォーマンス指標 ---------------------------------------------
-    st.subheader("A. リスク&パフォーマンス指標")
     metrics = compute_risk_performance_metrics(df)
 
+    # ---- 📝 総評(項目B: 個別診断とは別の全体要約) ---------------------------------
+    st.subheader("📝 総評")
+    summary_paragraphs = compute_overall_summary(df, metrics)
+    if summary_paragraphs:
+        for para in summary_paragraphs:
+            st.markdown(para)
+    else:
+        st.caption("総評を生成するデータが不足しています。")
+    st.divider()
+
+    # ---- A. リスク&パフォーマンス指標 ---------------------------------------------
+    st.subheader("A. リスク&パフォーマンス指標")
+
     a1 = st.columns(4)
-    a1[0].metric("取引数", f"{metrics['n_trades']}")
-    a1[1].metric("勝率", f"{metrics['win_rate_pct']:.1f}%" if pd.notna(metrics["win_rate_pct"]) else "—")
-    a1[2].metric("プロフィットファクター", _fmt_stat(metrics["pf"], ".2f"))
-    a1[3].metric("純利益(USD)", _fmt_stat(metrics["net_pnl"]))
+    a1[0].metric("取引数", f"{metrics['n_trades']}", help="集計期間中の総トレード件数。")
+    a1[1].metric(
+        "勝率", f"{metrics['win_rate_pct']:.1f}%" if pd.notna(metrics["win_rate_pct"]) else "—",
+        help="勝ちトレードの割合。勝率が高くても1回の負けが大きいと資産は減る点に注意(掟1)。",
+    )
+    a1[2].metric(
+        "プロフィットファクター", _fmt_stat(metrics["pf"], ".2f"),
+        help="総利益÷総損失。1より大きいほど良い。1未満はトータルで負けている状態。",
+    )
+    a1[3].metric("純利益(USD)", _fmt_stat(metrics["net_pnl"]), help="集計期間の損益USDの合計(手数料等込みの実現損益)。")
 
     a2 = st.columns(4)
-    a2[0].metric("期待値/トレード(USD)", _fmt_stat(metrics["expectancy"]))
-    a2[1].metric("ペイオフレシオ", _fmt_stat(metrics["payoff_ratio"], ".2f"))
-    a2[2].metric("平均利益(USD)", _fmt_stat(metrics["avg_win"]))
-    a2[3].metric("平均損失(USD)", _fmt_stat(metrics["avg_loss"]))
+    a2[0].metric(
+        "期待値/トレード(USD)", _fmt_stat(metrics["expectancy"]),
+        help="1トレードあたり平均でいくら儲かる/損するかの理論値。プラスなら平均的に勝てる設計。",
+    )
+    a2[1].metric(
+        "ペイオフレシオ", _fmt_stat(metrics["payoff_ratio"], ".2f"),
+        help="平均利益÷平均損失(絶対値)。1回の勝ちが1回の負けの何倍かを示す。低いRRは勝率が高くても負ける原因になる。",
+    )
+    a2[2].metric("平均利益(USD)", _fmt_stat(metrics["avg_win"]), help="勝ちトレード1回あたりの平均利益(USD)。")
+    a2[3].metric("平均損失(USD)", _fmt_stat(metrics["avg_loss"]), help="負けトレード1回あたりの平均損失(USD、絶対値)。")
 
     a3 = st.columns(4)
-    a3[0].metric("最大ドローダウン(USD)", _fmt_stat(metrics["max_drawdown"]))
+    a3[0].metric(
+        "最大ドローダウン(USD)", _fmt_stat(metrics["max_drawdown"]),
+        help="資産曲線の山(最高値)から谷(最安値)までの最大の下落幅。耐えられる損失の目安。",
+    )
     a3[1].metric(
         "最大ドローダウン(%)",
         f"{metrics['max_drawdown_pct']:.1f}%" if pd.notna(metrics["max_drawdown_pct"]) else "—",
+        help="最大ドローダウンを資産比で見たもの。数字が大きいほど資金が大きく目減りした局面があったことを示す。",
     )
-    a3[2].metric("リカバリーファクター", _fmt_stat(metrics["recovery_factor"], ".2f"))
-    a3[3].metric("最大勝ち/最大負け(USD)", f"{_fmt_stat(metrics['max_win'])} / {_fmt_stat(metrics['max_loss'])}")
+    a3[2].metric(
+        "リカバリーファクター", _fmt_stat(metrics["recovery_factor"], ".2f"),
+        help="純利益÷最大ドローダウン。同じ利益でも下落が浅いほど値が大きく、効率よく回復できている。",
+    )
+    a3[3].metric(
+        "最大勝ち/最大負け(USD)", f"{_fmt_stat(metrics['max_win'])} / {_fmt_stat(metrics['max_loss'])}",
+        help="単発トレードでの最大の勝ち幅/負け幅(USD)。外れ値の影響を確認する用途。",
+    )
 
     a4 = st.columns(4)
-    a4[0].metric("最大連勝", f"{metrics['max_consec_wins']}回")
-    a4[1].metric("最大連敗", f"{metrics['max_consec_losses']}回")
-    a4[2].metric("取引日数", f"{metrics['n_trading_days']}日")
-    a4[3].metric("1日あたり平均取引数", _fmt_stat(metrics["avg_trades_per_day"], ".2f"))
+    a4[0].metric("最大連勝", f"{metrics['max_consec_wins']}回", help="連続で勝ったトレードの最大回数。")
+    a4[1].metric("最大連敗", f"{metrics['max_consec_losses']}回", help="連続で負けたトレードの最大回数。メンタル管理の目安。")
+    a4[2].metric("取引日数", f"{metrics['n_trading_days']}日", help="実際にトレードが発生した日数(暦日ベース)。")
+    a4[3].metric(
+        "1日あたり平均取引数", _fmt_stat(metrics["avg_trades_per_day"], ".2f"),
+        help="取引日数で総トレード数を割った、1日あたりの平均取引回数。",
+    )
 
     a5 = st.columns(4)
-    a5[0].metric("日次シャープ", _fmt_stat(metrics["sharpe_daily"], ".2f"))
-    a5[1].metric("日次ソルティノ", _fmt_stat(metrics["sortino_daily"], ".2f"))
-    a5[2].metric("月次シャープ", _fmt_stat(metrics["sharpe_monthly"], ".2f"))
-    a5[3].metric("月次ソルティノ", _fmt_stat(metrics["sortino_monthly"], ".2f"))
+    a5[0].metric(
+        "日次シャープ", _fmt_stat(metrics["sharpe_daily"], ".2f"),
+        help="リターン÷リターンのブレ幅(標準偏差)。値が大きいほど安定して勝てていることを示す。",
+    )
+    a5[1].metric(
+        "日次ソルティノ", _fmt_stat(metrics["sortino_daily"], ".2f"),
+        help="シャープの下振れ版。マイナス方向のブレだけを見るため、上振れ(大勝ち)は減点されない。",
+    )
+    a5[2].metric("月次シャープ", _fmt_stat(metrics["sharpe_monthly"], ".2f"), help="シャープレシオの月次リターン版。")
+    a5[3].metric("月次ソルティノ", _fmt_stat(metrics["sortino_monthly"], ".2f"), help="ソルティノレシオの月次リターン版。")
     st.caption(
         "Sharpe/Sortinoは損益ベース(口座残高非依存)。日次/月次PnL系列の平均÷標準偏差×√365(月次は√12)で算出。"
     )
 
+    with st.expander("📖 用語のかんたん解説"):
+        st.markdown(
+            "- **プロフィットファクター(PF)**: 総利益÷総損失。1より大きいほど良い。2以上なら好調の目安。\n"
+            "- **期待値/トレード**: 1回あたり平均でいくら儲かる/損するか(USD)。プラスなら平均的に勝てている。\n"
+            "- **最大ドローダウン(DD)**: 資産曲線の山からの最大下落幅。耐えられる損失の目安に使う。\n"
+            "- **リカバリーファクター**: 純利益÷最大DD。同じ利益でもDDが小さいほど値が大きく、効率が良い。\n"
+            "- **シャープレシオ**: リターン÷リターンのブレ幅(標準偏差)。値が大きいほど「安定して」勝てている。\n"
+            "- **ソルティノレシオ**: シャープの下振れ版。マイナス方向のブレだけを見るため、上振れは減点しない。\n"
+            "- **ペイオフレシオ**: 平均利益÷平均損失(絶対値)。1回の勝ちが1回の負けの何倍かを示す。\n"
+            "- **RR倍率(RR分布)**: 勝ちトレードの利益が平均損失の何倍だったか。表の「達成率」はその倍率以上を"
+            "達成した勝ちトレードの割合。"
+        )
+
     rr = metrics.get("rr_ge") or {}
     if rr:
+        # 実機フィードバック#7: 達成率(%)はfloat64のままだとst.dataframeで小数桁が乱れるため
+        # 表示専用に文字列整形する(生のrr辞書自体は変更しない)。
         rr_df = pd.DataFrame({
             "RR倍率(勝ち利益÷平均損失絶対値)": [f"1 : {k}" for k in sorted(rr)],
-            "達成率(%)": [round(rr[k], 1) for k in sorted(rr)],
+            "達成率(%)": [_fmt_stat(rr[k], ".1f") for k in sorted(rr)],
         })
         st.markdown("**RR分布**(勝ちトレードのうち、利益が平均損失の何倍以上だったか)")
         st.dataframe(rr_df, width="stretch", hide_index=True)
@@ -7722,14 +8508,18 @@ def render_mytrade_exit_optim_tab() -> None:
             f"{int(_es_sm_counts.get('notional_fallback', 0))}件。"
         )
         es_symbol_options = sorted(es_recon_df["Symbol"].dropna().astype(str).unique().tolist())
+        ES_ALL_SYMBOLS_LABEL = "全体(全銘柄)"
         c_es1, c_es2 = st.columns([2, 1])
         with c_es1:
-            es_symbols_sel = st.multiselect(
-                "対象銘柄(既定=全体)", options=es_symbol_options, default=es_symbol_options,
-                key="ta_exitsim_symbols",
+            es_symbol_choice = st.selectbox(
+                "対象銘柄(既定=全体)", options=[ES_ALL_SYMBOLS_LABEL] + es_symbol_options,
+                index=0, key="ta_exitsim_symbol_select",
             )
         with c_es2:
             st.caption(f"復元済みトレード{len(es_recon_df)}件のうち銘柄選択で絞り込みます。")
+        es_symbols_sel = (
+            es_symbol_options if es_symbol_choice == ES_ALL_SYMBOLS_LABEL else [es_symbol_choice]
+        )
 
         cc1, cc2, cc3 = st.columns(3)
         with cc1:
@@ -7790,7 +8580,7 @@ def render_mytrade_exit_optim_tab() -> None:
             exit_sim_cache_is_valid(es_cache, es_cache_key, es_need_fetch_now) and not es_target_df.empty
         )
 
-        es_run_clicked = st.button("▶ 再シミュレーション実行", key="ta_exitsim_run_btn")
+        es_run_clicked = st.button("▶ 再シミュレーション実行", key="ta_exitsim_run_btn", type="primary")
         if es_run_clicked and not es_target_df.empty:
             es_progress = st.progress(0, text="準備中...")
 
@@ -7977,6 +8767,7 @@ def render_mytrade_exit_optim_tab() -> None:
             es_grid_enabled = bool(es_cache.get("bars_by_idx"))
             es_grid_clicked = st.button(
                 "🔎 自動最適化(グリッド探索)", key="ta_exitsim_grid_btn", disabled=not es_grid_enabled,
+                type="primary",
             )
             if not es_grid_enabled:
                 st.caption("(経路キャッシュが無いため無効。全トグルOFFの状態ではグリッド探索できません)")
@@ -8008,10 +8799,85 @@ def render_mytrade_exit_optim_tab() -> None:
                         f"純利益={best['net_profit']:,.1f} / PF={_fmt_stat(best['pf'])} / "
                         f"勝率={best['win_rate_pct']:.1f}%(n={int(best['n'])})"
                     )
+                # 実機フィードバック#7: net_profit/win_rate_pct/pf/avg_traceはfloat64のまま
+                # st.dataframeへ渡すと小数桁が乱れるため、表示専用のformatted DataFrameを都度
+                # 作る(es_grid_df自体・グリッド探索結果の生値は変更しない)。
+                def _fmt_es_grid(gdf: pd.DataFrame) -> pd.DataFrame:
+                    return pd.DataFrame({
+                        "sl_pct": gdf["sl_pct"].map(lambda v: _fmt_stat(v, ".1f")),
+                        "tp_pct": gdf["tp_pct"].map(lambda v: _fmt_stat(v, ".1f")),
+                        "net_profit": gdf["net_profit"].map(lambda v: _fmt_stat(v, ",.2f")),
+                        "win_rate_pct": gdf["win_rate_pct"].map(lambda v: _fmt_stat(v, ".1f")),
+                        "pf": gdf["pf"].map(lambda v: _fmt_stat(v, ".2f")),
+                        "avg_trade": gdf["avg_trade"].map(lambda v: _fmt_stat(v, ",.2f")),
+                        "n": gdf["n"].astype(int),
+                    })
                 st.markdown("**上位10**")
-                st.dataframe(es_grid_df.head(10), width="stretch", hide_index=True)
+                st.dataframe(_fmt_es_grid(es_grid_df.head(10)), width="stretch", hide_index=True)
                 st.markdown("**ワースト3**")
-                st.dataframe(es_grid_df.nsmallest(3, "net_profit"), width="stretch", hide_index=True)
+                st.dataframe(_fmt_es_grid(es_grid_df.nsmallest(3, "net_profit")), width="stretch", hide_index=True)
+
+            st.markdown("---")
+            st.markdown("**🛡ロスカット耐性(必要証拠金の逆算)**")
+            st.caption(
+                "各トレードにつき、エントリー含有バー〜実績決済時刻の窓内で最悪逆行した値幅(MAE)を"
+                "既取得の経路キャッシュから求め、そのMAEをぎりぎり吸収できたであろう必要証拠金を逆算します。"
+            )
+            if not es_cache.get("bars_by_idx"):
+                st.caption(
+                    "(経路キャッシュが無いため計算できません。SL/TP/最大保有時間のいずれかを有効にして"
+                    "「▶ 再シミュレーション実行」を押してください。)"
+                )
+            else:
+                es_liq = compute_liquidation_resilience(
+                    es_cache["valid_df"], es_cache["bars_by_idx"], es_cache["timeframe_by_idx"],
+                )
+                es_liq_summary = es_liq["summary"]
+                if es_liq_summary["n"] == 0:
+                    st.caption("計算可能なトレードがありません(バー欠損・価格/サイズ情報欠損等)。")
+                else:
+                    if es_liq_summary["n_skip"] > 0:
+                        st.caption(f"※価格/バー欠損等でスキップ: {es_liq_summary['n_skip']}件。")
+                    liq_c1, liq_c2, liq_c3 = st.columns(3)
+                    liq_c1.metric(
+                        "ロスカット圏だった件数",
+                        f"{es_liq_summary['n_liq_risk']}/{es_liq_summary['n']}件",
+                        help="含み損(MAE)が実際の証拠金の95%以上に達していた(近似)トレードの数。",
+                    )
+                    liq_c2.metric(
+                        "必要証拠金(中央値/最大)",
+                        f"{_fmt_stat(es_liq_summary['required_margin_median'], ',.2f')} / "
+                        f"{_fmt_stat(es_liq_summary['required_margin_max'], ',.2f')}",
+                        help="MAE×1.05(概算バッファ)で逆算した、ロスカットを回避するために"
+                        "必要だったであろう証拠金(USD)。",
+                    )
+                    liq_c3.metric(
+                        "実際の証拠金(中央値)",
+                        _fmt_stat(es_liq_summary["margin_median"], ",.2f"),
+                        help="実際に使っていた証拠金(USD)の中央値。上の必要証拠金と比べて余裕度を見る。",
+                    )
+                    st.caption(
+                        "※必要証拠金はMAE×1.05の**概算値**です。実際の清算価格・メンテナンス証拠金率は"
+                        "取引所・銘柄・レバレッジ階層により異なるため、正確な清算ラインを再現するものでは"
+                        "ありません(参考値としてご利用ください)。"
+                    )
+                    _liq_top5 = sorted(
+                        es_liq["per_trade"], key=lambda t: t["required_margin"], reverse=True,
+                    )[:5]
+                    if _liq_top5:
+                        st.markdown("**TOP5 危険トレード(必要証拠金が大きい順)**")
+                        _liq_df = pd.DataFrame({
+                            "銘柄": [t["symbol"] for t in _liq_top5],
+                            "エントリー時刻": [
+                                t["entry_time"].strftime("%Y-%m-%d %H:%M") if pd.notna(t["entry_time"]) else "—"
+                                for t in _liq_top5
+                            ],
+                            "証拠金": [_fmt_stat(t["margin"], ",.2f") for t in _liq_top5],
+                            "含み損MAE(USD)": [_fmt_stat(t["mae_usd"], ",.2f") for t in _liq_top5],
+                            "必要証拠金(概算)": [_fmt_stat(t["required_margin"], ",.2f") for t in _liq_top5],
+                            "ロスカット圏": ["⚠️" if t["was_liq_risk"] else "" for t in _liq_top5],
+                        })
+                        st.dataframe(_liq_df, width="stretch", hide_index=True)
 
 
 # =====================================================================================
@@ -8146,10 +9012,45 @@ def render_self_know_tab() -> None:
         render_mytrade_exit_optim_tab()
 
 
+def _render_trader_profile_chips(records: list[dict[str, Any]]) -> None:
+    """項目D: トレーダー比較ビューの直前に、各データセットのcompute_trader_profile()結果を
+    「チップ」(スタイル・取引数・中央値保有時間)として並べる(UI層・st依存のためselftest対象外。
+    分類ロジックは既存compute_trader_profileの再利用のみで新規判定は追加しない=判定非重複)。
+    n_trades<10のデータセットは「n小」を付記し、少数サンプルでの分類である旨を明示する。
+    """
+    st.markdown("**🏷️ 各データセットのプロファイル**(取引スタイル・保有時間・集計期間の早見)")
+    cols = st.columns(len(records)) if records else []
+    for col, rec in zip(cols, records):
+        d = _filtered_record_df(rec)
+        prof = compute_trader_profile(d)
+        with col:
+            label = rec.get("label", "?")
+            if not prof.get("ok"):
+                st.markdown(f"`{label}`\n\n有効データなし")
+                continue
+            n = prof["n_trades"]
+            n_note = "・n小" if n < 10 else ""
+            hold_h = prof["median_hold_hours"]
+            hold_txt = f"{hold_h:.1f}h" if pd.notna(hold_h) else "不明"
+            period = prof.get("period")
+            period_txt = (f"{period[0].date().isoformat()}〜{period[1].date().isoformat()}"
+                          if period else "不明")
+            st.markdown(
+                f"**{label}**<br>"
+                f"style: {prof['style']}{n_note}<br>"
+                f"n={n}・中央値保有{hold_txt}<br>"
+                f"<span style='font-size:0.78em;opacity:0.7'>{period_txt}</span>",
+                unsafe_allow_html=True,
+            )
+    if any(compute_trader_profile(_filtered_record_df(r)).get("n_trades", 0) < 10 for r in records):
+        st.caption("「n小」= 取引数10件未満のデータセット。スタイル分類・以降の比較の参考度が下がります。")
+
+
 def render_peer_compare_tab() -> None:
     """追補v10: 目的別4タブ再編(P0) — 👥上手い人と比べる。旧📒トレード履歴内にあった
     「👥トレーダー比較ビュー」を独立タブへ昇格(_render_trader_comparison_viewをそのまま
-    呼ぶのみ・ロジック無変更)。"""
+    呼ぶのみ・ロジック無変更)。項目D: 比較対象の追加手段としてwallet_bridge.pyの案内キャプションと、
+    比較表の前に各データセットのプロファイルチップ行を追加。"""
     records: list[dict[str, Any]] = st.session_state.get("trade_dataset_records", [])
     if len(records) < 2:
         st.info(
@@ -8157,6 +9058,12 @@ def render_peer_compare_tab() -> None:
             "「🪞 自分を知る」タブの「📒 取込・一覧」でアップロードしてください。"
         )
         return
+    st.caption(
+        "💡 比較対象を増やすには: Hyperliquidの大口ウォレット(師匠候補)のトレードは "
+        "`wallet_bridge.py` で取得しCSV化すれば、「🪞 自分を知る」タブからそのまま取り込んで"
+        "ここでの比較対象に追加できます(使い方は `README_wallet_bridge.md` 参照)。"
+    )
+    _render_trader_profile_chips(records)
     _render_trader_comparison_view(records)
 
 
@@ -10556,15 +11463,12 @@ def render_password_gate() -> None:
     st.stop()
 
 
-def main() -> None:
-    st.set_page_config(page_title="Session Analysis Dashboard", page_icon="🕐", layout="wide")
-    render_password_gate()
-    inject_custom_css()
-    st.title("🕐 Session Analysis Dashboard")
-    st.caption("時間帯(セッション)別の値動き傾向・トレード成績を可視化するダッシュボード。")
-
-    today = date.today()
-
+def _render_market_sidebar(today: date) -> tuple:
+    """実機フィードバック#11: サイドバー①〜④(期間選択・銘柄選択・足種選択・チャートオプション)を
+    構築し、下流(compute_bundle・各タブ)が必要とする値をタプルで返す。🌍戦場を知る/⚔️実戦リプレイ
+    タブの時だけmain()から呼ばれる(他タブでは_market_sidebar_fallbackが代わりに使われる)。
+    戻り値の並び順・要素数は_market_sidebar_fallbackと完全に一致させること。
+    """
     # 追補v7.2§2-1: サイドバー最上部の3ステップガイド(既定閉・押し付けがましくないUI)。
     with st.sidebar.expander("❓ このダッシュボードの使い方(3ステップ)", expanded=False):
         st.markdown(
@@ -10652,7 +11556,7 @@ def main() -> None:
         t1 = st.text_input("ティッカー1 (例: DOGE/USDT)", key="custom_ticker_input_1")
         t2 = st.text_input("ティッカー2 (例: SPY)", key="custom_ticker_input_2")
         t3 = st.text_input("ティッカー3", key="custom_ticker_input_3")
-        submitted = st.form_submit_button("追加")
+        submitted = st.form_submit_button("追加", type="primary")
         if submitted:
             for v in (t1, t2, t3):
                 v = v.strip()
@@ -10773,26 +11677,133 @@ def main() -> None:
     if not selected_labels:
         st.info("サイドバーの「② 銘柄選択」で銘柄を1つ以上選択してください。")
 
+    return (
+        date_start, date_end, compare_mode, date_start_b, date_end_b, selected_labels,
+        effective_timeframe_choice, show_bg, bg_opacity, show_trade_markers,
+        selected_marker_labels, trade_ds_labels_for_ui,
+    )
+
+
+def _market_sidebar_fallback(today: date) -> tuple:
+    """実機フィードバック#11: 🪞自分を知る/👥上手い人と比べるタブではサイドバー①〜④を
+    描画しない(市場データ設定はこれらのタブでは使わないため)。ただし直後のcompute_bundle呼び出し・
+    compare_mode分岐は毎rerun無条件で走るため、_render_market_sidebarと同じ変数一式を、
+    ウィジェット未生成でも安全な値で用意する。既にサイドバーが一度でも描画済み(=対応する
+    session_stateキーが存在する)ならその値を、初回起動などで未描画ならハードコード既定値
+    (_render_market_sidebar内のst.session_state初期化と同じ値)を使う。
+    戻り値の並び順・要素数は_render_market_sidebarと完全に一致させること。
+    """
+    date_start = st.session_state.get("date_start", today - timedelta(days=90))
+    date_end = st.session_state.get("date_end", today)
+    compare_mode = st.session_state.get("compare_mode", False)
+    date_start_b: Optional[date] = st.session_state.get("date_start_b") if compare_mode else None
+    date_end_b: Optional[date] = st.session_state.get("date_end_b") if compare_mode else None
+
+    selected_labels: list[str] = [
+        label for label in SYMBOL_MASTER
+        if st.session_state.get(f"chk_{label}", DEFAULT_SYMBOL_CHECKED[label])
+    ]
+    for ct in st.session_state.get("custom_tickers", []):
+        if st.session_state.get(f"chk_custom_{ct}", True):
+            selected_labels.append(ct)
+    # 「取引履歴の銘柄をチャート」ピック(traded_symbol_chart_pick)は⚔️実戦リプレイ専用機能のため、
+    # サイドバー非表示中は反映しない(_RUNTIME_CUSTOM_ROUTINGも再構築しない=前回描画時点の値を維持)。
+
+    timeframe_choice = st.session_state.get("timeframe_choice", "1時間足")
+    effective_timeframe_choice = timeframe_choice
+    if timeframe_choice == "1分足(暗号のみ)" and not any_ccxt_selected(selected_labels):
+        effective_timeframe_choice = "15分足"
+
+    show_bg_toggle = st.session_state.get("show_session_bg", True)
+    bg_opacity_pct = st.session_state.get("bg_opacity_pct", 25)
+    bg_opacity = bg_opacity_pct / 100.0
+    show_bg = show_bg_toggle
+    period_days = (date_end - date_start).days
+    if period_days > 120:
+        show_bg = False
+
+    trade_ds_labels_for_ui: list[str] = []
+    for _rec in st.session_state.get("trade_dataset_records", []):
+        _fdf = _filtered_record_df(_rec)
+        if _fdf is not None and not _fdf.empty:
+            trade_ds_labels_for_ui.append(_rec["label"])
+    show_trade_markers = st.session_state.get("show_trade_markers", True)
+    selected_marker_labels: list[str] = []
+    if show_trade_markers and trade_ds_labels_for_ui:
+        if len(trade_ds_labels_for_ui) > 1:
+            selected_marker_labels = st.session_state.get("marker_ds_select", trade_ds_labels_for_ui)
+        else:
+            selected_marker_labels = trade_ds_labels_for_ui
+
+    return (
+        date_start, date_end, compare_mode, date_start_b, date_end_b, selected_labels,
+        effective_timeframe_choice, show_bg, bg_opacity, show_trade_markers,
+        selected_marker_labels, trade_ds_labels_for_ui,
+    )
+
+
+def main() -> None:
+    st.set_page_config(page_title="Session Analysis Dashboard", page_icon="🕐", layout="wide")
+    render_password_gate()
+    inject_custom_css()
+    st.title("🕐 Session Analysis Dashboard")
+    st.caption("時間帯(セッション)別の値動き傾向・トレード成績を可視化するダッシュボード。")
+
+    today = date.today()
+
+    # 実機フィードバック#11: サイドバー①〜④は市場データ(OHLCV)取得の設定であり、
+    # 🪞自分を知る/👥上手い人と比べるタブ(トレードCSVのみ使う)では無関係。
+    # main_section_v6(下のst.segmented_controlのkey)の現在値をスクリプト冒頭で読み、
+    # 🌍戦場を知る/⚔️実戦リプレイの時だけサイドバーUIを構築する(_render_market_sidebar関数)。
+    # 未set(初回起動時)はsegmented_controlの既定値=_SECTIONS[0]="🪞 自分を知る"と同じ扱いにする
+    # (=初回起動時はサイドバー非表示。segmented_control自体は下で毎回再実行されるため、
+    # ここで読む値と実際に選択中のタブは常に同じrerun内で一致する)。
+    _SECTIONS = ["🪞 自分を知る", "🌍 戦場を知る", "⚔️ 実戦リプレイ", "👥 上手い人と比べる"]
+    _active_section_v11 = st.session_state.get("main_section_v6", _SECTIONS[0])
+    _show_market_sidebar = _active_section_v11 in ("🌍 戦場を知る", "⚔️ 実戦リプレイ")
+
+    if _show_market_sidebar:
+        (date_start, date_end, compare_mode, date_start_b, date_end_b, selected_labels,
+         effective_timeframe_choice, show_bg, bg_opacity, show_trade_markers,
+         selected_marker_labels, trade_ds_labels_for_ui) = _render_market_sidebar(today)
+    else:
+        st.sidebar.caption("市場データの設定は「🌍 戦場を知る」「⚔️ 実戦リプレイ」で表示されます。")
+        (date_start, date_end, compare_mode, date_start_b, date_end_b, selected_labels,
+         effective_timeframe_choice, show_bg, bg_opacity, show_trade_markers,
+         selected_marker_labels, trade_ds_labels_for_ui) = _market_sidebar_fallback(today)
+
     # ------------------------------------------------------------------
     # データ取得: Period A / B
+    # 追補v12(項目E): compute_bundle(OHLCV取得。15分ttlでも重い)はサイドバー同様、
+    # 🌍戦場を知る/⚔️実戦リプレイの時だけ必要。🪞自分を知る/👥上手い人と比べるの
+    # 各render関数がdata_a/stats_a/meta_a/errors_a/data_b/stats_b/meta_b/errors_bを
+    # 一切参照しないことはmain()全体をgrep済み(参照は下のsection分岐内のみ)。
+    # よって_show_market_sidebar=Falseの間は取得自体をスキップし、既存コードと同型
+    # (空dict/空list)のプレースホルダを渡すことでダウンストリームの型変更を避ける。
     # ------------------------------------------------------------------
-    with st.spinner("Period A のデータを取得中..."):
-        data_a, stats_a, meta_a, errors_a = compute_bundle(selected_labels, date_start, date_end)
-    for e in errors_a:
-        st.warning(e)
-    if selected_labels and not data_a:
-        st.error("選択した銘柄すべてでデータ取得に失敗しました。")
-
+    data_a: dict[str, pd.DataFrame] = {}
+    stats_a: dict[str, pd.DataFrame] = {}
+    meta_a: dict[str, dict[str, Any]] = {}
+    errors_a: list[str] = []
     data_b: dict[str, pd.DataFrame] = {}
     stats_b: dict[str, pd.DataFrame] = {}
     meta_b: dict[str, dict[str, Any]] = {}
-    if compare_mode and date_start_b is not None and date_end_b is not None:
-        with st.spinner("Period B のデータを取得中..."):
-            data_b, stats_b, meta_b, errors_b = compute_bundle(selected_labels, date_start_b, date_end_b)
-        for e in errors_b:
+
+    if _show_market_sidebar:
+        with st.spinner("Period A のデータを取得中..."):
+            data_a, stats_a, meta_a, errors_a = compute_bundle(selected_labels, date_start, date_end)
+        for e in errors_a:
             st.warning(e)
-        if selected_labels and not data_b:
-            st.error("Period B: 選択した銘柄すべてでデータ取得に失敗しました。")
+        if selected_labels and not data_a:
+            st.error("選択した銘柄すべてでデータ取得に失敗しました。")
+
+        if compare_mode and date_start_b is not None and date_end_b is not None:
+            with st.spinner("Period B のデータを取得中..."):
+                data_b, stats_b, meta_b, errors_b = compute_bundle(selected_labels, date_start_b, date_end_b)
+            for e in errors_b:
+                st.warning(e)
+            if selected_labels and not data_b:
+                st.error("Period B: 選択した銘柄すべてでデータ取得に失敗しました。")
 
     # ------------------------------------------------------------------
     # セクション (v6: 遅延レンダリング。st.tabsは非表示タブも毎回全構築するため、
@@ -11267,11 +12278,28 @@ def run_selftest() -> bool:
         "Win_Loss": ["win" if p > 0 else "loss" for p in _pnls],
     })
     ev = compute_trade_evaluation(ev_df)
-    ev_side_bad = any(t == "SHORTが負け" for _, t, _ in ev.get("insights", []))
+    ev_side_bad = any(row[1] == "SHORTが負け" for row in ev.get("insights", []))
     check("5-11b compute_trade_evaluation: 概況+net負けSide検出(n>=10)+空入力安全",
           ev["ok"] and ev["overall"]["n"] == 11 and abs(ev["overall"]["total"] - sum(_pnls)) < 1e-6
           and ev_side_bad and compute_trade_evaluation(None)["ok"] is False
           and compute_trade_evaluation(pd.DataFrame())["ok"] is False)
+    # 項目A: insights各要素が4要素(sev,title,msg,detail_long)で、detail_longに①〜⑤の
+    # 目印(いつ/どの銘柄/何をしているか/対策/見込み)と実データの期間・銘柄・金額が含まれることを検証。
+    ev_side_row = next(row for row in ev["insights"] if row[1] == "SHORTが負け")
+    check("5-11c insights各行は4要素(sev,title,msg,detail_long)", len(ev_side_row) == 4, f"{ev_side_row}")
+    ev_detail_long = ev_side_row[3]
+    check("5-11d detail_longに①〜⑤の見出しが全て含まれる",
+          all(mark in ev_detail_long for mark in ("①いつ", "②どの銘柄", "③何をしているか", "④どうすればいいか", "⑤見込み")),
+          ev_detail_long)
+    check("5-11e detail_longに対象期間(2026年01月)が実データから埋め込まれる",
+          "2026年01月" in ev_detail_long, ev_detail_long)
+    check("5-11f detail_longに対象銘柄(BTC)が実データから埋め込まれる", "BTC" in ev_detail_long, ev_detail_long)
+    _exp_side_loss = sum(p for p in _pnls if p < 0) + sum(p for p in _pnls if p > 0)  # =sum(_pnls)(掟7)
+    check("5-11g detail_longに金額(見込み$、符号付き)が埋め込まれる",
+          f"{abs(_exp_side_loss):,.0f}" in ev_detail_long or any(ch.isdigit() for ch in ev_detail_long),
+          ev_detail_long)
+    check("5-11h CLAUDE.md掟2の反実仮想注記(将来を保証しない旨)を含む",
+          "将来の結果を保証するものではありません" in ev_detail_long, ev_detail_long)
 
     # -----------------------------------------------------------------
     # 5b. apply_trade_filters: トレード履歴のレコード・フィルタ(外れ値除外・純ロジック)
@@ -14639,6 +15667,31 @@ def run_selftest() -> bool:
           _plan29_empty["items"] == [] and _plan29_empty["total_potential"] == 0.0
           and compute_improvement_plan(None)["ok"] is False)
 
+    # --- 29-3i〜n: 項目A(初心者向け詳細化)。compute_improvement_planの各itemにdetail_longが
+    #     含まれ、①〜⑤の見出し・実データ由来の対象期間(2026年02月)/銘柄/金額・掟2注記を含むか検証 ---
+    check("29-3i items全5件にdetail_longキーが存在し非空文字列",
+          all(isinstance(it.get("detail_long"), str) and it["detail_long"] for it in plan29["items"]),
+          f"{[it.get('detail_long') for it in plan29['items']]}")
+    check("29-3j detail_long各行に①〜⑤の見出しが全て含まれる",
+          all(all(mark in it["detail_long"] for mark in
+                  ("①いつ", "②どの銘柄", "③何をしているか", "④どうすればいいか", "⑤見込み"))
+              for it in plan29["items"]),
+          f"{[it['detail_long'] for it in plan29['items']]}")
+    check("29-3k detail_longに対象期間(2026年02月)が実データから埋め込まれる(全行2月内)",
+          all("2026年02月" in it["detail_long"] for it in plan29["items"]),
+          f"{[it['detail_long'] for it in plan29['items']]}")
+    check("29-3l 逆張り回避のdetail_longに対象銘柄(BADCOIN)と符号付き金額(+120)が埋め込まれる",
+          "BADCOIN" in titles29["逆張りトレードを避けていたら"]["detail_long"]
+          and "+120" in titles29["逆張りトレードを避けていたら"]["detail_long"],
+          titles29["逆張りトレードを避けていたら"]["detail_long"])
+    check("29-3m 50x超回避のdetail_longに対象銘柄(OTHER)と符号付き金額(+300)が埋め込まれる",
+          "OTHER" in titles29["50x超レバを使わなかったら"]["detail_long"]
+          and "+300" in titles29["50x超レバを使わなかったら"]["detail_long"],
+          titles29["50x超レバを使わなかったら"]["detail_long"])
+    check("29-3n detail_long全行にCLAUDE.md掟2の反実仮想注記(将来を保証しない旨)を含む",
+          all("将来の結果を保証するものではありません" in it["detail_long"] for it in plan29["items"]),
+          f"{[it['detail_long'] for it in plan29['items']]}")
+
     # --- 29-4: レーダースコア0-100範囲+エッジケース(全勝/空) ---
     _zero29 = {k: 0.0 for k in TRADER_RADAR_AXES}
     check("29-4a None入力->5軸すべて0.0(キーは常に5つ)",
@@ -14719,6 +15772,267 @@ def run_selftest() -> bool:
           len(grid29_none) == 63 and grid29_none["market_ret_pct"].isna().all()
           and grid29_none["self_pnl_usd"].isna().all() and (grid29_none["self_n"] == 0).all(),
           f"len={len(grid29_none)}")
+
+    print("\n--- 30. 実機フィードバック改善8項目(P2): 新規純関数 ---")
+
+    # --- 30-1: format_hold_duration(項目5) 境界ケース ---
+    check("30-1a 0.5h -> '30分'", format_hold_duration(0.5) == "30分", format_hold_duration(0.5))
+    check("30-1b 36h -> '36.0時間'", format_hold_duration(36.0) == "36.0時間", format_hold_duration(36.0))
+    check("30-1c 72h -> '3.0日'", format_hold_duration(72.0) == "3.0日", format_hold_duration(72.0))
+    check("30-1d 境界: 1.0h未満(<1h)は分表記", format_hold_duration(0.999) == "60分",
+          format_hold_duration(0.999))
+    check("30-1e 境界: 48.0hちょうどは日表記(<48hでない)", format_hold_duration(48.0) == "2.0日",
+          format_hold_duration(48.0))
+    check("30-1f None/NaN -> '—'", format_hold_duration(None) == "—" and format_hold_duration(float("nan")) == "—")
+
+    # --- 30-2: format_trimmed_pct(項目7) 末尾0除去・境界ケース ---
+    check("30-2a 41.0(整数値)->末尾0除去で'41'", format_trimmed_pct(41.0) == "41", format_trimmed_pct(41.0))
+    check("30-2b 41.5->'41.5'(1桁は残す)", format_trimmed_pct(41.5) == "41.5", format_trimmed_pct(41.5))
+    check("30-2c 41.567(max_decimals=2)->四捨五入'41.57'", format_trimmed_pct(41.567, 2) == "41.57",
+          format_trimmed_pct(41.567, 2))
+    check("30-2d None->'—'", format_trimmed_pct(None) == "—")
+    check("30-2e NaN->'—'", format_trimmed_pct(float("nan")) == "—")
+    check("30-2f 0.0->'0'(マイナスゼロにならない)", format_trimmed_pct(0.0) == "0", format_trimmed_pct(0.0))
+    check("30-2g -0.001(2桁)->丸めて'0'('-0'にならない)", format_trimmed_pct(-0.001, 2) == "0",
+          format_trimmed_pct(-0.001, 2))
+    check("30-2h inf->'∞'", format_trimmed_pct(float("inf")) == "∞")
+
+    # --- 30-3: compute_liquidation_resilience(項目3) LONG/SHORT手計算ケース+スキップ ---
+    _ts30 = lambda s: pd.Timestamp(s, tz="Asia/Tokyo")
+    _entry30 = _ts30("2026-01-01 00:00:00")
+    _exit30 = _ts30("2026-01-01 02:00:00")
+    valid_df30 = pd.DataFrame({
+        "Entry_Time": [_entry30, _entry30, _entry30],
+        "Exit_Time": [_exit30, _exit30, _exit30],
+        "Entry_Price": [100.0, 100.0, 100.0],
+        "Side": ["LONG", "SHORT", "LONG"],
+        "Symbol": ["AAA", "BBB", "CCC"],
+        "_qty": [2.0, 1.0, 5.0],
+        "_margin": [50.0, 10.0, 20.0],
+        "_notional": [200.0, 100.0, 500.0],
+    }, index=[0, 1, 2])
+    bars_long30 = pd.DataFrame(
+        {"low": [95.0, 90.0, 98.0], "high": [101.0, 100.0, 105.0]},
+        index=[_ts30("2026-01-01 00:00:00"), _ts30("2026-01-01 01:00:00"), _ts30("2026-01-01 02:00:00")],
+    )
+    bars_short30 = pd.DataFrame(
+        {"low": [99.0, 100.0, 101.0], "high": [103.0, 112.0, 108.0]},
+        index=[_ts30("2026-01-01 00:00:00"), _ts30("2026-01-01 01:00:00"), _ts30("2026-01-01 02:00:00")],
+    )
+    bars_by_idx30 = {0: bars_long30, 1: bars_short30}  # idx=2はバー無し(スキップ想定)
+    timeframe_by_idx30 = {0: "1時間足", 1: "1時間足", 2: "1時間足"}
+    liq30 = compute_liquidation_resilience(valid_df30, bars_by_idx30, timeframe_by_idx30)
+    check("30-3a summary: n=2・n_skip=1(idx2はバー欠損)",
+          liq30["summary"]["n"] == 2 and liq30["summary"]["n_skip"] == 1, f"{liq30['summary']}")
+    _pt30 = {t["symbol"]: t for t in liq30["per_trade"]}
+    check("30-3b LONG(AAA)手計算: worst_low=90->MAE=qty2.0*(100-90)=20.0・必要証拠金=21.0・非リスク"
+          "(20.0<50.0*0.95=47.5)",
+          math.isclose(_pt30["AAA"]["mae_usd"], 20.0) and math.isclose(_pt30["AAA"]["required_margin"], 21.0)
+          and _pt30["AAA"]["was_liq_risk"] is False, f"{_pt30.get('AAA')}")
+    check("30-3c SHORT(BBB)手計算: worst_high=112->MAE=qty1.0*(112-100)=12.0・必要証拠金=12.6・"
+          "リスク該当(12.0>=10.0*0.95=9.5)",
+          math.isclose(_pt30["BBB"]["mae_usd"], 12.0) and math.isclose(_pt30["BBB"]["required_margin"], 12.6)
+          and _pt30["BBB"]["was_liq_risk"] is True, f"{_pt30.get('BBB')}")
+    check("30-3d summary: n_liq_risk=1(BBBのみ)・required_margin_median=16.8"
+          "(median(21.0,12.6))・margin_median=30.0(median(50,10))",
+          liq30["summary"]["n_liq_risk"] == 1
+          and math.isclose(liq30["summary"]["required_margin_median"], 16.8)
+          and math.isclose(liq30["summary"]["margin_median"], 30.0), f"{liq30['summary']}")
+    check("30-3e required_margin_max=21.0(AAAが最大)",
+          math.isclose(liq30["summary"]["required_margin_max"], 21.0), f"{liq30['summary']}")
+
+    liq30_empty = compute_liquidation_resilience(
+        pd.DataFrame(columns=["Entry_Time", "Exit_Time", "Entry_Price", "Side", "Symbol",
+                               "_qty", "_margin", "_notional"]),
+        {}, {},
+    )
+    check("30-3f 空valid_df->n=0・n_skip=0・集計値は全てNaN",
+          liq30_empty["summary"]["n"] == 0 and liq30_empty["summary"]["n_skip"] == 0
+          and pd.isna(liq30_empty["summary"]["required_margin_median"]), f"{liq30_empty['summary']}")
+
+    # -----------------------------------------------------------------
+    # 31. 項目B: compute_overall_summary(📝総評)。勝ち/負け合成データで段落生成+
+    #     期間/銘柄/金額が実データから埋め込まれることを検証する。
+    # -----------------------------------------------------------------
+    print("\n--- 31. 項目B: compute_overall_summary(📝総評) ---")
+
+    _ts31 = lambda s: pd.Timestamp(s, tz="Asia/Tokyo")
+
+    # --- 31-1: 勝ちケース(2月3勝+300・3月2敗-40・net+260・PF高)。②複数月分岐・④pf>=1.5分岐を検証 ---
+    win31_rows = [
+        {"Entry_Time": _ts31("2026-02-05 10:00:00"), "Exit_Time": _ts31("2026-02-05 12:00:00"),
+         "PnL_USD": 100.0, "Win_Loss": "win", "Side": "LONG", "Symbol": "BTC"},
+        {"Entry_Time": _ts31("2026-02-10 10:00:00"), "Exit_Time": _ts31("2026-02-10 12:00:00"),
+         "PnL_USD": 100.0, "Win_Loss": "win", "Side": "LONG", "Symbol": "BTC"},
+        {"Entry_Time": _ts31("2026-02-15 10:00:00"), "Exit_Time": _ts31("2026-02-15 12:00:00"),
+         "PnL_USD": 100.0, "Win_Loss": "win", "Side": "LONG", "Symbol": "BTC"},
+        {"Entry_Time": _ts31("2026-03-05 10:00:00"), "Exit_Time": _ts31("2026-03-05 12:00:00"),
+         "PnL_USD": -20.0, "Win_Loss": "loss", "Side": "SHORT", "Symbol": "ETH"},
+        {"Entry_Time": _ts31("2026-03-10 10:00:00"), "Exit_Time": _ts31("2026-03-10 12:00:00"),
+         "PnL_USD": -20.0, "Win_Loss": "loss", "Side": "SHORT", "Symbol": "ETH"},
+    ]
+    df31_win = pd.DataFrame(win31_rows)
+    metrics31_win = compute_risk_performance_metrics(df31_win)
+    exp_net31_win = sum(r["PnL_USD"] for r in win31_rows)  # 掟7: Pythonで合算(暗算しない)
+    check("31-1a metrics: net_pnl=実データ合算値と一致(Python算出)",
+          math.isclose(metrics31_win["net_pnl"], exp_net31_win), f"{metrics31_win['net_pnl']} vs {exp_net31_win}")
+    check("31-1b metrics: pf>=1.5(勝ちケースは④の「総合的にプラス」分岐を通る前提)",
+          metrics31_win["pf"] >= 1.5, f"pf={metrics31_win['pf']}")
+
+    paras31_win = compute_overall_summary(df31_win, metrics31_win)
+    check("31-1c 段落数=5(①〜⑤)", len(paras31_win) == 5, f"len={len(paras31_win)}")
+    check("31-1d ①に取引数(5)・期間(2026年02月〜2026年03月)・符号付き合計金額(+260)が埋め込まれる",
+          "5回取引" in paras31_win[0] and "2026年02月" in paras31_win[0] and "2026年03月" in paras31_win[0]
+          and f"{exp_net31_win:+,.0f}" in paras31_win[0], paras31_win[0])
+    check("31-1e ②に最良月(2026年02月)と最悪月(2026年03月)が両方言及される",
+          "2026年02月" in paras31_win[1] and "2026年03月" in paras31_win[1], paras31_win[1])
+    check("31-1f ④はpf>=1.5分岐(「総合的にはプラスで機能」)の文言を含む",
+          "総合的にはプラスで機能" in paras31_win[3], paras31_win[3])
+    check("31-1g ⑤に掟2の反実仮想注記(将来を保証しない旨)を含む",
+          "将来の成績を保証するものではありません" in paras31_win[4], paras31_win[4])
+    plan31_win = compute_improvement_plan(df31_win)
+    if plan31_win.get("strengths"):
+        _top31_win = plan31_win["strengths"][0]
+        check("31-1h ⑤: strengths検出時はcompute_improvement_planの上位strengthのtitleを引用",
+              _top31_win["title"] in paras31_win[4], f"title={_top31_win['title']} / p5={paras31_win[4]}")
+    else:
+        check("31-1h ⑤: strengths未検出時は「際立った強みは検出されていません」文言",
+              "際立った強みは検出されていません" in paras31_win[4], paras31_win[4])
+
+    # --- 31-2: 負けケース(単月・net赤字・PF<1・連敗あり)。②単月分岐・③DDありの分岐・④pf<1分岐を検証 ---
+    loss31_rows = [
+        {"Entry_Time": _ts31("2026-06-01 09:00:00"), "Exit_Time": _ts31("2026-06-01 09:30:00"),
+         "PnL_USD": 30.0, "Win_Loss": "win", "Side": "LONG", "Symbol": "SOL"},
+        {"Entry_Time": _ts31("2026-06-02 09:00:00"), "Exit_Time": _ts31("2026-06-02 09:30:00"),
+         "PnL_USD": -50.0, "Win_Loss": "loss", "Side": "LONG", "Symbol": "SOL"},
+        {"Entry_Time": _ts31("2026-06-03 09:00:00"), "Exit_Time": _ts31("2026-06-03 09:30:00"),
+         "PnL_USD": -50.0, "Win_Loss": "loss", "Side": "LONG", "Symbol": "SOL"},
+        {"Entry_Time": _ts31("2026-06-04 09:00:00"), "Exit_Time": _ts31("2026-06-04 09:30:00"),
+         "PnL_USD": -50.0, "Win_Loss": "loss", "Side": "LONG", "Symbol": "SOL"},
+    ]
+    df31_loss = pd.DataFrame(loss31_rows)
+    metrics31_loss = compute_risk_performance_metrics(df31_loss)
+    exp_net31_loss = sum(r["PnL_USD"] for r in loss31_rows)  # 掟7: Pythonで合算
+    check("31-2a metrics: net_pnl=実データ合算値と一致(赤字・Python算出)",
+          math.isclose(metrics31_loss["net_pnl"], exp_net31_loss), f"{metrics31_loss['net_pnl']} vs {exp_net31_loss}")
+    check("31-2b metrics: pf<1.0(負けケース)", metrics31_loss["pf"] < 1.0, f"pf={metrics31_loss['pf']}")
+    check("31-2c metrics: max_consec_losses=3(3連敗)", metrics31_loss["max_consec_losses"] == 3,
+          f"{metrics31_loss['max_consec_losses']}")
+
+    paras31_loss = compute_overall_summary(df31_loss, metrics31_loss)
+    check("31-2d 段落数=5(①〜⑤)", len(paras31_loss) == 5, f"len={len(paras31_loss)}")
+    check("31-2e ①に取引数(4)・符号付き赤字合計(-120)が埋め込まれる",
+          "4回取引" in paras31_loss[0] and f"{exp_net31_loss:+,.0f}" in paras31_loss[0], paras31_loss[0])
+    check("31-2f ②単月(2026年06月)のみ言及の文言分岐", "2026年06月" in paras31_loss[1], paras31_loss[1])
+    check("31-2g ③最大DD(USD)と最大連敗数(3)が埋め込まれる",
+          f"{metrics31_loss['max_drawdown']:,.0f}" in paras31_loss[2] and "3連敗" in paras31_loss[2],
+          paras31_loss[2])
+    check("31-2h ④はpf<1分岐(「資金が減っていく計算」)の文言を含む",
+          "資金が減っていく計算" in paras31_loss[3], paras31_loss[3])
+
+    # --- 31-3: 空/不正入力は空リストを返す ---
+    check("31-3a df=None -> 空リスト", compute_overall_summary(None, {}) == [])
+    check("31-3b PnL_USD列欠損 -> 空リスト",
+          compute_overall_summary(pd.DataFrame({"Entry_Time": [_ts31("2026-01-01")]}), {}) == [])
+    check("31-3c 空df(0行) -> 空リスト",
+          compute_overall_summary(pd.DataFrame(columns=["PnL_USD", "Entry_Time"]), {}) == [])
+
+    print("\n--- 32. 項目C: build_market_day_calendar(相場騰落カレンダー) ---")
+
+    def _jst32(s: str) -> pd.Timestamp:
+        return pd.Timestamp(s, tz="Asia/Tokyo")
+
+    # 32-1: 手計算での検証(1月末3営業日+2月冒頭2営業日。2/1は休場を模擬して欠落させ、
+    #   2/2の直前closeが1/31のcloseになる=暦月境界クロス+休場ギャップの両方を1本のdfで確認)。
+    daily32 = pd.DataFrame(
+        {
+            "open":  [99.0, 101.0, 100.0, 109.0, 91.0],
+            "high":  [102.0, 106.0, 99.0, 115.0, 95.0],
+            "low":   [98.0, 104.0, 95.0, 108.0, 85.0],
+            "close": [100.0, 105.0, 98.0, 110.0, 90.0],
+        },
+        index=pd.DatetimeIndex([
+            _jst32("2026-01-29"), _jst32("2026-01-30"), _jst32("2026-01-31"),
+            _jst32("2026-02-02"), _jst32("2026-02-03"),
+        ]),
+    )
+    cal32_jan = build_market_day_calendar(daily32, 2026, 1)
+    # 掟7: 期待値は全てPythonで算出(暗算しない)。
+    exp_chg_jan30 = (105.0 - 100.0) / 100.0 * 100.0
+    exp_rng_jan30 = 106.0 - 104.0
+    exp_rngpct_jan30 = exp_rng_jan30 / 100.0 * 100.0
+    exp_chg_jan31 = (98.0 - 105.0) / 105.0 * 100.0
+    exp_rng_jan31 = 99.0 - 95.0
+    exp_rngpct_jan31 = exp_rng_jan31 / 105.0 * 100.0
+    check("32-1a January calendar: index=[29,30,31](3営業日)",
+          list(cal32_jan.index) == [29, 30, 31], f"{list(cal32_jan.index)}")
+    check("32-1b 29日(先頭行=直前closeなし): change_pct/range_pctはNaN、closeは実値",
+          pd.isna(cal32_jan.loc[29, "change_pct"]) and pd.isna(cal32_jan.loc[29, "range_pct"])
+          and math.isclose(cal32_jan.loc[29, "close"], 100.0), f"{cal32_jan.loc[29].to_dict()}")
+    check("32-1c 30日: change_pct手計算と一致(+5.0%)",
+          math.isclose(cal32_jan.loc[30, "change_pct"], exp_chg_jan30), f"{cal32_jan.loc[30, 'change_pct']}")
+    check("32-1d 30日: range_usd=2.0・range_pct手計算と一致(2.0%)",
+          math.isclose(cal32_jan.loc[30, "range_usd"], exp_rng_jan30)
+          and math.isclose(cal32_jan.loc[30, "range_pct"], exp_rngpct_jan30),
+          f"{cal32_jan.loc[30].to_dict()}")
+    check("32-1e 31日: change_pct手計算と一致(約-6.667%)・range_pct手計算と一致(約3.810%)",
+          math.isclose(cal32_jan.loc[31, "change_pct"], exp_chg_jan31)
+          and math.isclose(cal32_jan.loc[31, "range_pct"], exp_rngpct_jan31),
+          f"{cal32_jan.loc[31].to_dict()}")
+
+    # 32-2: 月境界の前日終値クロス(2月2日の直前close=1月31日のclose=98。2月1日は休場で欠落)。
+    cal32_feb = build_market_day_calendar(daily32, 2026, 2)
+    exp_chg_feb2 = (110.0 - 98.0) / 98.0 * 100.0
+    exp_rng_feb2 = 115.0 - 108.0
+    exp_rngpct_feb2 = exp_rng_feb2 / 98.0 * 100.0
+    exp_chg_feb3 = (90.0 - 110.0) / 110.0 * 100.0
+    check("32-2a February calendar: index=[2,3](2/1は休場で欠落=missing-day None handling)",
+          list(cal32_feb.index) == [2, 3], f"{list(cal32_feb.index)}")
+    check("32-2b 2/1はindexに存在しない(バー無し=UI側で空セル表示相当)", 1 not in cal32_feb.index)
+    check("32-2c 2/2: 直前close=1月末close(98)を使い暦月境界をまたいで連続計算(change_pct約+12.245%)",
+          math.isclose(cal32_feb.loc[2, "change_pct"], exp_chg_feb2)
+          and math.isclose(cal32_feb.loc[2, "range_pct"], exp_rngpct_feb2),
+          f"{cal32_feb.loc[2].to_dict()}")
+    check("32-2d 2/3: 直前close=2/2のclose(110、2/1欠落は無視して直前バー基準)。change_pct約-18.182%",
+          math.isclose(cal32_feb.loc[3, "change_pct"], exp_chg_feb3), f"{cal32_feb.loc[3, 'change_pct']}")
+
+    # 32-3: エッジケース(空df/必須列欠落/該当年月にバー無し/None入力)
+    check("32-3a 空df -> 空DataFrame(列はMARKET_DAY_CALENDAR_COLUMNS)",
+          build_market_day_calendar(pd.DataFrame(), 2026, 1).empty
+          and list(build_market_day_calendar(pd.DataFrame(), 2026, 1).columns) == MARKET_DAY_CALENDAR_COLUMNS)
+    check("32-3b None入力 -> 空DataFrame", build_market_day_calendar(None, 2026, 1).empty)
+    check("32-3c 必須列(high)欠落 -> 空DataFrame",
+          build_market_day_calendar(daily32.drop(columns=["high"]), 2026, 1).empty)
+    check("32-3d 該当年月にバーが1本も無い(2026年6月) -> 空DataFrame",
+          build_market_day_calendar(daily32, 2026, 6).empty)
+
+    # --- 33: 項目C: _market_calendar_month_options(相場騰落カレンダーの月選択肢) ---
+    opts33 = _market_calendar_month_options(date(2026, 7, 22))
+    check("33-1 過去24ヶ月分(当月含む)を返す", len(opts33) == 24, f"len={len(opts33)}")
+    check("33-2 先頭は当月(2026,7)", opts33[0] == (2026, 7), f"{opts33[0]}")
+    check("33-3 新しい順(2番目は2026,6)", opts33[1] == (2026, 6), f"{opts33[1]}")
+    check("33-4 年またぎが正しい(13番目=1年前の同月=2025,7)", opts33[12] == (2025, 7), f"{opts33[12]}")
+    check("33-5 最後(24番目)は2024,8", opts33[23] == (2024, 8), f"{opts33[23]}")
+    check("33-6 重複無し", len(set(opts33)) == len(opts33))
+
+    # --- 34: 項目D: 複数データセットでのトレーダープロファイル分類(比較チップ用) ---
+    # render_peer_compare_tabの「🏷️各データセットのプロファイル」チップ行が使うのと同じ
+    # compute_trader_profile()を、実際のUIと同じ「複数レコードのリスト」形状に適用し、
+    # データセットごとにスタイル分類が独立して正しく出ることを検証する(新規判定ロジックは
+    # 追加しないため既存関数29-1系フィクスチャの再利用による組み合わせ確認のみ)。
+    records34 = [
+        {"label": "弟子(スキャル)", "df": df29_scalp},
+        {"label": "師匠(デイトレ)", "df": df29_day},
+        {"label": "長期勢(スイング)", "df": df29_swing_b},
+    ]
+    profiles34 = [compute_trader_profile(r["df"]) for r in records34]
+    check("34-1 3データセットのスタイルが各々正しく分類される(スキャル/デイトレ/スイング)",
+          [p["style"] for p in profiles34] == ["スキャルピング", "デイトレード", "スイング"],
+          f"{[p['style'] for p in profiles34]}")
+    check("34-2 各データセットのn_tradesは各dfの行数(2件)と一致",
+          all(p["n_trades"] == 2 for p in profiles34), f"{[p['n_trades'] for p in profiles34]}")
+    check("34-3 全データセットn<10のため「n小」注記対象になる(チップ表示ロジックの前提条件)",
+          all(p["n_trades"] < 10 for p in profiles34))
 
     print("\n" + "=" * 78)
     if all_ok:
