@@ -674,9 +674,13 @@ def _is_bingx_transaction_history(cols) -> bool:
 
 def reconstruct_bingx_order_history(df: pd.DataFrame) -> tuple[pd.DataFrame, list[tuple[str, str]]]:
     """BingX注文履歴(Open/Close個別約定)→往復トレードへ再構築。
-    ポジション会計: Openで数量・加重平均建値・建玉時刻を集約、CloseでRealized PNLを確定損益とし、
-    エントリー=集約平均建値/建玉時刻、エグジット=当該Closeの約定価格/時刻で1トレードを発行する
+    ポジション会計: Openで数量・加重平均建値を集約、CloseでRealized PNLを確定損益とし、
+    エントリー価格=集約平均建値、エグジット=当該Closeの約定価格/時刻で1トレードを発行する
     (部分決済は複数トレードになる=各実現イベントが1トレード)。ヘッジ(Long/Short)は別建玉。
+    追補v13: **建玉時刻(Entry_Time)はLIFO対当**=新しいロットから先に消費した数量加重平均。
+    旧実装(ポジション初回建玉時刻を全クローズへ割当)はコア建玉を残したままスキャルすると
+    数分の取引が数週間保有と誤表示された(実データでBTC 0.0091コア39日+周辺スキャル百件超を
+    確認)。価格・PnLはブローカーのRealized PNLと整合する平均建値会計のまま。
     時刻はUTC+8→JST(+1h)。損益はRealized PNL列(手数料別)。
     Quantity列(追補v9.1: レビュー反映)=当該決済(Close)の実約定数量(cq=min(決済数量,残玉数量))。
     建玉前クローズ(orphan)行はエントリー情報が無くQuantityも算出不能なためNoneを入れる。
@@ -724,12 +728,15 @@ def reconstruct_bingx_order_history(df: pd.DataFrame) -> tuple[pd.DataFrame, lis
         t = r["_t"]
         key = (str(pair), side)
         if act == "Open":
-            st_ = pos.setdefault(key, {"qty": 0.0, "cost": 0.0, "open_time": t, "lev": lev})
+            st_ = pos.setdefault(key, {"qty": 0.0, "cost": 0.0, "open_time": t, "lev": lev, "lots": []})
             if st_["qty"] <= 1e-12:
                 st_["open_time"] = t
                 st_["lev"] = lev
+                st_["lots"] = []
             st_["qty"] += q
             st_["cost"] += q * px
+            # 追補v13: LIFOロット(建玉時刻の対当用)。価格/PnLは従来の平均建値会計のまま。
+            st_["lots"].append([q, t])
         else:
             try:
                 rpnl = float(r[c_pnl]) if c_pnl else 0.0
@@ -740,8 +747,28 @@ def reconstruct_bingx_order_history(df: pd.DataFrame) -> tuple[pd.DataFrame, lis
             if st_ and st_["qty"] > 1e-12 and px > 0:
                 avg = st_["cost"] / st_["qty"]
                 cq = min(q, st_["qty"])
+                # 追補v13: 建玉時刻はLIFO対当(新しいロットから先に消費)の数量加重平均。
+                # 旧実装は「ポジション初回建玉時刻」を全クローズへ割当てており、コア建玉を
+                # 持ったままスキャルすると数分の取引が数週間保有と誤表示された(実データで
+                # BTC 0.0091コア39日+スキャル百件超を確認)。価格・PnLは従来どおり平均建値
+                # 会計(ブローカーのRealized PNLと整合)を維持し、時刻だけLIFOにする。
+                _need = cq
+                _wsum_ns = 0.0
+                _wq = 0.0
+                while _need > 1e-15 and st_["lots"]:
+                    _lot = st_["lots"][-1]
+                    _take = min(_need, _lot[0])
+                    _wsum_ns += _take * float(pd.Timestamp(_lot[1]).value)
+                    _wq += _take
+                    _lot[0] -= _take
+                    _need -= _take
+                    if _lot[0] <= 1e-15:
+                        st_["lots"].pop()
+                entry_t_lifo = (
+                    pd.Timestamp(int(_wsum_ns / _wq)) if _wq > 0 else st_["open_time"]
+                )
                 trades.append({
-                    "Entry_Time": st_["open_time"], "Exit_Time": t,
+                    "Entry_Time": entry_t_lifo, "Exit_Time": t,
                     "Symbol": _bingx_symbol(pair), "PnL_USD": rpnl,
                     "PnL_Percent": (px / avg - 1.0) * 100.0 * sgn if avg else None,
                     "Win_Loss": "win" if rpnl > 0 else "loss", "Side": side.upper(),
@@ -752,6 +779,7 @@ def reconstruct_bingx_order_history(df: pd.DataFrame) -> tuple[pd.DataFrame, lis
                 if st_["qty"] <= 1e-12:
                     st_["qty"] = 0.0
                     st_["cost"] = 0.0
+                    st_["lots"] = []
             else:
                 orphan += 1
                 trades.append({
@@ -3619,6 +3647,20 @@ def inject_custom_css() -> None:
             padding-bottom: 8px;
         }
         .block-container { padding-top: 2rem; }
+        /* 系統1: 入力コントロール(セレクトボックス/マルチセレクト/ラジオ/チェックボックス/トグル)の
+           視認性強化。「ここに操作できる要素がある」ことが一目でわかるよう、淡い青の背景+枠線を付与する。
+           注意: Streamlit 1.59系ではst.toggleも専用testidを持たず、st.checkboxと同じ
+           div[data-testid="stCheckbox"]としてレンダリングされる(headless実機確認済み)。
+           テキスト色は変更しない。サイドバー/メイン両方で崩れないことを確認済み。 */
+        div[data-testid="stSelectbox"],
+        div[data-testid="stMultiSelect"],
+        div[data-testid="stRadio"],
+        div[data-testid="stCheckbox"] {
+            background: rgba(59,130,246,0.07);
+            border: 1px solid rgba(96,165,250,0.35);
+            border-radius: 8px;
+            padding: 4px 10px;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -5053,6 +5095,7 @@ def render_market_day_calendar_section(today_: Optional[date] = None) -> None:
 
     _render_one_market_day_calendar("mkcal_a", symbol_options, today_eff)
 
+    st.markdown("🔀 **比較したい場合はここをON**")
     compare_on = st.checkbox("別の銘柄・月と比較する", key="mkcal_compare_toggle")
     if compare_on:
         st.markdown("---")
@@ -7858,6 +7901,245 @@ def compute_liquidation_resilience(
     }
 
 
+def compute_exit_quality(
+    valid_df: pd.DataFrame, bars_by_idx: dict[Any, pd.DataFrame], timeframe_by_idx: dict[Any, str],
+) -> dict[str, Any]:
+    """P1.5a エグジット品質(MFE/MAE捕捉率)。「利確が早すぎないか」「損切が遅すぎないか」に
+    数値で答えるための集計。🛡ロスカット耐性(compute_liquidation_resilience)と同じ経路キャッシュ
+    (bars_by_idx/timeframe_by_idx。エントリー含有バー〜実績Exit_Timeの窓)を使う。
+
+    各トレードについて窓内の:
+      - MFE_gross(順行方向の最良値幅) = qty * max(favorable方向の最良価格 - entry_price)
+        (LONG=窓内highの最大値、SHORT=窓内lowの最小値)
+      - MAE_gross(逆行方向の最悪値幅) = qty * max(0, 逆行方向の値幅)
+        (LONG/SHORTの向き取りはcompute_liquidation_resilienceと同一)
+    を求め、勝ちトレード(PnL_USD>0)には capture_ratio = PnL_USD / MFE_gross
+    (MFE_gross>0の場合のみ)、負けトレード(PnL_USD<0)には pain_ratio = |PnL_USD| / MAE_gross
+    (MAE_gross>0の場合のみ)を計算する。
+
+    「利確後さらに伸びた」トレード = capture_ratio<1 かつ 見逃し益(MFE_gross-PnL_USD)を
+    証拠金(_margin)に対するROE%換算した値が5%超のもの、の件数を summary["n_missed_gain"]に計上。
+
+    バー欠損・Entry_Time/Exit_Time/Entry_Price/qty/PnL_USDのいずれか欠損・窓内0本のトレードは
+    スキップし summary["n_skip"] に計上する(per_tradeには含めない)。
+
+    戻り値: {"per_trade": [{"symbol","entry_time","exit_time","pnl_usd","mfe_gross","mae_gross",
+      "capture_ratio","pain_ratio","missed_gain_usd","missed_gain_roe_pct"}, ...],
+      "summary": {"n_win_eval","n_loss_eval","capture_ratio_median","capture_ratio_mean",
+      "pain_ratio_median","pain_ratio_mean","n_missed_gain","n_skip"},
+      "top_missed_gains": [同per_trade形式の上位5件(MFE_gross-PnL_USD降順)]}
+    """
+    per_trade: list[dict[str, Any]] = []
+    n_skip = 0
+    for idx, row in valid_df.iterrows():
+        bars = bars_by_idx.get(idx)
+        if bars is None or bars.empty:
+            n_skip += 1
+            continue
+        entry_time = row.get("Entry_Time")
+        exit_time = row.get("Exit_Time")
+        entry_price = row.get("Entry_Price")
+        qty = row.get("_qty")
+        margin = row.get("_margin")
+        side = row.get("Side")
+        pnl_usd = row.get("PnL_USD")
+        if (pd.isna(entry_time) or pd.isna(exit_time) or pd.isna(entry_price)
+                or pd.isna(qty) or pd.isna(pnl_usd)):
+            n_skip += 1
+            continue
+        window_end = compute_window_end(entry_time, exit_time, None, exit_time)
+        if window_end is None:
+            n_skip += 1
+            continue
+        bar_interval = bar_interval_for_choice(timeframe_by_idx.get(idx, "1時間足"))
+        b = bars.sort_index()
+        b = b.loc[(b.index > entry_time - bar_interval) & (b.index <= window_end)]
+        if b.empty:
+            n_skip += 1
+            continue
+        is_long = str(side).strip().upper() != "SHORT" if pd.notna(side) else True
+        entry_price_f = float(entry_price)
+        qty_f = float(qty)
+        pnl_f = float(pnl_usd)
+        if is_long:
+            best_price = float(b["high"].max())
+            favorable = max(0.0, best_price - entry_price_f)
+            worst_price = float(b["low"].min())
+            adverse = max(0.0, entry_price_f - worst_price)
+        else:
+            best_price = float(b["low"].min())
+            favorable = max(0.0, entry_price_f - best_price)
+            worst_price = float(b["high"].max())
+            adverse = max(0.0, worst_price - entry_price_f)
+        mfe_gross = qty_f * favorable
+        mae_gross = qty_f * adverse
+
+        capture_ratio = float("nan")
+        pain_ratio = float("nan")
+        missed_gain_usd = float("nan")
+        if pnl_f > 0:
+            if mfe_gross > 0:
+                capture_ratio = pnl_f / mfe_gross
+            missed_gain_usd = mfe_gross - pnl_f
+        elif pnl_f < 0:
+            if mae_gross > 0:
+                pain_ratio = abs(pnl_f) / mae_gross
+
+        margin_f = float(margin) if pd.notna(margin) else float("nan")
+        missed_gain_roe_pct = (
+            (missed_gain_usd / margin_f * 100.0)
+            if pd.notna(missed_gain_usd) and pd.notna(margin_f) and margin_f > 0
+            else float("nan")
+        )
+
+        per_trade.append({
+            "symbol": row.get("Symbol"), "entry_time": entry_time, "exit_time": exit_time,
+            "pnl_usd": pnl_f, "mfe_gross": mfe_gross, "mae_gross": mae_gross,
+            "capture_ratio": capture_ratio, "pain_ratio": pain_ratio,
+            "missed_gain_usd": missed_gain_usd, "missed_gain_roe_pct": missed_gain_roe_pct,
+        })
+
+    win_eval = [t for t in per_trade if t["pnl_usd"] > 0 and pd.notna(t["capture_ratio"])]
+    loss_eval = [t for t in per_trade if t["pnl_usd"] < 0 and pd.notna(t["pain_ratio"])]
+    n_win_eval = len(win_eval)
+    n_loss_eval = len(loss_eval)
+
+    if n_win_eval > 0:
+        cap_series = pd.Series([t["capture_ratio"] for t in win_eval], dtype=float)
+        capture_ratio_median = float(cap_series.median())
+        capture_ratio_mean = float(cap_series.mean())
+    else:
+        capture_ratio_median = float("nan")
+        capture_ratio_mean = float("nan")
+
+    if n_loss_eval > 0:
+        pain_series = pd.Series([t["pain_ratio"] for t in loss_eval], dtype=float)
+        pain_ratio_median = float(pain_series.median())
+        pain_ratio_mean = float(pain_series.mean())
+    else:
+        pain_ratio_median = float("nan")
+        pain_ratio_mean = float("nan")
+
+    n_missed_gain = sum(
+        1 for t in win_eval
+        if t["capture_ratio"] < 1 and pd.notna(t["missed_gain_roe_pct"]) and t["missed_gain_roe_pct"] > 5.0
+    )
+
+    top_missed_gains = sorted(
+        win_eval, key=lambda t: t["missed_gain_usd"], reverse=True,
+    )[:5]
+
+    return {
+        "per_trade": per_trade,
+        "summary": {
+            "n_win_eval": n_win_eval, "n_loss_eval": n_loss_eval,
+            "capture_ratio_median": capture_ratio_median, "capture_ratio_mean": capture_ratio_mean,
+            "pain_ratio_median": pain_ratio_median, "pain_ratio_mean": pain_ratio_mean,
+            "n_missed_gain": n_missed_gain, "n_skip": n_skip,
+        },
+        "top_missed_gains": top_missed_gains,
+    }
+
+
+def compute_entry_adverse_start(
+    valid_df: pd.DataFrame, bars_by_idx: dict[Any, pd.DataFrame], timeframe_by_idx: dict[Any, str],
+    first_bars: tuple[int, ...] = (1, 3),
+) -> dict[str, Any]:
+    """P1.5b エントリー直後の逆行検知(「指値が刺さった瞬間が最悪」検知)。
+
+    BingXのCSVには指値の発注時刻が無く、約定(エントリー)時刻しか分からない。そのため
+    「約定直後に相場が逆行しているか」を「市況が変わってから刺さって即焼かれる」の代理指標
+    として使う(発注時刻データが取得できればより厳密な分析が可能になる、という限界を持つ近似)。
+
+    各トレードについて、エントリー含有バーを起点に先頭N本(first_bars=(1,3)、両方)のバーの
+    範囲で逆行値幅を求め、ROE%に換算する: adverse_roe_pct = 逆行価格差 / entry_price * leverage * 100
+    (LONG=先頭N本のlowの最小値との差、SHORT=先頭N本のhighの最大値との差。値は0以上)。
+
+    バー欠損・Entry_Time/Entry_Price/Leverage欠損・窓内0本のトレードはスキップし
+    n_skip に計上する(per_tradeには含めない)。
+
+    戻り値: {"per_trade": [{"symbol","entry_time","side","zone","adverse_roe_pct_1","adverse_roe_pct_3"}...],
+      "by_n": {1: {"overall": {"n_eval","median_adverse_roe_pct","over10_rate_pct"},
+                   "by_symbol": {symbol: {同上}}, "by_zone": {zone: {同上}},
+                   "worst5": [per_trade形式の上位5件(adverse_roe_pct_N降順)]},
+               3: {...同形式...}},
+      "n_skip": n_skip}
+    """
+    per_trade: list[dict[str, Any]] = []
+    n_skip = 0
+    for idx, row in valid_df.iterrows():
+        bars = bars_by_idx.get(idx)
+        if bars is None or bars.empty:
+            n_skip += 1
+            continue
+        entry_time = row.get("Entry_Time")
+        entry_price = row.get("Entry_Price")
+        leverage = row.get("Leverage")
+        side = row.get("Side")
+        if (pd.isna(entry_time) or pd.isna(entry_price) or pd.isna(leverage)
+                or float(leverage) <= 0):
+            n_skip += 1
+            continue
+        bar_interval = bar_interval_for_choice(timeframe_by_idx.get(idx, "1時間足"))
+        b = bars.sort_index()
+        b = b.loc[b.index > entry_time - bar_interval]
+        if b.empty:
+            n_skip += 1
+            continue
+        is_long = str(side).strip().upper() != "SHORT" if pd.notna(side) else True
+        entry_price_f = float(entry_price)
+        leverage_f = float(leverage)
+        try:
+            zone = hour_to_zone(int(pd.Timestamp(entry_time).hour))
+        except (ValueError, TypeError):
+            zone = None
+
+        rec: dict[str, Any] = {
+            "symbol": row.get("Symbol"), "entry_time": entry_time,
+            "side": "LONG" if is_long else "SHORT", "zone": zone,
+        }
+        for n_bars in first_bars:
+            b_n = b.iloc[:n_bars]
+            if b_n.empty:
+                rec[f"adverse_roe_pct_{n_bars}"] = float("nan")
+                continue
+            if is_long:
+                worst_price = float(b_n["low"].min())
+                adverse = max(0.0, entry_price_f - worst_price)
+            else:
+                worst_price = float(b_n["high"].max())
+                adverse = max(0.0, worst_price - entry_price_f)
+            rec[f"adverse_roe_pct_{n_bars}"] = (adverse / entry_price_f) * leverage_f * 100.0
+        per_trade.append(rec)
+
+    def _agg_group(records: list[dict[str, Any]], field: str) -> dict[str, Any]:
+        vals = [r[field] for r in records if pd.notna(r.get(field))]
+        n_eval = len(vals)
+        if n_eval == 0:
+            return {"n_eval": 0, "median_adverse_roe_pct": float("nan"), "over10_rate_pct": float("nan")}
+        s = pd.Series(vals, dtype=float)
+        over10 = float((s > 10.0).sum()) / n_eval * 100.0
+        return {"n_eval": n_eval, "median_adverse_roe_pct": float(s.median()), "over10_rate_pct": over10}
+
+    by_n: dict[int, dict[str, Any]] = {}
+    for n_bars in first_bars:
+        field = f"adverse_roe_pct_{n_bars}"
+        evaluable = [r for r in per_trade if pd.notna(r.get(field))]
+        overall = _agg_group(evaluable, field)
+        by_symbol: dict[Any, dict[str, Any]] = {}
+        for sym in sorted({r["symbol"] for r in evaluable if pd.notna(r.get("symbol"))}, key=str):
+            by_symbol[sym] = _agg_group([r for r in evaluable if r["symbol"] == sym], field)
+        by_zone: dict[Any, dict[str, Any]] = {}
+        for zone in sorted({r["zone"] for r in evaluable if r.get("zone") is not None}):
+            by_zone[zone] = _agg_group([r for r in evaluable if r["zone"] == zone], field)
+        worst5 = sorted(evaluable, key=lambda r: r[field], reverse=True)[:5]
+        by_n[n_bars] = {
+            "overall": overall, "by_symbol": by_symbol, "by_zone": by_zone, "worst5": worst5,
+        }
+
+    return {"per_trade": per_trade, "by_n": by_n, "n_skip": n_skip}
+
+
 def compute_exit_sim_cache_key(
     target_df: pd.DataFrame, hold_enabled: bool, hold_hours: Optional[float],
 ) -> str:
@@ -8878,6 +9160,185 @@ def render_mytrade_exit_optim_tab() -> None:
                             "ロスカット圏": ["⚠️" if t["was_liq_risk"] else "" for t in _liq_top5],
                         })
                         st.dataframe(_liq_df, width="stretch", hide_index=True)
+
+            def _fmt_pct1(v: Any, spec: str = ",.1f") -> str:
+                """P1.5a/b UI専用のパーセント表示ヘルパー(計算ロジックではない・selftest対象外)。
+                NaNは'—'、それ以外は指定specでフォーマットして'%'を付ける。"""
+                return "—" if v is None or (isinstance(v, float) and pd.isna(v)) else f"{v:{spec}}%"
+
+            st.markdown("---")
+            st.markdown("**🎯 利確・損切位置の妥当性(MFE/MAE捕捉率)**")
+            st.caption(
+                "各トレードにつき、エントリー含有バー〜実績決済時刻の窓内で記録された最良値幅(MFE)・"
+                "最悪値幅(MAE)と実際のPnLを比較し、「含み益をどれだけ取り切れたか」「含み損にどれだけ"
+                "耐えてから切ったか」を数値化します。"
+            )
+            if not es_cache.get("bars_by_idx"):
+                st.caption(
+                    "(経路キャッシュが無いため計算できません。SL/TP/最大保有時間のいずれかを有効にして"
+                    "「▶ 再シミュレーション実行」を押してください。)"
+                )
+            else:
+                es_quality = compute_exit_quality(
+                    es_cache["valid_df"], es_cache["bars_by_idx"], es_cache["timeframe_by_idx"],
+                )
+                es_q_summary = es_quality["summary"]
+                if es_q_summary["n_win_eval"] == 0 and es_q_summary["n_loss_eval"] == 0:
+                    st.caption("計算可能なトレードがありません(バー欠損・価格/サイズ情報欠損等)。")
+                else:
+                    if es_q_summary["n_skip"] > 0:
+                        st.caption(f"※価格/バー欠損等でスキップ: {es_q_summary['n_skip']}件。")
+                    q_c1, q_c2 = st.columns(2)
+                    q_c1.metric(
+                        "捕捉率(中央値)",
+                        _fmt_stat(es_q_summary["capture_ratio_median"], ",.2f"),
+                        help=f"勝ちトレード{es_q_summary['n_win_eval']}件が対象。"
+                        "「1ドルの含み益(MFE)のうち何セント取れたか」。1.0=最良値でぴったり利確、"
+                        "1未満=途中で利確(値が小さいほど利確が早すぎる傾向)。",
+                    )
+                    q_c2.metric(
+                        "耐え率(中央値)",
+                        _fmt_stat(es_q_summary["pain_ratio_median"], ",.2f"),
+                        help=f"負けトレード{es_q_summary['n_loss_eval']}件が対象。"
+                        "「最悪の含み損(MAE)のうちどれだけ耐えてから切ったか」。1.0付近="
+                        "最悪値付近まで耐えてから切っている(損切が遅い傾向)。",
+                    )
+                    st.caption(
+                        f"捕捉率(平均): {_fmt_stat(es_q_summary['capture_ratio_mean'], ',.2f')} / "
+                        f"耐え率(平均): {_fmt_stat(es_q_summary['pain_ratio_mean'], ',.2f')} / "
+                        f"利確後さらに伸びた(捕捉率<1かつ見逃し益ROE>5%): {es_q_summary['n_missed_gain']}件"
+                    )
+                    st.caption(
+                        "捕捉率が低い=利確が早すぎる傾向。耐え率が1.0付近=最悪値付近まで耐えてから"
+                        "切っている=損切が遅い傾向。バー粒度・窓内(エントリー含有バー〜実績決済時刻)"
+                        "のみの近似値である点にご注意ください。"
+                    )
+                    _q_top5 = es_quality["top_missed_gains"]
+                    if _q_top5:
+                        st.markdown("**TOP5 利確後さらに伸びたトレード(見逃し益が大きい順)**")
+                        _q_df = pd.DataFrame({
+                            "銘柄": [t["symbol"] for t in _q_top5],
+                            "エントリー時刻": [
+                                t["entry_time"].strftime("%Y-%m-%d %H:%M") if pd.notna(t["entry_time"]) else "—"
+                                for t in _q_top5
+                            ],
+                            "実現PnL(USD)": [_fmt_stat(t["pnl_usd"], ",.2f") for t in _q_top5],
+                            "MFE(USD)": [_fmt_stat(t["mfe_gross"], ",.2f") for t in _q_top5],
+                            "見逃し益(USD)": [_fmt_stat(t["missed_gain_usd"], ",.2f") for t in _q_top5],
+                            "見逃し益ROE%": [_fmt_stat(t["missed_gain_roe_pct"], ",.2f") for t in _q_top5],
+                            "捕捉率": [_fmt_stat(t["capture_ratio"], ",.2f") for t in _q_top5],
+                        })
+                        st.dataframe(_q_df, width="stretch", hide_index=True)
+
+            st.markdown("---")
+            st.markdown("**⚡ 刺さった直後どうなっているか(初動逆行)**")
+            st.caption(
+                "指値の発注時刻はCSVに含まれないため、「約定(エントリー)直後にどれだけ逆行したか」を"
+                "「市況が変わってから刺さって即焼かれていないか」の代理指標として見ます"
+                "(エントリー含有バーから先頭1本/3本以内の逆行値幅をROE%に換算)。"
+            )
+            if not es_cache.get("bars_by_idx"):
+                st.caption(
+                    "(経路キャッシュが無いため計算できません。SL/TP/最大保有時間のいずれかを有効にして"
+                    "「▶ 再シミュレーション実行」を押してください。)"
+                )
+            else:
+                es_adverse = compute_entry_adverse_start(
+                    es_cache["valid_df"], es_cache["bars_by_idx"], es_cache["timeframe_by_idx"],
+                )
+                _adv1 = es_adverse["by_n"].get(1, {})
+                _adv1_overall = _adv1.get("overall", {})
+                if _adv1_overall.get("n_eval", 0) == 0:
+                    st.caption("計算可能なトレードがありません(バー欠損・価格/レバレッジ情報欠損等)。")
+                else:
+                    if es_adverse["n_skip"] > 0:
+                        st.caption(f"※価格/バー欠損等でスキップ: {es_adverse['n_skip']}件。")
+                    a_c1, a_c2 = st.columns(2)
+                    a_c1.metric(
+                        "初動逆行ROE%(直後1本・中央値)",
+                        _fmt_pct1(_adv1_overall.get("median_adverse_roe_pct"), ",.2f"),
+                        help=f"エントリー含有バーの直後1本以内での最悪逆行値幅をROE%換算した中央値"
+                        f"({_adv1_overall.get('n_eval', 0)}件が対象)。",
+                    )
+                    a_c2.metric(
+                        "10%超の割合(直後1本)",
+                        _fmt_pct1(_adv1_overall.get("over10_rate_pct")),
+                        help="直後1本以内の逆行ROE%が10%を超えたトレードの割合。高いほど「刺さった"
+                        "直後に不利な方向へ動きやすい」= 指値の置き方を見直す候補になり得ます。",
+                    )
+                    _adv3_overall = es_adverse["by_n"].get(3, {}).get("overall", {})
+                    st.caption(
+                        f"(参考: 直後3本・中央値 {_fmt_pct1(_adv3_overall.get('median_adverse_roe_pct'), ',.2f')} / "
+                        f"10%超の割合 {_fmt_pct1(_adv3_overall.get('over10_rate_pct'))})"
+                    )
+
+                    _by_zone1 = _adv1.get("by_zone", {})
+                    if _by_zone1:
+                        _zone_vals = [g["median_adverse_roe_pct"] for g in _by_zone1.values()]
+                        _zone_vmax = compute_diverging_vmax(
+                            pd.DataFrame({"v": _zone_vals}), ["v"],
+                        )
+                        _zone_df = pd.DataFrame({
+                            "詳細帯": list(_by_zone1.keys()),
+                            "件数": [g["n_eval"] for g in _by_zone1.values()],
+                            "初動逆行ROE%(中央値)": [
+                                _fmt_pct1(g["median_adverse_roe_pct"], ",.2f") for g in _by_zone1.values()
+                            ],
+                            "10%超の割合": [_fmt_pct1(g["over10_rate_pct"]) for g in _by_zone1.values()],
+                        })
+                        _zone_raw = [g["median_adverse_roe_pct"] for g in _by_zone1.values()]
+                        st.markdown("**詳細帯別(直後1本)**")
+                        st.dataframe(
+                            _zone_df.style.apply(
+                                lambda col: [diverging_color(-v, _zone_vmax) for v in _zone_raw],
+                                subset=["初動逆行ROE%(中央値)"],
+                            ),
+                            width="stretch", hide_index=True,
+                        )
+
+                    _by_symbol1 = _adv1.get("by_symbol", {})
+                    if _by_symbol1:
+                        _sym_items = sorted(
+                            _by_symbol1.items(), key=lambda kv: kv[1]["n_eval"], reverse=True,
+                        )[:10]
+                        _sym_raw = [g["median_adverse_roe_pct"] for _, g in _sym_items]
+                        _sym_vmax = compute_diverging_vmax(pd.DataFrame({"v": _sym_raw}), ["v"])
+                        _sym_df = pd.DataFrame({
+                            "銘柄": [s for s, _ in _sym_items],
+                            "件数": [g["n_eval"] for _, g in _sym_items],
+                            "初動逆行ROE%(中央値)": [_fmt_pct1(g["median_adverse_roe_pct"], ",.2f") for _, g in _sym_items],
+                            "10%超の割合": [_fmt_pct1(g["over10_rate_pct"]) for _, g in _sym_items],
+                        })
+                        st.markdown("**銘柄別(直後1本・件数上位10)**")
+                        st.dataframe(
+                            _sym_df.style.apply(
+                                lambda col: [diverging_color(-v, _sym_vmax) for v in _sym_raw],
+                                subset=["初動逆行ROE%(中央値)"],
+                            ),
+                            width="stretch", hide_index=True,
+                        )
+
+                    _adv_worst5 = _adv1.get("worst5", [])
+                    if _adv_worst5:
+                        st.markdown("**TOP5 初動逆行が大きいトレード(直後1本)**")
+                        _adv_df = pd.DataFrame({
+                            "銘柄": [t["symbol"] for t in _adv_worst5],
+                            "エントリー時刻": [
+                                t["entry_time"].strftime("%Y-%m-%d %H:%M") if pd.notna(t["entry_time"]) else "—"
+                                for t in _adv_worst5
+                            ],
+                            "方向": [t["side"] for t in _adv_worst5],
+                            "詳細帯": [t.get("zone") or "—" for t in _adv_worst5],
+                            "初動逆行ROE%": [_fmt_pct1(t["adverse_roe_pct_1"], ",.2f") for t in _adv_worst5],
+                        })
+                        st.dataframe(_adv_df, width="stretch", hide_index=True)
+
+                    st.caption(
+                        "この比率が高い場合、指値注文が不利な瞬間にばかり約定している可能性があり、"
+                        "指値運用の見直し候補になります。発注時刻データがAPI等で取得できれば、"
+                        "より厳密な分析が可能になります(現状は約定後の値動きを代理指標として使う近似です)。"
+                    )
+                    st.caption("※バー粒度の近似値であり、バー内の値動きの順序(高値/安値どちらが先か)は不明です。")
 
 
 # =====================================================================================
@@ -12232,6 +12693,33 @@ def run_selftest() -> bool:
     check("5-8b Quantity列がBTC=1.0/1.0・ETH(orphan)=NaNで通る", ok58q,
           f"btc_qty={None if btc is None else btc['Quantity'].tolist()}・"
           f"eth_qty={None if eth is None else eth['Quantity'].tolist()}")
+    # 追補v13: 建玉時刻のLIFO対当。コア(09:00)を残したままスキャル(10:00建て→10:10決済)した場合、
+    # スキャルのEntry_Timeは10:00のロット(JST11:00)であり、コアの09:00(旧実装の誤り)ではない。
+    # コアを閉じる最後のCloseだけが09:00ロット(JST10:00)に対当する。
+    oh_lifo = pd.DataFrame([
+        {"Time(UTC+8)": "2026-01-02 09:00:00", "Pair": "BTC-USDT", "Type": "Open Long",
+         "Leverage": "10X", "DealPrice": 100.0, "Quantity": 1.0, "Realized PNL": 0},
+        {"Time(UTC+8)": "2026-01-02 10:00:00", "Pair": "BTC-USDT", "Type": "Open Long",
+         "Leverage": "10X", "DealPrice": 110.0, "Quantity": 0.5, "Realized PNL": 0},
+        {"Time(UTC+8)": "2026-01-02 10:10:00", "Pair": "BTC-USDT", "Type": "Close Long",
+         "Leverage": "10X", "DealPrice": 111.0, "Quantity": 0.5, "Realized PNL": 0.5},
+        {"Time(UTC+8)": "2026-01-02 12:00:00", "Pair": "BTC-USDT", "Type": "Close Long",
+         "Leverage": "10X", "DealPrice": 105.0, "Quantity": 1.0, "Realized PNL": 5.0},
+    ])
+    lnorm, _ = normalize_trades_csv(oh_lifo)
+    lifo_tr = lnorm.sort_values("Exit_Time") if lnorm is not None else None
+    ok58c = (lifo_tr is not None and len(lifo_tr) == 2
+             # スキャル決済: LIFOで10:00ロット→JST 11:00(旧実装なら09:00→JST10:00で誤り)
+             and lifo_tr.iloc[0]["Entry_Time"].hour == 11
+             and lifo_tr.iloc[0]["Entry_Time"].minute == 0
+             # コア決済: 残った09:00ロット→JST 10:00
+             and lifo_tr.iloc[1]["Entry_Time"].hour == 10
+             # 保有時間: スキャル=10分・コア=3時間
+             and abs((lifo_tr.iloc[0]["Exit_Time"] - lifo_tr.iloc[0]["Entry_Time"]).total_seconds() - 600) < 1
+             and abs((lifo_tr.iloc[1]["Exit_Time"] - lifo_tr.iloc[1]["Entry_Time"]).total_seconds() - 10800) < 1)
+    check("5-8c 建玉時刻LIFO対当: コア温存スキャルの保有=10分・コア決済=3時間", ok58c,
+          None if lifo_tr is None else
+          f"entry_times={[str(x) for x in lifo_tr['Entry_Time'].tolist()]}")
     # 5-9 検出だけで通常CSVは素通り(既存自作形式が再構築対象にならない)
     plain = pd.DataFrame({"Entry_Time": ["2026-01-01 10:00"], "Symbol": ["BTC"], "PnL_USD": [5.0]})
     check("5-9 通常CSVはBingX判定に掛からず素通り",
@@ -16033,6 +16521,199 @@ def run_selftest() -> bool:
           all(p["n_trades"] == 2 for p in profiles34), f"{[p['n_trades'] for p in profiles34]}")
     check("34-3 全データセットn<10のため「n小」注記対象になる(チップ表示ロジックの前提条件)",
           all(p["n_trades"] < 10 for p in profiles34))
+
+    # -----------------------------------------------------------------
+    # 35. 系統2(P1.5a): compute_exit_quality(MFE/MAE捕捉率)。LONG/SHORT・勝ち/負け・
+    #     MFE_gross=0の境界(win_evalから除外)・スキップの手計算ケース(掟7: 数値はPythonで算出)。
+    # -----------------------------------------------------------------
+    print("\n--- 35. 系統2(P1.5a): compute_exit_quality ---")
+
+    _ts35 = lambda s: pd.Timestamp(s, tz="Asia/Tokyo")
+    _entry35 = _ts35("2026-01-01 00:00:00")
+    _exit35 = _ts35("2026-01-01 02:00:00")
+    valid_df35 = pd.DataFrame({
+        "Entry_Time": [_entry35] * 5,
+        "Exit_Time": [_exit35] * 5,
+        "Entry_Price": [100.0, 100.0, 100.0, 50.0, 100.0],
+        "Side": ["LONG", "LONG", "SHORT", "SHORT", "LONG"],
+        "Symbol": ["AAA", "BBB", "CCC", "DDD", "FFF"],
+        "PnL_USD": [18.0, 9.0, -7.2, -38.0, 5.0],
+        "_qty": [2.0, 1.0, 3.0, 4.0, 1.0],
+        "_margin": [50.0, 10.0, 20.0, 15.0, 20.0],
+    }, index=[0, 1, 2, 3, 4])
+    # AAA(LONG,win,よく捕捉): high=110->MFE=2*(110-100)=20/low=97->MAE=2*3=6/PnL18->capture=0.9/missed=2.0/ROE=4.0%
+    bars_aaa35 = pd.DataFrame(
+        {"low": [97.0, 98.0, 99.0], "high": [100.0, 110.0, 105.0]},
+        index=[_ts35("2026-01-01 00:00:00"), _ts35("2026-01-01 01:00:00"), _ts35("2026-01-01 02:00:00")],
+    )
+    # BBB(LONG,win,見逃し大): high=130->MFE=1*30=30/low=98->MAE=1*2=2/PnL9->capture=0.3/missed=21.0/ROE=210%
+    bars_bbb35 = pd.DataFrame(
+        {"low": [99.0, 98.0, 99.0], "high": [100.0, 130.0, 105.0]},
+        index=[_ts35("2026-01-01 00:00:00"), _ts35("2026-01-01 01:00:00"), _ts35("2026-01-01 02:00:00")],
+    )
+    # CCC(SHORT,loss): low=85->MFE(未使用)=3*15=45/high=103->MAE=3*3=9/PnL-7.2->pain=0.8
+    bars_ccc35 = pd.DataFrame(
+        {"low": [99.0, 85.0, 92.0], "high": [101.0, 103.0, 100.0]},
+        index=[_ts35("2026-01-01 00:00:00"), _ts35("2026-01-01 01:00:00"), _ts35("2026-01-01 02:00:00")],
+    )
+    # DDD(SHORT,loss,ほぼMAE付近まで耐え): low=47->MFE(未使用)=4*3=12/high=60->MAE=4*10=40/PnL-38->pain=0.95
+    bars_ddd35 = pd.DataFrame(
+        {"low": [49.0, 47.0, 48.0], "high": [51.0, 60.0, 55.0]},
+        index=[_ts35("2026-01-01 00:00:00"), _ts35("2026-01-01 01:00:00"), _ts35("2026-01-01 02:00:00")],
+    )
+    # FFF(LONG,win,MFE_gross=0): high常にentry以下->MFE=0のためcapture_ratioはNaN(win_evalから除外)
+    bars_fff35 = pd.DataFrame(
+        {"low": [95.0, 96.0, 97.0], "high": [100.0, 100.0, 100.0]},
+        index=[_ts35("2026-01-01 00:00:00"), _ts35("2026-01-01 01:00:00"), _ts35("2026-01-01 02:00:00")],
+    )
+    bars_by_idx35 = {0: bars_aaa35, 1: bars_bbb35, 2: bars_ccc35, 3: bars_ddd35, 4: bars_fff35}
+    timeframe_by_idx35 = {i: "1時間足" for i in range(5)}
+    # idx=5(EEE相当)はvalid_dfに含めずbars_by_idxにも無い代わりに、バー欠損スキップは
+    # 単純にbars_by_idxから該当idxを外した行を追加して検証する。
+    valid_df35_skip = pd.concat([
+        valid_df35,
+        pd.DataFrame({
+            "Entry_Time": [_entry35], "Exit_Time": [_exit35], "Entry_Price": [100.0],
+            "Side": ["LONG"], "Symbol": ["EEE"], "PnL_USD": [1.0], "_qty": [1.0], "_margin": [10.0],
+        }, index=[5]),
+    ])
+
+    eq35 = compute_exit_quality(valid_df35_skip, bars_by_idx35, timeframe_by_idx35)
+    _pt35 = {t["symbol"]: t for t in eq35["per_trade"]}
+    check("35-1 summary: n_skip=1(idx5=EEEはバー欠損)", eq35["summary"]["n_skip"] == 1,
+          f"{eq35['summary']}")
+    check("35-2a AAA(LONG,win)手計算: MFE=20.0・MAE=6.0・capture=0.9・missed=2.0・missedROE=4.0%",
+          math.isclose(_pt35["AAA"]["mfe_gross"], 20.0) and math.isclose(_pt35["AAA"]["mae_gross"], 6.0)
+          and math.isclose(_pt35["AAA"]["capture_ratio"], 0.9)
+          and math.isclose(_pt35["AAA"]["missed_gain_usd"], 2.0)
+          and math.isclose(_pt35["AAA"]["missed_gain_roe_pct"], 4.0), f"{_pt35.get('AAA')}")
+    check("35-2b BBB(LONG,win,見逃し大)手計算: MFE=30.0・capture=0.3・missed=21.0・missedROE=210.0%",
+          math.isclose(_pt35["BBB"]["mfe_gross"], 30.0) and math.isclose(_pt35["BBB"]["capture_ratio"], 0.3)
+          and math.isclose(_pt35["BBB"]["missed_gain_usd"], 21.0)
+          and math.isclose(_pt35["BBB"]["missed_gain_roe_pct"], 210.0), f"{_pt35.get('BBB')}")
+    check("35-2c CCC(SHORT,loss)手計算: MAE=9.0・pain=0.8(capture_ratioはNaNのまま)",
+          math.isclose(_pt35["CCC"]["mae_gross"], 9.0) and math.isclose(_pt35["CCC"]["pain_ratio"], 0.8)
+          and pd.isna(_pt35["CCC"]["capture_ratio"]), f"{_pt35.get('CCC')}")
+    check("35-2d DDD(SHORT,loss,耐え率高)手計算: MAE=40.0・pain=0.95",
+          math.isclose(_pt35["DDD"]["mae_gross"], 40.0) and math.isclose(_pt35["DDD"]["pain_ratio"], 0.95),
+          f"{_pt35.get('DDD')}")
+    check("35-2e FFF(LONG,win,MFE_gross=0)はcapture_ratio=NaN(win_evalから除外される)",
+          math.isclose(_pt35["FFF"]["mfe_gross"], 0.0) and pd.isna(_pt35["FFF"]["capture_ratio"]),
+          f"{_pt35.get('FFF')}")
+    check("35-3a summary: n_win_eval=2(AAA・BBBのみ、FFFはMFE=0で除外)・n_loss_eval=2(CCC・DDD)",
+          eq35["summary"]["n_win_eval"] == 2 and eq35["summary"]["n_loss_eval"] == 2,
+          f"{eq35['summary']}")
+    check("35-3b capture_ratio_median=capture_ratio_mean=0.6(median/mean(0.9,0.3))",
+          math.isclose(eq35["summary"]["capture_ratio_median"], 0.6)
+          and math.isclose(eq35["summary"]["capture_ratio_mean"], 0.6), f"{eq35['summary']}")
+    check("35-3c pain_ratio_median=pain_ratio_mean=0.875(median/mean(0.8,0.95))",
+          math.isclose(eq35["summary"]["pain_ratio_median"], 0.875)
+          and math.isclose(eq35["summary"]["pain_ratio_mean"], 0.875), f"{eq35['summary']}")
+    check("35-3d n_missed_gain=1(BBBのみ。AAAはROE4.0%<=5%で非該当・capture<1条件はAAAも満たすが"
+          "ROE閾値で除外)",
+          eq35["summary"]["n_missed_gain"] == 1, f"{eq35['summary']}")
+    check("35-4 top_missed_gains: 先頭=BBB(missed=21.0)・2番目=AAA(missed=2.0)(降順)",
+          [t["symbol"] for t in eq35["top_missed_gains"][:2]] == ["BBB", "AAA"],
+          f"{[t['symbol'] for t in eq35['top_missed_gains']]}")
+
+    eq35_empty = compute_exit_quality(
+        pd.DataFrame(columns=["Entry_Time", "Exit_Time", "Entry_Price", "Side", "Symbol",
+                               "PnL_USD", "_qty", "_margin"]),
+        {}, {},
+    )
+    check("35-5 空valid_df -> n_win_eval=n_loss_eval=n_skip=0・中央値等は全てNaN",
+          eq35_empty["summary"]["n_win_eval"] == 0 and eq35_empty["summary"]["n_loss_eval"] == 0
+          and eq35_empty["summary"]["n_skip"] == 0
+          and pd.isna(eq35_empty["summary"]["capture_ratio_median"]), f"{eq35_empty['summary']}")
+
+    # -----------------------------------------------------------------
+    # 36. 系統3(P1.5b): compute_entry_adverse_start(初動逆行検知)。LONG/SHORT・
+    #     first_bars=(1,3)両方・詳細帯(zone)別集計・worst5順序・スキップの手計算ケース
+    #     (掟7: 数値はPythonで算出)。
+    # -----------------------------------------------------------------
+    print("\n--- 36. 系統3(P1.5b): compute_entry_adverse_start ---")
+
+    _entry36_aaa = pd.Timestamp("2026-01-01 00:00:00", tz="Asia/Tokyo")  # hour=0 -> "NY重複 (21-1)"
+    _entry36_bbb = pd.Timestamp("2026-01-05 08:00:00", tz="Asia/Tokyo")  # hour=8 -> "アジア早朝 (7-10)"
+    _entry36_ccc = pd.Timestamp("2026-01-02 00:00:00", tz="Asia/Tokyo")  # hour=0 -> AAAと同じ帯
+    valid_df36 = pd.DataFrame({
+        "Entry_Time": [_entry36_aaa, _entry36_bbb, _entry36_ccc],
+        "Entry_Price": [100.0, 50.0, 200.0],
+        "Leverage": [10.0, 5.0, 2.0],
+        "Side": ["LONG", "SHORT", "LONG"],
+        "Symbol": ["AAA", "BBB", "CCC"],
+    }, index=[0, 1, 2])
+    # AAA(LONG,entry=100,lev=10): 直後1本low=97->adverse=3->ROE=30.0% / 3本min(low)=90->adverse=10->ROE=100.0%
+    bars_aaa36 = pd.DataFrame(
+        {"low": [97.0, 90.0, 99.0, 85.0], "high": [102.0, 105.0, 101.0, 110.0]},
+        index=[_entry36_aaa + pd.Timedelta(hours=h) for h in range(4)],
+    )
+    # BBB(SHORT,entry=50,lev=5): 直後1本high=52->adverse=2->ROE=20.0% / 3本max(high)=60->adverse=10->ROE=100.0%
+    bars_bbb36 = pd.DataFrame(
+        {"low": [48.0, 47.0, 49.0, 40.0], "high": [52.0, 53.0, 60.0, 58.0]},
+        index=[_entry36_bbb + pd.Timedelta(hours=h) for h in range(4)],
+    )
+    # CCC(LONG,entry=200,lev=2): 直後1本low=199->adverse=1->ROE=1.0% / 3本min(low)=197->adverse=3->ROE=3.0%
+    bars_ccc36 = pd.DataFrame(
+        {"low": [199.0, 198.0, 197.0], "high": [202.0, 203.0, 205.0]},
+        index=[_entry36_ccc + pd.Timedelta(hours=h) for h in range(3)],
+    )
+    bars_by_idx36 = {0: bars_aaa36, 1: bars_bbb36, 2: bars_ccc36}  # idx=3(DDD相当)はバー無し=スキップ想定
+    timeframe_by_idx36 = {0: "1時間足", 1: "1時間足", 2: "1時間足", 3: "1時間足"}
+    valid_df36_skip = pd.concat([
+        valid_df36,
+        pd.DataFrame({
+            "Entry_Time": [_entry36_aaa], "Entry_Price": [1.0], "Leverage": [1.0],
+            "Side": ["LONG"], "Symbol": ["DDD"],
+        }, index=[3]),
+    ])
+
+    adv36 = compute_entry_adverse_start(valid_df36_skip, bars_by_idx36, timeframe_by_idx36)
+    check("36-1 n_skip=1(idx3=DDDはバー欠損)", adv36["n_skip"] == 1, f"{adv36['n_skip']}")
+    _pt36 = {t["symbol"]: t for t in adv36["per_trade"]}
+    check("36-2a AAA手計算: 直後1本ROE=30.0%・直後3本ROE=100.0%",
+          math.isclose(_pt36["AAA"]["adverse_roe_pct_1"], 30.0)
+          and math.isclose(_pt36["AAA"]["adverse_roe_pct_3"], 100.0), f"{_pt36.get('AAA')}")
+    check("36-2b BBB(SHORT)手計算: 直後1本ROE=20.0%・直後3本ROE=100.0%",
+          math.isclose(_pt36["BBB"]["adverse_roe_pct_1"], 20.0)
+          and math.isclose(_pt36["BBB"]["adverse_roe_pct_3"], 100.0), f"{_pt36.get('BBB')}")
+    check("36-2c CCC手計算: 直後1本ROE=1.0%・直後3本ROE=3.0%",
+          math.isclose(_pt36["CCC"]["adverse_roe_pct_1"], 1.0)
+          and math.isclose(_pt36["CCC"]["adverse_roe_pct_3"], 3.0), f"{_pt36.get('CCC')}")
+
+    _n1_36 = adv36["by_n"][1]
+    _n3_36 = adv36["by_n"][3]
+    check("36-3a by_n[1]['overall']: n_eval=3・median=20.0(median(30,20,1))・over10_rate_pct=66.67%(2/3)",
+          _n1_36["overall"]["n_eval"] == 3 and math.isclose(_n1_36["overall"]["median_adverse_roe_pct"], 20.0)
+          and math.isclose(_n1_36["overall"]["over10_rate_pct"], 200.0 / 3, rel_tol=1e-6),
+          f"{_n1_36['overall']}")
+    check("36-3b by_n[3]['overall']: median=100.0(median(100,100,3))・over10_rate_pct=66.67%(2/3)",
+          math.isclose(_n3_36["overall"]["median_adverse_roe_pct"], 100.0)
+          and math.isclose(_n3_36["overall"]["over10_rate_pct"], 200.0 / 3, rel_tol=1e-6),
+          f"{_n3_36['overall']}")
+    check("36-4 by_zone(直後1本): AAA/CCCの帯(hour=0)はn=2・median=15.5(median(30,1))/"
+          "BBBの帯(hour=8)はn=1・median=20.0",
+          math.isclose(_n1_36["by_zone"][hour_to_zone(0)]["median_adverse_roe_pct"], 15.5)
+          and _n1_36["by_zone"][hour_to_zone(0)]["n_eval"] == 2
+          and math.isclose(_n1_36["by_zone"][hour_to_zone(8)]["median_adverse_roe_pct"], 20.0)
+          and _n1_36["by_zone"][hour_to_zone(8)]["n_eval"] == 1,
+          f"{_n1_36['by_zone']}")
+    check("36-5 by_symbol(直後1本): AAA/BBB/CCC各n_eval=1でmedianが各々のROEと一致",
+          math.isclose(_n1_36["by_symbol"]["AAA"]["median_adverse_roe_pct"], 30.0)
+          and math.isclose(_n1_36["by_symbol"]["BBB"]["median_adverse_roe_pct"], 20.0)
+          and math.isclose(_n1_36["by_symbol"]["CCC"]["median_adverse_roe_pct"], 1.0),
+          f"{_n1_36['by_symbol']}")
+    check("36-6 worst5(直後1本)は降順: AAA(30.0) > BBB(20.0) > CCC(1.0)",
+          [t["symbol"] for t in _n1_36["worst5"]] == ["AAA", "BBB", "CCC"],
+          f"{[t['symbol'] for t in _n1_36['worst5']]}")
+
+    adv36_empty = compute_entry_adverse_start(
+        pd.DataFrame(columns=["Entry_Time", "Entry_Price", "Leverage", "Side", "Symbol"]), {}, {},
+    )
+    check("36-7 空valid_df -> n_skip=0・by_n[1]['overall']['n_eval']=0・medianはNaN",
+          adv36_empty["n_skip"] == 0 and adv36_empty["by_n"][1]["overall"]["n_eval"] == 0
+          and pd.isna(adv36_empty["by_n"][1]["overall"]["median_adverse_roe_pct"]),
+          f"{adv36_empty['by_n'][1]['overall']}")
 
     print("\n" + "=" * 78)
     if all_ok:
