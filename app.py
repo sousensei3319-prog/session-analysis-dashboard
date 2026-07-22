@@ -1975,6 +1975,75 @@ def format_hold_duration(hours: Any) -> str:
     return f"{h / 24.0:.1f}日"
 
 
+# 追補v14: 保有時間バケット分析(ユーザー実機フィードバック「散布図では傾向が読めない」対応)。
+# バケット境界(時間)。ラベル/下限(含む)/上限(含まない)。スキャル中心の実データに合わせた対数的刻み。
+HOLD_BUCKET_DEFS_H: list[tuple[str, float, float]] = [
+    ("1分未満", 0.0, 1.0 / 60.0),
+    ("1〜5分", 1.0 / 60.0, 5.0 / 60.0),
+    ("5〜15分", 5.0 / 60.0, 0.25),
+    ("15分〜1時間", 0.25, 1.0),
+    ("1〜4時間", 1.0, 4.0),
+    ("4〜24時間", 4.0, 24.0),
+    ("1〜7日", 24.0, 168.0),
+    ("7日超", 168.0, float("inf")),
+]
+
+
+def compute_hold_bucket_stats(df: pd.DataFrame) -> pd.DataFrame:
+    """追補v14: 保有時間バケット別の成績集計(純関数・selftest対象)。
+    Entry_Time/Exit_Timeから保有時間(h)を求め、HOLD_BUCKET_DEFS_Hの各バケットに割り当てて
+    件数・勝率(PnL>0)・合計損益・平均損益を返す。保有時間がNaN/0以下の行は対象外。
+    戻り値: columns=[bucket, n, win_rate_pct, total_pnl, avg_pnl](バケット定義順・n=0の
+    バケットも行として含む=棒グラフの欠けを防ぐ)。空/列欠損時は空DataFrame。"""
+    cols = ["bucket", "n", "win_rate_pct", "total_pnl", "avg_pnl"]
+    if df is None or df.empty or "Entry_Time" not in df.columns or "Exit_Time" not in df.columns:
+        return pd.DataFrame(columns=cols)
+    entry = pd.to_datetime(df["Entry_Time"], errors="coerce")
+    exit_ = pd.to_datetime(df["Exit_Time"], errors="coerce")
+    hold_h = (exit_ - entry).dt.total_seconds() / 3600.0
+    pnl = pd.to_numeric(df.get("PnL_USD"), errors="coerce")
+    ok = hold_h.notna() & (hold_h > 0) & pnl.notna()
+    hold_h, pnl = hold_h[ok], pnl[ok]
+    rows = []
+    for label, lo, hi in HOLD_BUCKET_DEFS_H:
+        m = (hold_h >= lo) & (hold_h < hi)
+        n = int(m.sum())
+        sub = pnl[m]
+        rows.append({
+            "bucket": label, "n": n,
+            "win_rate_pct": (100.0 * float((sub > 0).sum()) / n) if n else float("nan"),
+            "total_pnl": float(sub.sum()) if n else 0.0,
+            "avg_pnl": float(sub.mean()) if n else float("nan"),
+        })
+    return pd.DataFrame(rows, columns=cols)
+
+
+def compute_win_loss_hold_stats(df: pd.DataFrame) -> dict[str, Any]:
+    """追補v14: 勝ちトレードと負けトレードの保有時間中央値の比較(純関数・selftest対象)。
+    「負けを勝ちより長く持つ」(損切りが遅い・塩漬け=ディスポジション効果)の検出が目的。
+    戻り値: {ok, n_win, n_loss, win_median_h, loss_median_h, loss_to_win_ratio}
+    (勝ちまたは負けが0件ならok=False。draw(PnL=0)はどちらにも含めない)。"""
+    out: dict[str, Any] = {"ok": False, "n_win": 0, "n_loss": 0,
+                           "win_median_h": float("nan"), "loss_median_h": float("nan"),
+                           "loss_to_win_ratio": float("nan")}
+    if df is None or df.empty or "Entry_Time" not in df.columns or "Exit_Time" not in df.columns:
+        return out
+    entry = pd.to_datetime(df["Entry_Time"], errors="coerce")
+    exit_ = pd.to_datetime(df["Exit_Time"], errors="coerce")
+    hold_h = (exit_ - entry).dt.total_seconds() / 3600.0
+    pnl = pd.to_numeric(df.get("PnL_USD"), errors="coerce")
+    ok = hold_h.notna() & (hold_h > 0) & pnl.notna()
+    hold_h, pnl = hold_h[ok], pnl[ok]
+    win_h, loss_h = hold_h[pnl > 0], hold_h[pnl < 0]
+    out["n_win"], out["n_loss"] = int(len(win_h)), int(len(loss_h))
+    if not len(win_h) or not len(loss_h):
+        return out
+    wm, lm = float(win_h.median()), float(loss_h.median())
+    out.update({"ok": True, "win_median_h": wm, "loss_median_h": lm,
+                "loss_to_win_ratio": (lm / wm) if wm > 0 else float("nan")})
+    return out
+
+
 def format_trade_select_label(
     seq: int, symbol: Any, side: Any, leverage: Any,
     entry_time: Any, exit_time: Any, pnl_usd: Any,
@@ -7093,9 +7162,73 @@ def render_mytrade_diagnosis_tab() -> None:
     band_fig.update_layout(height=380, margin=dict(l=40, r=20, t=40, b=20))
     st.plotly_chart(band_fig, width="stretch")
 
-    # 追補v11: ForexTester様式視覚化(P1)#5 🔬保有時間 × 損益 散布図。
-    st.markdown("**保有時間 × 損益**")
+    # 追補v11→v14: 保有時間分析。実機フィードバック「散布図では傾向が読めない」を受け、
+    # バケット集計(どの保有レンジで稼ぎ/失っているか)+勝ち負け保有中央値の比較(損切りが
+    # 遅い/塩漬けの検出)を主役にし、散布図は折りたたみ(生データ確認用)へ格下げ。
+    st.markdown("**保有時間 × 損益(バケット分析)**")
     if "Exit_Time" in df.columns and "Entry_Time" in df.columns:
+        _wl_v14 = compute_win_loss_hold_stats(df)
+        if _wl_v14["ok"]:
+            _wlc1, _wlc2, _wlc3 = st.columns(3)
+            _wlc1.metric(
+                "勝ちトレードの保有中央値", format_hold_duration(_wl_v14["win_median_h"]),
+                help="勝って終わったトレードを保有時間順に並べた真ん中の値。")
+            _wlc2.metric(
+                "負けトレードの保有中央値", format_hold_duration(_wl_v14["loss_median_h"]),
+                help="負けて終わったトレードの真ん中の保有時間。勝ちより大幅に長い場合、"
+                     "『負けを認められず持ち続ける(塩漬け)』傾向のサインです。")
+            _ratio_v14 = _wl_v14["loss_to_win_ratio"]
+            _wlc3.metric(
+                "負け÷勝ち(倍率)", f"{_ratio_v14:.2f}倍" if pd.notna(_ratio_v14) else "—",
+                help="1.0=同じ。大きいほど負けを長く持っている。")
+            if pd.notna(_ratio_v14) and _ratio_v14 >= 1.5:
+                st.warning(
+                    f"⚠️ 負けトレードを勝ちの約{_ratio_v14:.1f}倍長く持っています。"
+                    "含み損になったポジションを『戻るまで待つ』傾向のサインです。"
+                    "損切りルール(エグジット最適化のSL%を参考)を先に決めてから入るのがお勧めです。"
+                )
+            elif pd.notna(_ratio_v14) and _ratio_v14 <= 0.67:
+                st.success("✅ 負けを早く切り、勝ちを長く伸ばせています(理想的な形です)。")
+            else:
+                st.caption("勝ちと負けで保有時間に大きな差はありません。")
+        _bucket_v14 = compute_hold_bucket_stats(df)
+        if not _bucket_v14.empty and int(_bucket_v14["n"].sum()) > 0:
+            _bk_colors = np.where(
+                pd.to_numeric(_bucket_v14["total_pnl"], errors="coerce").fillna(0.0) >= 0,
+                "#22c55e", "#ef4444")
+            _bk_fig = go.Figure(go.Bar(
+                x=_bucket_v14["bucket"], y=_bucket_v14["total_pnl"],
+                marker_color=list(_bk_colors),
+                text=[f"{int(n)}件" for n in _bucket_v14["n"]], textposition="outside",
+                customdata=np.stack([
+                    _bucket_v14["win_rate_pct"].fillna(-1.0),
+                    _bucket_v14["avg_pnl"].fillna(0.0),
+                    _bucket_v14["n"],
+                ], axis=-1),
+                hovertemplate=(
+                    "%{x}<br>合計損益: %{y:,.2f} USD<br>勝率: %{customdata[0]:.1f}%<br>"
+                    "平均: %{customdata[1]:,.2f} USD<br>件数: %{customdata[2]:,}件<extra></extra>"
+                ),
+            ))
+            _bk_fig.update_layout(
+                template="plotly_dark", height=360, margin=dict(l=40, r=20, t=40, b=20),
+                xaxis_title="保有時間バケット", yaxis_title="合計損益(USD)",
+            )
+            st.plotly_chart(_bk_fig, width="stretch", key="ta_hold_bucket_bar")
+            _bk_disp = pd.DataFrame({
+                "保有時間": _bucket_v14["bucket"],
+                "件数": [f"{int(n):,}" for n in _bucket_v14["n"]],
+                "勝率%": [f"{v:.1f}" if pd.notna(v) else "—" for v in _bucket_v14["win_rate_pct"]],
+                "合計損益(USD)": [f"{v:,.2f}" for v in _bucket_v14["total_pnl"]],
+                "平均損益(USD)": [f"{v:,.2f}" if pd.notna(v) else "—" for v in _bucket_v14["avg_pnl"]],
+            })
+            st.dataframe(_bk_disp, width="stretch", hide_index=True)
+            st.caption(
+                "緑=そのレンジで合計プラス・赤=マイナス。『どの保有時間なら勝てているか』が"
+                "件数・勝率と一緒に読めます。散布図(1点=1トレードの生データ)は下の折りたたみへ。"
+                f" 集計期間: {pd.to_datetime(df['Entry_Time'], errors='coerce').min():%Y-%m-%d} 〜 "
+                f"{pd.to_datetime(df['Entry_Time'], errors='coerce').max():%Y-%m-%d}(掟6)"
+            )
         _entry_p5 = pd.to_datetime(df["Entry_Time"], errors="coerce")
         _exit_p5 = pd.to_datetime(df["Exit_Time"], errors="coerce")
         _plot_df_p5 = df.copy()
@@ -7106,61 +7239,63 @@ def render_mytrade_diagnosis_tab() -> None:
         if _plot_df_p5.empty:
             st.caption("保有時間(Entry_Time/Exit_Timeとも有効)を計算できるトレードがありません。")
         else:
-            _median_hold_p5 = float(_plot_df_p5["_hold_hours"].median())
-            _hover_cols_p5 = [c for c in ["Symbol", "Side", "Entry_Time"] if c in _plot_df_p5.columns]
-            # 実機フィードバック#5: log_x=Trueの自動レンジが10^20超まで伸びて目盛りが意味不明に
-            # なる不具合があったため、px.scatterではなくgo.Figureで組み立て直し、
-            # (a) tickvals/ticktextを固定の人間可読ラベルにする、
-            # (b) x軸rangeをデータ範囲+余白にクランプする(自動で10^80まで伸ばさない)、
-            # (c) hovertemplateはcustomdata経由でformat_hold_duration(純関数・selftest済み)の
-            #     文字列を表示する、の3点を実現する(計算列_hold_hours自体は従来どおりCSV
-            #     エクスポートに影響しない表示専用の派生列)。
-            _plot_df_p5 = _plot_df_p5.copy()
-            _plot_df_p5["_hold_str"] = _plot_df_p5["_hold_hours"].apply(format_hold_duration)
-            scatter_fig = go.Figure()
-            for _res_name, _res_color in (("勝ち", "#2ECC71"), ("負け", "#E74C3C")):
-                _sub_p5 = _plot_df_p5[_plot_df_p5["_結果"] == _res_name]
-                if _sub_p5.empty:
-                    continue
-                _customdata_cols_p5 = ["_hold_str"] + _hover_cols_p5
-                _hover_extra_p5 = "".join(
-                    f"{col}: %{{customdata[{i + 1}]}}<br>" for i, col in enumerate(_hover_cols_p5)
+            with st.expander("🔬 散布図(1点=1トレードの生データ)", expanded=False):
+                _median_hold_p5 = float(_plot_df_p5["_hold_hours"].median())
+                _hover_cols_p5 = [c for c in ["Symbol", "Side", "Entry_Time"] if c in _plot_df_p5.columns]
+                # 実機フィードバック#5: log_x=Trueの自動レンジが10^20超まで伸びて目盛りが意味不明に
+                # なる不具合があったため、px.scatterではなくgo.Figureで組み立て直し、
+                # (a) tickvals/ticktextを固定の人間可読ラベルにする、
+                # (b) x軸rangeをデータ範囲+余白にクランプする(自動で10^80まで伸ばさない)、
+                # (c) hovertemplateはcustomdata経由でformat_hold_duration(純関数・selftest済み)の
+                #     文字列を表示する、の3点を実現する(計算列_hold_hours自体は従来どおりCSV
+                #     エクスポートに影響しない表示専用の派生列)。
+                _plot_df_p5 = _plot_df_p5.copy()
+                _plot_df_p5["_hold_str"] = _plot_df_p5["_hold_hours"].apply(format_hold_duration)
+                scatter_fig = go.Figure()
+                for _res_name, _res_color in (("勝ち", "#2ECC71"), ("負け", "#E74C3C")):
+                    _sub_p5 = _plot_df_p5[_plot_df_p5["_結果"] == _res_name]
+                    if _sub_p5.empty:
+                        continue
+                    _customdata_cols_p5 = ["_hold_str"] + _hover_cols_p5
+                    _hover_extra_p5 = "".join(
+                        f"{col}: %{{customdata[{i + 1}]}}<br>" for i, col in enumerate(_hover_cols_p5)
+                    )
+                    scatter_fig.add_trace(go.Scatter(
+                        x=_sub_p5["_hold_hours"], y=_sub_p5["PnL_USD"], mode="markers", name=_res_name,
+                        marker=dict(color=_res_color),
+                        customdata=_sub_p5[_customdata_cols_p5].to_numpy(),
+                        hovertemplate=(
+                            "保有時間: %{customdata[0]}<br>損益(USD): %{y:,.2f}<br>"
+                            + _hover_extra_p5 + "<extra></extra>"
+                        ),
+                    ))
+                scatter_fig.add_vline(
+                    x=_median_hold_p5, line_dash="dash", line_color="rgba(255,255,255,0.5)",
+                    annotation_text=f"中央値 {format_hold_duration(_median_hold_p5)}", annotation_position="top",
                 )
-                scatter_fig.add_trace(go.Scatter(
-                    x=_sub_p5["_hold_hours"], y=_sub_p5["PnL_USD"], mode="markers", name=_res_name,
-                    marker=dict(color=_res_color),
-                    customdata=_sub_p5[_customdata_cols_p5].to_numpy(),
-                    hovertemplate=(
-                        "保有時間: %{customdata[0]}<br>損益(USD): %{y:,.2f}<br>"
-                        + _hover_extra_p5 + "<extra></extra>"
-                    ),
-                ))
-            scatter_fig.add_vline(
-                x=_median_hold_p5, line_dash="dash", line_color="rgba(255,255,255,0.5)",
-                annotation_text=f"中央値 {format_hold_duration(_median_hold_p5)}", annotation_position="top",
-            )
-            _hold_min_p5 = float(_plot_df_p5["_hold_hours"].min())
-            _hold_max_p5 = float(_plot_df_p5["_hold_hours"].max())
-            _range_lo_p5 = max(min(_hold_min_p5, 1.0 / 60.0) * 0.8, 1e-4)
-            _range_hi_p5 = max(_hold_max_p5, 1.0) * 1.3
-            scatter_fig.update_xaxes(
-                type="log", title_text="保有時間(対数軸)",
-                tickvals=[1 / 60, 5 / 60, 0.25, 1, 4, 24, 72, 168, 720],
-                ticktext=["1分", "5分", "15分", "1時間", "4時間", "1日", "3日", "1週間", "1ヶ月"],
-                range=[math.log10(_range_lo_p5), math.log10(_range_hi_p5)],
-            )
-            scatter_fig.update_yaxes(title_text="損益(USD)")
-            scatter_fig.update_layout(
-                template="plotly_dark", height=380, margin=dict(l=40, r=20, t=40, b=20),
-                legend_title_text="結果",
-            )
-            st.plotly_chart(scatter_fig, width="stretch")
-            st.caption(
-                "右側ほど長期保有。右下(長く持って大負け)が『持ちすぎゾーン』。集計期間: "
-                f"{_plot_df_p5['Entry_Time'].min():%Y-%m-%d} 〜 {_plot_df_p5['Entry_Time'].max():%Y-%m-%d}(掟6)"
-            )
+                _hold_min_p5 = float(_plot_df_p5["_hold_hours"].min())
+                _hold_max_p5 = float(_plot_df_p5["_hold_hours"].max())
+                _range_lo_p5 = max(min(_hold_min_p5, 1.0 / 60.0) * 0.8, 1e-4)
+                _range_hi_p5 = max(_hold_max_p5, 1.0) * 1.3
+                scatter_fig.update_xaxes(
+                    type="log", title_text="保有時間(対数軸)",
+                    tickvals=[1 / 60, 5 / 60, 0.25, 1, 4, 24, 72, 168, 720],
+                    ticktext=["1分", "5分", "15分", "1時間", "4時間", "1日", "3日", "1週間", "1ヶ月"],
+                    range=[math.log10(_range_lo_p5), math.log10(_range_hi_p5)],
+                )
+                scatter_fig.update_yaxes(title_text="損益(USD)")
+                scatter_fig.update_layout(
+                    template="plotly_dark", height=380, margin=dict(l=40, r=20, t=40, b=20),
+                    legend_title_text="結果",
+                )
+                st.plotly_chart(scatter_fig, width="stretch")
+                st.caption(
+                    "1点=1トレード(緑=勝ち・赤=負け)。横軸は対数なので左右の距離は倍率です。"
+                    "点が横一線に潰れて見える場合はバケット分析(上)の方が傾向を読みやすいです。集計期間: "
+                    f"{_plot_df_p5['Entry_Time'].min():%Y-%m-%d} 〜 {_plot_df_p5['Entry_Time'].max():%Y-%m-%d}(掟6)"
+                )
     else:
-        st.caption("Entry_Time/Exit_Time列が無いため保有時間×損益散布図を表示できません。")
+        st.caption("Entry_Time/Exit_Time列が無いため保有時間分析を表示できません。")
 
 
 def _render_trader_comparison_view(records: list[dict[str, Any]]) -> None:
@@ -16714,6 +16849,46 @@ def run_selftest() -> bool:
           adv36_empty["n_skip"] == 0 and adv36_empty["by_n"][1]["overall"]["n_eval"] == 0
           and pd.isna(adv36_empty["by_n"][1]["overall"]["median_adverse_roe_pct"]),
           f"{adv36_empty['by_n'][1]['overall']}")
+
+    print("\n--- 37. 追補v14 保有時間バケット分析+勝ち負け保有中央値 ---")
+    _t37 = pd.Timestamp("2026-03-01 10:00:00", tz="Asia/Tokyo")
+
+    def _mk37(hold_minutes: float, pnl: float) -> dict:
+        return {"Entry_Time": _t37, "Exit_Time": _t37 + pd.Timedelta(minutes=hold_minutes),
+                "PnL_USD": pnl}
+
+    # バケット割当: 0.5分(1分未満)/3分(1〜5分)/10分(5〜15分)/30分×2(15分〜1時間)/
+    # 120分(1〜4時間)/720分(4〜24時間)/3000分=50h(1〜7日)/12000分=200h(7日超)
+    df37 = pd.DataFrame([
+        _mk37(0.5, +10), _mk37(3, -5), _mk37(10, +20), _mk37(30, +30), _mk37(30, -10),
+        _mk37(120, -40), _mk37(720, +15), _mk37(3000, -25), _mk37(12000, +7),
+    ])
+    bk37 = compute_hold_bucket_stats(df37)
+    check("37-1a バケット行数=定義8行(n=0含む)", len(bk37) == len(HOLD_BUCKET_DEFS_H), f"{len(bk37)}")
+    _bk37_map = {r["bucket"]: r for _, r in bk37.iterrows()}
+    check("37-1b 15分〜1時間はn=2・合計+20・勝率50%",
+          _bk37_map["15分〜1時間"]["n"] == 2
+          and abs(_bk37_map["15分〜1時間"]["total_pnl"] - 20.0) < 1e-9
+          and abs(_bk37_map["15分〜1時間"]["win_rate_pct"] - 50.0) < 1e-9,
+          f"{_bk37_map['15分〜1時間'].to_dict()}")
+    check("37-1c 7日超はn=1・合計+7", _bk37_map["7日超"]["n"] == 1
+          and abs(_bk37_map["7日超"]["total_pnl"] - 7.0) < 1e-9, f"{_bk37_map['7日超'].to_dict()}")
+    check("37-1d 全バケットn合計=9件", int(bk37["n"].sum()) == 9, f"{int(bk37['n'].sum())}")
+    check("37-1e n=0バケット(1〜4時間ではない: 4〜24時間はn=1)→1分未満n=1・avgはnanでない",
+          _bk37_map["1分未満"]["n"] == 1 and pd.notna(_bk37_map["1分未満"]["avg_pnl"]),
+          f"{_bk37_map['1分未満'].to_dict()}")
+    # 勝ち保有: 0.5/10/30/720/12000分 → 中央値30分=0.5h。負け保有: 3/30/120/3000分 → 中央値(30+120)/2=75分=1.25h
+    wl37 = compute_win_loss_hold_stats(df37)
+    check("37-2a 勝ち中央値=0.5h・負け中央値=1.25h・比率=2.5",
+          wl37["ok"] and abs(wl37["win_median_h"] - 0.5) < 1e-9
+          and abs(wl37["loss_median_h"] - 1.25) < 1e-9
+          and abs(wl37["loss_to_win_ratio"] - 2.5) < 1e-9, f"{wl37}")
+    check("37-2b n_win=5/n_loss=4", wl37["n_win"] == 5 and wl37["n_loss"] == 4, f"{wl37}")
+    wl37_onesided = compute_win_loss_hold_stats(pd.DataFrame([_mk37(10, +5), _mk37(20, +3)]))
+    check("37-2c 負け0件はok=False", not wl37_onesided["ok"], f"{wl37_onesided}")
+    check("37-2d 空dfは空/ok=False",
+          compute_hold_bucket_stats(pd.DataFrame()).empty
+          and not compute_win_loss_hold_stats(pd.DataFrame())["ok"], "")
 
     print("\n" + "=" * 78)
     if all_ok:
