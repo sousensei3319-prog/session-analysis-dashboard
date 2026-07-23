@@ -1278,10 +1278,87 @@ def reconstruct_superior(df: pd.DataFrame) -> tuple[pd.DataFrame, list[tuple[str
     return out, msgs
 
 
+def _is_engulf_trades_log(cols: list) -> bool:
+    """追補v17: engulf_console(検証ペーパー/デモBot)のtrades.csv形式か(固有列で判定)。"""
+    need = {"method_key", "symbol", "side", "entry_ts", "exit_ts", "entry_px", "exit_px"}
+    return need.issubset({str(c).strip() for c in cols})
+
+
+def reconstruct_engulf_trades_log(df: pd.DataFrame) -> tuple[pd.DataFrame, list[tuple[str, str]]]:
+    """追補v17: engulf_console(検証Bot)のtrades.csvを取り込む。1行=1往復トレード。
+    - 時刻: entry_ts/exit_ts=ISO8601(UTC)→JST(+9h)。
+    - PnL_USD: ブローカー実績(broker_pnl_usd)優先・欠損行は理論値(pnl_fixed_usd)。
+      Entry/Exit_PriceもPnLと同じソース(broker優先)で一貫させる。
+    - PnL_Percent: gross_ret_pct(価格変動%・side調整済み・レバ非考慮=他アダプタと同一流儀)。
+    - Quantity: margin_usd×lev÷建値。Win_Loss: 採用PnLの符号(0はdraw)。
+    """
+    rows: list[dict] = []
+    n_broker = 0
+    n_model = 0
+    n_bad = 0
+    mode_counts: dict[str, int] = {}
+    for _, r in df.iterrows():
+        try:
+            et = pd.to_datetime(r.get("entry_ts"), utc=True, errors="coerce")
+            xt = pd.to_datetime(r.get("exit_ts"), utc=True, errors="coerce")
+            if pd.isna(et) or pd.isna(xt):
+                n_bad += 1
+                continue
+            b_pnl = pd.to_numeric(r.get("broker_pnl_usd"), errors="coerce")
+            b_ep = pd.to_numeric(r.get("broker_entry_px"), errors="coerce")
+            b_xp = pd.to_numeric(r.get("broker_exit_px"), errors="coerce")
+            use_broker = pd.notna(b_pnl) and pd.notna(b_ep) and pd.notna(b_xp)
+            if use_broker:
+                pnl, ep, xp = float(b_pnl), float(b_ep), float(b_xp)
+                n_broker += 1
+            else:
+                pnl = float(pd.to_numeric(r.get("pnl_fixed_usd"), errors="coerce"))
+                ep = float(pd.to_numeric(r.get("entry_px"), errors="coerce"))
+                xp = float(pd.to_numeric(r.get("exit_px"), errors="coerce"))
+                n_model += 1
+            if not (pd.notna(pnl) and pd.notna(ep) and pd.notna(xp)):
+                n_bad += 1
+                continue
+            lev = pd.to_numeric(r.get("lev"), errors="coerce")
+            lev = float(lev) if pd.notna(lev) and float(lev) > 0 else None
+            margin = pd.to_numeric(r.get("margin_usd"), errors="coerce")
+            margin = float(margin) if pd.notna(margin) and float(margin) > 0 else None
+            qty = (margin * lev / ep) if (margin and lev and ep > 0) else None
+            mode = str(r.get("mode") or "").strip() or "不明"
+            mode_counts[mode] = mode_counts.get(mode, 0) + 1
+            rows.append({
+                "Entry_Time": (et.tz_convert("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M:%S"),
+                "Exit_Time": (xt.tz_convert("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M:%S"),
+                "Symbol": _strip_quote_suffix(str(r.get("symbol") or "")),
+                "PnL_USD": pnl,
+                "PnL_Percent": pd.to_numeric(r.get("gross_ret_pct"), errors="coerce"),
+                "Win_Loss": "win" if pnl > 0 else ("loss" if pnl < 0 else "draw"),
+                "Side": str(r.get("side") or "").strip().upper() or None,
+                "Leverage": lev,
+                "Entry_Price": ep,
+                "Exit_Price": xp,
+                "Quantity": qty,
+            })
+        except Exception:  # noqa: BLE001
+            n_bad += 1
+            continue
+    out = pd.DataFrame(rows)
+    mode_s = "・".join(f"{k}{v}件" for k, v in sorted(mode_counts.items()))
+    msgs: list[tuple[str, str]] = [(
+        "info",
+        f"engulf_console検証ログを検出: {len(df)}行 → {len(out)}トレード({mode_s})。"
+        f"PnLはブローカー実績{n_broker}件/理論値フォールバック{n_model}件"
+        + (f"・解析不能スキップ{n_bad}件" if n_bad else "")
+        + "。時刻はUTC→JST変換。⚠️検証Bot(ペーパー/デモ)の成績であり実弾ではありません。",
+    )]
+    return out, msgs
+
+
 def _adapt_broker_export(raw_df: pd.DataFrame) -> tuple[pd.DataFrame, list[tuple[str, str]]]:
     """アップロードDataFrameが対応ブローカーのエクスポートなら往復トレードへ再構築する。
     非該当ならそのまま返す(既存の自作CSV形式はここを素通りする)。
-    検出チェーン: BingX(注文/取引履歴) → MT4 → BTCC(英語/日本語) → MEXC(注文履歴は拒否/ポジション履歴) → Superior BTC。
+    検出チェーン: BingX(注文/取引履歴) → engulf検証ログ → MT4 → BTCC(英語/日本語) →
+    MEXC(注文履歴は拒否/ポジション履歴) → Superior BTC。
     """
     try:
         cols = list(raw_df.columns)
@@ -1289,6 +1366,8 @@ def _adapt_broker_export(raw_df: pd.DataFrame) -> tuple[pd.DataFrame, list[tuple
             return reconstruct_bingx_order_history(raw_df)
         if _is_bingx_transaction_history(cols):
             return reconstruct_bingx_transaction_history(raw_df)
+        if _is_engulf_trades_log(cols):
+            return reconstruct_engulf_trades_log(raw_df)
         if _is_mt4_history(raw_df):
             return reconstruct_mt4_history(raw_df)
         if _is_btcc_en(cols):
@@ -7202,6 +7281,7 @@ _PRESET_LABEL_RULES: list[tuple[str, str]] = [
     ("mexc", "MEXC"),
     ("superior", "Superior"),
     ("order_history", "BingX"),
+    ("trades", "engulf検証ログ"),  # 追補v17: engulf_console検証Botのtrades.csv
 ]
 
 
@@ -7690,7 +7770,9 @@ def render_mytrade_intake_tab() -> None:
             "・**MEXC** ポジション履歴(往復完結・推奨)。先物注文履歴は往復が完結していないため"
             "取り込めません(取込時にエラー表示)。複数ファイルは期間重複に注意。\n\n"
             "・**Superior BTC** 取引履歴xlsx。利確/損切の別を自動集計。時刻はUTC+0→JST換算(+9h)。\n\n"
-            "(2026-07-22: MT4/BTCC英語版/BTCC日本語版/MEXCポジション履歴/Superior BTCに対応)\n\n"
+            "・**engulf_console検証ログ**(trades.csv)。検証Bot(ペーパー/デモ)の取引ログ。"
+            "PnLはブローカー実績優先(欠損は理論値)・時刻はUTC→JST換算。実弾成績ではない点に注意。\n\n"
+            "(2026-07-22: MT4/BTCC英語版/BTCC日本語版/MEXCポジション履歴/Superior BTC/engulf検証ログに対応)\n\n"
             "まず試すだけなら「サンプル(弟子+師匠)を読み込む」ボタン。詳しい仕様は📖使い方ガイド参照。"
         )
 
@@ -17980,6 +18062,55 @@ def run_selftest() -> bool:
               len(_res39c["my_data"]) == 2, f"{_res39c['my_data']}")
         check("39-5b my_dataのラベルが自動推定されている",
               {d["label"] for d in _res39c["my_data"]} == {"MT4口座", "BTCC"}, f"{_res39c['my_data']}")
+
+    print("\n--- 40. 追補v17 engulf_console検証ログ取込 ---")
+    _eg40 = pd.DataFrame([
+        # broker実績あり(LONG): broker値を採用。entry_ts=UTC 07:49 → JST 16:49
+        {"method_key": "BTCUSDT_x_long", "symbol": "BTCUSDT", "side": "long",
+         "entry_ts": "2026-07-15T07:49:00Z", "exit_ts": "2026-07-15T09:00:00Z",
+         "entry_px": 64595.3, "exit_px": 64740.0, "gross_ret_pct": 0.22401,
+         "lev": 30, "margin_usd": 100.0, "pnl_fixed_usd": 3.7203, "mode": "paper",
+         "broker_entry_px": 64600.0, "broker_exit_px": 64750.0, "broker_pnl_usd": 5.55},
+        # broker欠損(SHORT): 理論値フォールバック
+        {"method_key": "ETHUSDT_y_short", "symbol": "ETHUSDT", "side": "short",
+         "entry_ts": "2026-07-16T00:33:00Z", "exit_ts": "2026-07-16T01:05:57Z",
+         "entry_px": 1874.0, "exit_px": 1880.0, "gross_ret_pct": -0.3201,
+         "lev": 10, "margin_usd": 100.0, "pnl_fixed_usd": -3.2015, "mode": "demo",
+         "broker_entry_px": None, "broker_exit_px": None, "broker_pnl_usd": None},
+        # PnL=0 → draw
+        {"method_key": "SOLUSDT_z_long", "symbol": "SOLUSDT", "side": "long",
+         "entry_ts": "2026-07-16T02:00:00Z", "exit_ts": "2026-07-16T03:00:00Z",
+         "entry_px": 75.0, "exit_px": 75.0, "gross_ret_pct": 0.0,
+         "lev": 10, "margin_usd": 100.0, "pnl_fixed_usd": 0.0, "mode": "demo",
+         "broker_entry_px": None, "broker_exit_px": None, "broker_pnl_usd": None},
+        # 時刻壊れ → スキップ
+        {"method_key": "BAD", "symbol": "BTCUSDT", "side": "long",
+         "entry_ts": "not-a-time", "exit_ts": "2026-07-16T03:00:00Z",
+         "entry_px": 1.0, "exit_px": 1.0, "gross_ret_pct": 0.0,
+         "lev": 1, "margin_usd": 100.0, "pnl_fixed_usd": 0.0, "mode": "demo",
+         "broker_entry_px": None, "broker_exit_px": None, "broker_pnl_usd": None},
+    ])
+    check("40-1a 検出関数: engulf形式をTrue", _is_engulf_trades_log(list(_eg40.columns)), "")
+    check("40-1b 検出関数: BingX形式列はFalse",
+          not _is_engulf_trades_log(["UID", "Order No.", "Time(UTC+8)", "Pair", "Type"]), "")
+    _eg40_out, _eg40_msgs = reconstruct_engulf_trades_log(_eg40)
+    check("40-2a 4行→3トレード(壊れ1行スキップ)", len(_eg40_out) == 3, f"{len(_eg40_out)}")
+    _r0 = _eg40_out.iloc[0]
+    check("40-2b broker実績優先: PnL=5.55・Entry_Price=64600",
+          abs(float(_r0["PnL_USD"]) - 5.55) < 1e-9 and abs(float(_r0["Entry_Price"]) - 64600.0) < 1e-9,
+          f"{_r0.to_dict()}")
+    check("40-2c UTC→JST変換: 07:49Z→16:49", _r0["Entry_Time"] == "2026-07-15 16:49:00", f"{_r0['Entry_Time']}")
+    check("40-2d Symbol正規化: BTCUSDT→BTC・Side=LONG",
+          _r0["Symbol"] == "BTC" and _r0["Side"] == "LONG", f"{_r0['Symbol']}/{_r0['Side']}")
+    check("40-2e Quantity=margin×lev÷broker建値",
+          abs(float(_r0["Quantity"]) - (100.0 * 30 / 64600.0)) < 1e-12, f"{_r0['Quantity']}")
+    _r1 = _eg40_out.iloc[1]
+    check("40-2f broker欠損は理論値フォールバック: PnL=-3.2015・loss",
+          abs(float(_r1["PnL_USD"]) - (-3.2015)) < 1e-9 and _r1["Win_Loss"] == "loss", f"{_r1.to_dict()}")
+    check("40-2g PnL=0はdraw", _eg40_out.iloc[2]["Win_Loss"] == "draw", f"{_eg40_out.iloc[2]['Win_Loss']}")
+    check("40-2h infoメッセージにbroker/理論値件数とスキップ数",
+          any("実績1件" in m and "フォールバック2件" in m and "スキップ1件" in m for _, m in _eg40_msgs),
+          f"{_eg40_msgs}")
 
     print("\n" + "=" * 78)
     if all_ok:
